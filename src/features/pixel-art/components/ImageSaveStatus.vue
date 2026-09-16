@@ -10,11 +10,13 @@ const props = withDefaults(
     error?: string;
     lastSavedAt?: number | string | null;
     compactOnMobile?: boolean;
+    interactive?: boolean;
   }>(),
   {
     error: "",
     lastSavedAt: null,
     compactOnMobile: false,
+    interactive: true,
   },
 );
 
@@ -66,7 +68,7 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
 </script>
 
 <template>
-  <div
+  <span
     class="image-save-status"
     :class="[`is-${status}`, { 'is-compact-on-mobile': compactOnMobile }]"
     :role="status === 'error' ? 'alert' : 'status'"
@@ -89,7 +91,7 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
     <span>{{ label }}</span>
 
     <button
-      v-if="canRetry"
+      v-if="canRetry && interactive"
       type="button"
       class="image-save-status__retry"
       :aria-label="status === 'offline' ? 'Retry save while offline' : 'Retry save'"
@@ -99,7 +101,7 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
       <RotateCcw :size="12" :stroke-width="2.2" aria-hidden="true" />
       <span>Retry</span>
     </button>
-  </div>
+  </span>
 </template>
 
 <style scoped>

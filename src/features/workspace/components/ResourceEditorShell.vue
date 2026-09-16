@@ -42,6 +42,8 @@ import {
 } from "../../../lib/realtime";
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
 import ImageDocumentPresence from "./ImageDocumentPresence.vue";
+import ResourceDocumentInfoDialog from "./ResourceDocumentInfoDialog.vue";
+import { buildDocumentInfoDetails } from "../lib/documentInfo";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import {
   clonePixelArtDocument,
@@ -528,6 +530,7 @@ const imageConflictRemoteRevision = ref<number | null>(null);
 const imageConflictOperation = ref<ImageConflictOperation | null>(null);
 const isImageConflictResolving = ref(false);
 const isRenamingResource = ref(false);
+const isDocumentInfoOpen = ref(false);
 const isResourceNameSaving = ref(false);
 const resourceNameSaveError = ref("");
 const resourceNameDraft = ref("");
@@ -1987,6 +1990,12 @@ const openImageConflict = (
     isImageConflictOpen.value = true;
   };
 
+  if (isDocumentInfoOpen.value) {
+    isDocumentInfoOpen.value = false;
+    void nextTick(() => window.requestAnimationFrame(revealConflict));
+    return;
+  }
+
   if (activeImageInspectorPanel.value !== null) {
     activeImageInspectorPanel.value = null;
     void nextTick(() => window.requestAnimationFrame(revealConflict));
@@ -2094,6 +2103,30 @@ const commitResourceName = () => {
     }
   });
   return operation;
+};
+
+const documentInfoDetails = computed(() => buildDocumentInfoDetails({
+  projectName: projectName.value,
+  typeLabel: editorMeta.value.label,
+  createdAt: normalizeResourceUpdatedAt(resource.value?.created_at),
+  updatedAt: normalizeResourceUpdatedAt(resource.value?.updated_at),
+  revision: resource.value?.revision,
+  image: isImageEditor.value ? {
+    width: imageGridWidth.value,
+    height: imageGridHeight.value,
+    layerCount: imageLayers.value.length,
+  } : null,
+}));
+
+const openDocumentInfo = () => {
+  if (isLoading.value || errorMessage.value || !resource.value) return;
+  clearImageTemporaryKeys();
+  isDocumentInfoOpen.value = true;
+};
+
+const closeDocumentInfo = () => {
+  cancelRenamingResource();
+  isDocumentInfoOpen.value = false;
 };
 
 const buildImageDocument = (includeRotationPreview = true): PixelArtDocumentV2 => {
@@ -6279,6 +6312,7 @@ const handleResourceEditorKeydown = (event: KeyboardEvent) => {
     event.isComposing ||
     activeImageInspectorPanel.value !== null ||
     isImageConflictOpen.value ||
+    isDocumentInfoOpen.value ||
     isProfileDialogOpen.value ||
     isEditableKeyboardTarget(event.target) ||
     isImageControlKeyboardTarget(event.target)
@@ -6684,59 +6718,92 @@ onUnmounted(() => {
       @user-click="isProfileDialogOpen = true"
     >
       <template #center>
-        <div
+        <button
+          type="button"
           class="resource-editor-title"
           :class="{
             'is-loading': isLoading,
             'has-document-presence': hasImageDocumentPresence && !isLoading,
             'has-save-warning': displayedImageSaveStatus === 'error' || displayedImageSaveStatus === 'offline',
           }"
+          :disabled="isLoading || Boolean(errorMessage) || !resource"
+          :aria-label="`Open information for ${resourceName}`"
+          title="Document information"
+          aria-haspopup="dialog"
+          :aria-expanded="isDocumentInfoOpen"
+          aria-controls="resource-document-info-dialog"
+          data-image-shortcuts="off"
+          @click="openDocumentInfo"
         >
           <span class="resource-editor-title__icon" aria-hidden="true">
             <Icon :icon="editorMeta.icon" width="22" height="22" />
           </span>
-          <input
-            v-if="isRenamingResource"
-            v-model="resourceNameDraft"
-            class="resource-editor-title__name-input"
-            type="text"
-            maxlength="120"
-            aria-label="Image name"
-            autofocus
-            @blur="commitResourceName"
-            @keydown.enter.prevent="($event.currentTarget as HTMLInputElement).blur()"
-            @keydown.escape.prevent="cancelRenamingResource"
-          />
-          <button
-            v-else
-            type="button"
-            class="resource-editor-title__name"
-            :disabled="!canEditImage"
-            :aria-label="canEditImage ? `Rename ${resourceName}` : resourceName"
-            :title="canEditImage ? 'Rename image' : resourceName"
-            @click="startRenamingResource"
-          >
-            {{ resourceName }}
-          </button>
+          <span class="resource-editor-title__name">{{ resourceName }}</span>
           <span class="resource-editor-title__kind">{{ editorMeta.label }}</span>
-          <div v-if="isImageEditor && !isLoading" class="resource-editor-title__save-cluster">
+          <span v-if="isImageEditor && !isLoading" class="resource-editor-title__save-cluster">
             <ImageSaveStatus
               :status="displayedImageSaveStatus"
               :error="displayedImageSaveError"
               :last-saved-at="effectiveImageLastSavedAt"
               :compact-on-mobile="hasImageDocumentPresence"
-              @retry="retryImageSave"
+              :interactive="false"
             />
-          </div>
+          </span>
           <ImageDocumentPresence
             v-if="isImageEditor && !isLoading && !errorMessage"
             :members="projectPresenceMembers"
             :current-user-id="currentPresenceUserId"
             :current-user="currentImagePresenceMember"
           />
-        </div>
+        </button>
       </template>
     </StudioTopbar>
+
+    <ResourceDocumentInfoDialog
+      v-if="!isLoading && !errorMessage && resource"
+      :open="isDocumentInfoOpen"
+      dialog-id="resource-document-info-dialog"
+      :type-label="editorMeta.label"
+      :details="documentInfoDetails"
+      :members="projectPresenceMembers"
+      :current-user-id="currentPresenceUserId"
+      :current-user="currentImagePresenceMember"
+      :show-people="isImageEditor"
+      @close="closeDocumentInfo"
+    >
+      <template #name>
+        <input
+          v-if="isRenamingResource"
+          v-model="resourceNameDraft"
+          class="resource-editor-title__name-input"
+          type="text"
+          maxlength="120"
+          aria-label="Image name"
+          autofocus
+          :disabled="isResourceNameSaving"
+          @blur="commitResourceName"
+          @keydown.enter.prevent="commitResourceName"
+        />
+        <strong v-else class="resource-document-info__name">{{ resourceName }}</strong>
+        <button
+          v-if="canEditImage && !isRenamingResource"
+          type="button"
+          class="resource-document-info__rename"
+          :aria-label="`Rename ${resourceName}`"
+          :disabled="isResourceNameSaving"
+          @click="startRenamingResource"
+        >Rename</button>
+        <p v-if="resourceNameSaveError" role="alert">{{ resourceNameSaveError }}</p>
+      </template>
+      <template v-if="isImageEditor" #save>
+        <ImageSaveStatus
+          :status="displayedImageSaveStatus"
+          :error="displayedImageSaveError"
+          :last-saved-at="effectiveImageLastSavedAt"
+          @retry="retryImageSave"
+        />
+      </template>
+    </ResourceDocumentInfoDialog>
 
     <main class="resource-editor-stage" aria-label="Resource editor">
       <div v-if="isLoading" class="resource-editor-loader" role="status" aria-label="Loading item">
@@ -7888,6 +7955,8 @@ onUnmounted(() => {
     gap: 8px;
     align-items: center;
     justify-content: center;
+    width: 100%;
+    box-sizing: border-box;
     min-width: 0;
     max-width: 100%;
     height: 36px;
@@ -7897,7 +7966,22 @@ onUnmounted(() => {
     border: 1px solid var(--editor-border);
     border-radius: var(--editor-radius-md);
     box-shadow: none;
+    cursor: pointer;
+    touch-action: manipulation;
   }
+
+  .resource-editor-title:hover:not(:disabled),
+  .resource-editor-title[aria-expanded="true"] {
+    background: var(--editor-surface);
+    border-color: var(--editor-border-strong);
+  }
+
+  .resource-editor-title:focus-visible {
+    outline: 2px solid var(--editor-focus);
+    outline-offset: 2px;
+  }
+
+  .resource-editor-title:disabled { cursor: default; }
 
   .resource-editor-title.is-loading {
     opacity: 0.66;
@@ -7927,27 +8011,14 @@ onUnmounted(() => {
     font-weight: 650;
     text-overflow: ellipsis;
     white-space: nowrap;
-    cursor: pointer;
     background: transparent;
     border: 1px solid transparent;
     border-radius: var(--editor-radius-sm);
     outline: none;
   }
 
-  .resource-editor-title__name:hover:not(:disabled) {
-    background: var(--editor-surface);
-  }
-
-  .resource-editor-title__name:focus-visible {
-    border-color: var(--editor-focus);
-  }
-
-  .resource-editor-title__name:disabled {
-    cursor: default;
-  }
-
   .resource-editor-title__name-input {
-    width: min(220px, 23vw);
+    width: 100%;
     height: 28px;
     padding: 0 6px;
     box-sizing: border-box;
@@ -7967,6 +8038,29 @@ onUnmounted(() => {
     color: var(--editor-quiet);
     font-size: 11px;
     font-weight: 500;
+  }
+
+  .resource-document-info__name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 15px;
+  }
+
+  .resource-document-info__rename {
+    flex: 0 0 auto;
+    min-height: 36px;
+    padding: 0 10px;
+    color: #eeeeee;
+    background: #242424;
+    border: 1px solid #454545;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .resource-document-info__rename:focus-visible {
+    outline: 2px solid #ffffff;
+    outline-offset: 2px;
   }
 
   .resource-editor-title__save-cluster {
