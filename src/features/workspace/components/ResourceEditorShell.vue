@@ -41,6 +41,8 @@ import {
   type ProjectPresenceSnapshot,
 } from "../../../lib/realtime";
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
+import ImageDocumentPresence from "./ImageDocumentPresence.vue";
+import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import {
   clonePixelArtDocument,
   compositeVisibleLayers,
@@ -417,6 +419,7 @@ const selectedImageColorDraft = ref(DEFAULT_PENCIL_COLOR.toUpperCase());
 const secondaryImageColor = ref("#000000");
 const personalImagePalette = ref<PinnedPaletteColor[]>([]);
 const imagePaletteUserId = ref("");
+const currentPresenceUserId = ref("");
 const isPersonalImagePaletteSaving = ref(false);
 const activeImageTool = ref<ImageTool>("pencil");
 const imageBrushSize = ref(1);
@@ -559,7 +562,7 @@ let imageEditorSessionSaveInFlight: Promise<void> | null = null;
 let imageEditorSessionSaveQueued = false;
 let lastSavedImageEditorSession = "";
 let projectPresenceConnection: ProjectPresenceConnection | null = null;
-let projectPresenceMembers: ProjectPresenceMember[] = [];
+const projectPresenceMembers = shallowRef<ProjectPresenceMember[]>([]);
 let imageCollaborationCursorTimeout: ReturnType<typeof setTimeout> | null = null;
 let imageCollaborationSelectionTimeout: ReturnType<typeof setTimeout> | null = null;
 let imageCollaborationCleanupInterval: ReturnType<typeof setInterval> | null = null;
@@ -593,6 +596,11 @@ const editorMeta = computed(() =>
   resource.value ? editorMetaByType[resource.value.type] || fallbackEditorMeta : fallbackEditorMeta,
 );
 const isImageEditor = computed(() => editorMeta.value.routeKind === "image");
+const hasImageDocumentPresence = computed(
+  () =>
+    isImageEditor.value &&
+    getDocumentPresenceMembers(projectPresenceMembers.value, currentPresenceUserId.value).others.length > 0,
+);
 const projectName = computed(() => project.value?.name || "Project");
 const resourceName = computed(() => resource.value?.name || "Loading item");
 const resourceColor = computed(() => resource.value?.color || editorMeta.value.color);
@@ -1864,6 +1872,7 @@ const updateProfile = (user: UserPublic) => {
   profileEmail.value = user.email;
   profilePixelAvatar.value = user.avatar_pixel_art || null;
   imagePaletteUserId.value = user.id;
+  currentPresenceUserId.value = user.id;
   personalImagePalette.value = normalizePinnedPaletteColors(user.pixel_art_palette);
   isProfileDialogOpen.value = false;
   connectResourcePresence();
@@ -2203,8 +2212,8 @@ const collaboratorName = (activity: ProjectEditorActivity) =>
   activity.user.username?.trim() || activity.user.email.split("@")[0] || "Collaborator";
 
 const collaboratorPresenceMember = (activity: ProjectEditorActivity) =>
-  projectPresenceMembers.find((member) => member.client_id === activity.client_id) ||
-  projectPresenceMembers.find((member) => member.id === activity.user.id);
+  projectPresenceMembers.value.find((member) => member.client_id === activity.client_id) ||
+  projectPresenceMembers.value.find((member) => member.id === activity.user.id);
 
 const remoteImageCollaboratorInitials = (collaborator: RemoteImageCollaborator) => {
   const parts = collaborator.name.split(/[\s._-]+/).filter(Boolean);
@@ -2268,14 +2277,14 @@ const updateRemoteImageCollaborator = (
 };
 
 const handleProjectPresenceSync = (snapshot: ProjectPresenceSnapshot) => {
-  projectPresenceMembers = snapshot[props.resourceId] || [];
-  if (projectPresenceMembers.length === 0) return;
+  projectPresenceMembers.value = snapshot[props.resourceId] || [];
+  if (projectPresenceMembers.value.length === 0) return;
 
   remoteImageCollaborators.value = Object.fromEntries(
     Object.entries(remoteImageCollaborators.value).map(([clientId, collaborator]) => {
       const member =
-        projectPresenceMembers.find((candidate) => candidate.client_id === clientId) ||
-        projectPresenceMembers.find((candidate) => candidate.id === collaborator.userId);
+        projectPresenceMembers.value.find((candidate) => candidate.client_id === clientId) ||
+        projectPresenceMembers.value.find((candidate) => candidate.id === collaborator.userId);
       if (!member) return [clientId, collaborator];
       return [
         clientId,
@@ -6311,6 +6320,7 @@ const loadEditor = async () => {
     }
 
     imagePaletteUserId.value = workspace?.user.id || "";
+    currentPresenceUserId.value = workspace?.user.id || "";
     personalImagePalette.value = normalizePinnedPaletteColors(
       workspace?.user.pixel_art_palette,
     );
@@ -6520,7 +6530,14 @@ onUnmounted(() => {
       @user-click="isProfileDialogOpen = true"
     >
       <template #center>
-        <div class="resource-editor-title" :class="{ 'is-loading': isLoading }">
+        <div
+          class="resource-editor-title"
+          :class="{
+            'is-loading': isLoading,
+            'has-document-presence': hasImageDocumentPresence && !isLoading,
+            'has-save-warning': displayedImageSaveStatus === 'error' || displayedImageSaveStatus === 'offline',
+          }"
+        >
           <span class="resource-editor-title__icon" aria-hidden="true">
             <Icon :icon="editorMeta.icon" width="22" height="22" />
           </span>
@@ -6553,9 +6570,15 @@ onUnmounted(() => {
               :status="displayedImageSaveStatus"
               :error="displayedImageSaveError"
               :last-saved-at="effectiveImageLastSavedAt"
+              :compact-on-mobile="hasImageDocumentPresence"
               @retry="retryImageSave"
             />
           </div>
+          <ImageDocumentPresence
+            v-if="isImageEditor && !isLoading && !errorMessage"
+            :members="projectPresenceMembers"
+            :current-user-id="currentPresenceUserId"
+          />
         </div>
       </template>
     </StudioTopbar>
@@ -7782,6 +7805,7 @@ onUnmounted(() => {
 
   .resource-editor-title__save-cluster {
     display: inline-flex;
+    flex: 0 0 auto;
     align-items: center;
     min-width: 0;
     padding-left: 8px;
@@ -9523,6 +9547,24 @@ onUnmounted(() => {
 
     .resource-editor-title__name {
       max-width: 104px;
+    }
+
+    .resource-editor-title.has-document-presence {
+      height: 44px;
+      gap: 4px;
+      padding-right: 3px;
+      padding-left: 5px;
+    }
+
+    .resource-editor-title.has-document-presence .resource-editor-title__name,
+    .resource-editor-title.has-document-presence .resource-editor-title__name-input {
+      flex: 1 1 0;
+      min-width: 0;
+      max-width: none;
+    }
+
+    .resource-editor-title.has-document-presence.has-save-warning .resource-editor-title__icon {
+      display: none;
     }
 
     .resource-editor-title__save-cluster {

@@ -9,10 +9,12 @@ const props = withDefaults(
     status: SaveStatus;
     error?: string;
     lastSavedAt?: number | string | null;
+    compactOnMobile?: boolean;
   }>(),
   {
     error: "",
     lastSavedAt: null,
+    compactOnMobile: false,
   },
 );
 
@@ -66,7 +68,7 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
 <template>
   <div
     class="image-save-status"
-    :class="`is-${status}`"
+    :class="[`is-${status}`, { 'is-compact-on-mobile': compactOnMobile }]"
     :role="status === 'error' ? 'alert' : 'status'"
     :aria-live="status === 'error' ? 'assertive' : 'polite'"
     aria-atomic="true"
@@ -171,6 +173,21 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
   @media (prefers-reduced-motion: reduce) {
     .image-save-status__spinner {
       animation: none;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .image-save-status.is-compact-on-mobile {
+      gap: 4px;
+      padding-right: 4px;
+      padding-left: 4px;
+    }
+
+    .image-save-status.is-compact-on-mobile.is-saved > span,
+    .image-save-status.is-compact-on-mobile.is-saving > span,
+    .image-save-status.is-compact-on-mobile.is-dirty > span,
+    .image-save-status.is-compact-on-mobile .image-save-status__retry > span {
+      display: none;
     }
   }
 
