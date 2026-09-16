@@ -17,6 +17,7 @@ import {
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -283,9 +284,16 @@ describe("project presence", () => {
     ]);
   });
 
-  it("tracks the open resource and publishes synchronized project presence", async () => {
+  it.each([
+    { visibilityState: "visible", supportsWorker: false },
+    { visibilityState: "hidden", supportsWorker: true },
+  ] as const)("keeps open-document presence ($visibilityState, worker: $supportsWorker)", async ({
+    visibilityState,
+    supportsWorker,
+  }) => {
     let presenceSync: (() => void) | undefined;
     let editorActivity: ((message: { payload: unknown }) => void) | undefined;
+    let subscriptionHandler: ((status: string) => void) | undefined;
     const track = vi.fn(async () => "ok");
     const untrack = vi.fn(async () => "ok");
     const send = vi.fn(async () => "ok");
@@ -317,6 +325,7 @@ describe("project presence", () => {
       ),
       presenceState: vi.fn(() => state),
       subscribe: vi.fn((handler: (status: string) => void) => {
+        subscriptionHandler = handler;
         handler("SUBSCRIBED");
         return channel;
       }),
@@ -336,26 +345,29 @@ describe("project presence", () => {
         setAuth = setAuth;
       } as unknown as (...args: any[]) => any,
     );
-    vi.stubGlobal("window", {});
+    vi.stubGlobal("window", supportsWorker ? { Worker: vi.fn() } : {});
+    const documentState = { visibilityState } as { visibilityState: DocumentVisibilityState };
+    vi.stubGlobal("document", documentState);
+    const config = {
+      enabled: true,
+      supabase_url: "https://project.supabase.co",
+      publishable_key: "sb_publishable_test",
+      access_token: "realtime-token",
+      expires_at: "2099-09-14T12:00:00Z",
+      channel: "project:project-1:presence",
+      user: {
+        id: "user-1",
+        email: "artist@example.com",
+        username: "Artist",
+        avatar_url: null,
+        avatar_pixel_art: null,
+      },
+    };
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
         new Response(
-          JSON.stringify({
-            enabled: true,
-            supabase_url: "https://project.supabase.co",
-            publishable_key: "sb_publishable_test",
-            access_token: "realtime-token",
-            expires_at: "2099-09-14T12:00:00Z",
-            channel: "project:project-1:presence",
-            user: {
-              id: "user-1",
-              email: "artist@example.com",
-              username: "Artist",
-              avatar_url: null,
-              avatar_pixel_art: null,
-            },
-          }),
+          JSON.stringify(config),
           { status: 200, headers: { "Content-Type": "application/json" } },
         ),
       ),
@@ -385,6 +397,10 @@ describe("project presence", () => {
         presence: { enabled: true, key: "user-1" },
       },
     });
+    expect(supabaseMocks.RealtimeClient).toHaveBeenCalledWith(
+      "wss://project.supabase.co/realtime/v1",
+      expect.objectContaining({ worker: supportsWorker }),
+    );
     expect(setAuth).toHaveBeenCalledWith("realtime-token");
     expect(setAuth.mock.invocationCallOrder[0]).toBeLessThan(
       channel.subscribe.mock.invocationCallOrder[0]!,
@@ -442,10 +458,59 @@ describe("project presence", () => {
       expect.objectContaining({ client_id: "remote-client", kind: "cursor" }),
     );
 
+    documentState.visibilityState = "hidden";
+    presenceSync?.();
+    expect(onSync).toHaveBeenLastCalledWith({
+      "resource-1": [expect.objectContaining({ id: "user-1" })],
+    });
+    expect(untrack).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+
+    // A real network interruption can still happen. Rejoining must restore
+    // the same document even when its browser tab remains in the background.
+    subscriptionHandler?.("CHANNEL_ERROR");
+    expect(onSync).toHaveBeenLastCalledWith({});
+    subscriptionHandler?.("SUBSCRIBED");
+    await vi.waitFor(() => expect(track).toHaveBeenCalledTimes(2));
+    expect(track).toHaveBeenLastCalledWith(
+      expect.objectContaining({ client_id: connection.clientId, resource_id: "resource-1" }),
+    );
+    expect(send).toHaveBeenLastCalledWith({
+      type: "broadcast",
+      event: "editor.activity",
+      payload: expect.objectContaining({ kind: "sync-request", resource_id: "resource-1" }),
+    });
+
+    const options = supabaseMocks.RealtimeClient.mock.calls[0]?.[1] as {
+      accessToken: () => Promise<string | null>;
+    };
+    expect(await options.accessToken()).toBe("realtime-token");
+    expect(fetch).toHaveBeenCalledOnce();
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(config.expires_at) - 30_000);
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      ...config,
+      access_token: "refreshed-token",
+      expires_at: "2100-09-14T12:00:00Z",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    expect(await options.accessToken()).toBe("refreshed-token");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    documentState.visibilityState = "visible";
+    presenceSync?.();
+    expect(untrack).not.toHaveBeenCalled();
+
     connection.setResourceId(null);
-    await vi.waitFor(() => expect(untrack).toHaveBeenCalled());
+    await vi.waitFor(() => expect(untrack).toHaveBeenCalledOnce());
+    connection.setResourceId("resource-2");
+    await vi.waitFor(() => expect(track).toHaveBeenCalledTimes(3));
+    expect(track).toHaveBeenLastCalledWith(expect.objectContaining({ resource_id: "resource-2" }));
+    connection.close();
     connection.close();
     await vi.waitFor(() => expect(removeChannel).toHaveBeenCalledWith(channel));
+    expect(untrack).toHaveBeenCalledTimes(2);
     expect(disconnect).toHaveBeenCalledOnce();
+    subscriptionHandler?.("SUBSCRIBED");
+    connection.sendEditorActivity("sync-request", {});
+    connection.setResourceId("resource-1");
+    expect(track).toHaveBeenCalledTimes(3);
   });
 });

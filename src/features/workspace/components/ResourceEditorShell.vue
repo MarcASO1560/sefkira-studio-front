@@ -159,6 +159,7 @@ import {
 import { resizePixelArtDocument } from "../../pixel-art/lib/resize";
 import {
   applyCollaborativePixelPatch,
+  canSendCollaborativeActivity,
   collaboratorColor,
   readCollaborativeCursor,
   readCollaborativeDocument,
@@ -2185,7 +2186,10 @@ const sendImageCollaborationActivity = (
   kind: ProjectEditorActivity["kind"],
   payload: Record<string, unknown>,
 ) => {
-  if (!isImageEditor.value || document.visibilityState !== "visible") return;
+  if (
+    !isImageEditor.value ||
+    !canSendCollaborativeActivity(kind, payload, document.visibilityState)
+  ) return;
   projectPresenceConnection?.sendEditorActivity(kind, payload);
 };
 
@@ -6474,15 +6478,15 @@ const flushImageBeforePageHide = () => {
   void persistImageEditorSession(true);
 };
 
-const syncResourcePresenceVisibility = () => {
+const handleResourceVisibilityChange = () => {
   if (document.visibilityState !== "visible") {
     broadcastImageCursor(null);
     flushImageCollaborationCursor();
-    remoteImageCollaborators.value = {};
+    flushImageCollaborationPixels();
+    flushImageCollaborationSelection();
   }
-  projectPresenceConnection?.setResourceId(
-    document.visibilityState === "visible" && resource.value ? props.resourceId : null,
-  );
+  // Presence belongs to the open document, not the focused browser tab. Keep
+  // receiving updates and answering sync requests while it is in the background.
 };
 
 const connectResourcePresence = () => {
@@ -6490,7 +6494,7 @@ const connectResourcePresence = () => {
   projectPresenceConnection = connectProjectPresence(
     props.projectId,
     handleProjectPresenceSync,
-    document.visibilityState === "visible" ? props.resourceId : null,
+    props.resourceId,
     handleProjectEditorActivity,
   );
 };
@@ -6659,7 +6663,7 @@ onMounted(() => {
   window.addEventListener("beforeunload", warnBeforeImageUnload);
   window.addEventListener("pagehide", flushImageBeforePageHide);
   window.addEventListener("resize", updateImageViewportSize);
-  document.addEventListener("visibilitychange", syncResourcePresenceVisibility);
+  document.addEventListener("visibilitychange", handleResourceVisibilityChange);
   imageCollaborationCleanupInterval = window.setInterval(
     removeStaleImageCollaborators,
     4000,
@@ -6685,7 +6689,7 @@ onUnmounted(() => {
   window.removeEventListener("beforeunload", warnBeforeImageUnload);
   window.removeEventListener("pagehide", flushImageBeforePageHide);
   window.removeEventListener("resize", updateImageViewportSize);
-  document.removeEventListener("visibilitychange", syncResourcePresenceVisibility);
+  document.removeEventListener("visibilitychange", handleResourceVisibilityChange);
   projectPresenceConnection?.close();
   projectPresenceConnection = null;
   remoteImageCollaborators.value = {};

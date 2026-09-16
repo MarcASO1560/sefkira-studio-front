@@ -5,6 +5,7 @@ import { createPixelLayer } from "./document";
 import { PIXEL_ART_PASTEL_PALETTE } from "./palette";
 import {
   applyCollaborativePixelPatch,
+  canSendCollaborativeActivity,
   collaboratorColor,
   readCollaborativeCursor,
   readCollaborativeDocument,
@@ -27,6 +28,21 @@ const activity = (
 });
 
 describe("pixel-art collaboration", () => {
+  it.each(["document", "pixels", "selection", "sync-request"] as const)(
+    "keeps %s synchronization enabled in background documents",
+    (kind) => {
+      expect(canSendCollaborativeActivity(kind, {}, "hidden")).toBe(true);
+      expect(canSendCollaborativeActivity(kind, {}, "visible")).toBe(true);
+    },
+  );
+
+  it("hides a background cursor without treating the document as disconnected", () => {
+    expect(canSendCollaborativeActivity("cursor", { visible: false }, "hidden")).toBe(true);
+    expect(canSendCollaborativeActivity("cursor", { visible: true }, "hidden")).toBe(false);
+    expect(canSendCollaborativeActivity("cursor", {}, "hidden")).toBe(false);
+    expect(canSendCollaborativeActivity("cursor", { visible: true }, "visible")).toBe(true);
+  });
+
   it("accepts finite cursor positions across the workspace and rejects unsafe offsets", () => {
     expect(
       readCollaborativeCursor(

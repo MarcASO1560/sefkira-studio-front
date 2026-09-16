@@ -10,6 +10,13 @@ import type {
 import { parsePixelArtResourceData, PixelArtMigrationError } from "./migrations";
 import { PIXEL_ART_PASTEL_PALETTE } from "./palette";
 
+/** Background documents still synchronize; only an active cursor needs focus. */
+export const canSendCollaborativeActivity = (
+  kind: ProjectEditorActivity["kind"],
+  payload: Record<string, unknown>,
+  visibilityState: DocumentVisibilityState,
+) => kind !== "cursor" || visibilityState === "visible" || payload.visible === false;
+
 export type CollaborativeCursor = Readonly<{
   height: number;
   tool: string;

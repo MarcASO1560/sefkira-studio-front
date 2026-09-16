@@ -613,6 +613,9 @@ export const connectProjectPresence = (
         client = new RealtimeClient(realtimeUrl, {
           accessToken: getAccessToken,
           params: { apikey: config.publishable_key },
+          // Browser-tab timers are throttled in the background. Run the
+          // heartbeat in Supabase's worker when the browser supports it.
+          worker: typeof window.Worker === "function",
         });
         await client.setAuth(config.access_token);
         if (closed) {
