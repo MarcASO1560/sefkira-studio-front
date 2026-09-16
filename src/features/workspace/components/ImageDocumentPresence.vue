@@ -34,11 +34,11 @@ const memberCount = computed(() =>
     justify-content: center;
     gap: 4px;
     min-width: 28px;
-    padding: 0 3px;
+    padding: 0;
     color: #ffffff;
     background: transparent;
     border: 0;
-    font-size: 0.68rem;
+    font-size: 12px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     line-height: 1;

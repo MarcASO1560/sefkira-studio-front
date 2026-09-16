@@ -11,12 +11,14 @@ const props = withDefaults(
     lastSavedAt?: number | string | null;
     compactOnMobile?: boolean;
     interactive?: boolean;
+    appearance?: "badge" | "inline";
   }>(),
   {
     error: "",
     lastSavedAt: null,
     compactOnMobile: false,
     interactive: true,
+    appearance: "badge",
   },
 );
 
@@ -70,7 +72,7 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
 <template>
   <span
     class="image-save-status"
-    :class="[`is-${status}`, { 'is-compact-on-mobile': compactOnMobile }]"
+    :class="[`is-${status}`, { 'is-compact-on-mobile': compactOnMobile, 'is-inline': appearance === 'inline' }]"
     :role="status === 'error' ? 'alert' : 'status'"
     :aria-live="status === 'error' ? 'assertive' : 'polite'"
     aria-atomic="true"
@@ -191,6 +193,23 @@ const canRetry = computed(() => props.status === "error" || props.status === "of
     .image-save-status.is-compact-on-mobile .image-save-status__retry > span {
       display: none;
     }
+  }
+
+  .image-save-status.is-inline {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 0;
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    font-size: 12px;
+  }
+
+  .image-save-status.is-inline svg { flex: 0 0 auto; }
+
+  .image-save-status.is-inline:not(.is-dirty) > svg {
+    width: 16px;
+    height: 16px;
   }
 
   @media (forced-colors: active) {

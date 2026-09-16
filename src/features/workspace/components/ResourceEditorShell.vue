@@ -6723,8 +6723,6 @@ onUnmounted(() => {
           class="resource-editor-title"
           :class="{
             'is-loading': isLoading,
-            'has-document-presence': hasImageDocumentPresence && !isLoading,
-            'has-save-warning': displayedImageSaveStatus === 'error' || displayedImageSaveStatus === 'offline',
           }"
           :disabled="isLoading || Boolean(errorMessage) || !resource"
           :aria-label="`Open information for ${resourceName}`"
@@ -6735,26 +6733,29 @@ onUnmounted(() => {
           data-image-shortcuts="off"
           @click="openDocumentInfo"
         >
-          <span class="resource-editor-title__icon" aria-hidden="true">
-            <Icon :icon="editorMeta.icon" width="22" height="22" />
+          <span class="resource-editor-title__identity">
+            <span class="resource-editor-title__icon" aria-hidden="true">
+              <Icon :icon="editorMeta.icon" width="22" height="22" />
+            </span>
+            <span class="resource-editor-title__name">{{ resourceName }}</span>
+            <span class="resource-editor-title__kind">{{ editorMeta.label }}</span>
           </span>
-          <span class="resource-editor-title__name">{{ resourceName }}</span>
-          <span class="resource-editor-title__kind">{{ editorMeta.label }}</span>
-          <span v-if="isImageEditor && !isLoading" class="resource-editor-title__save-cluster">
+          <span v-if="isImageEditor && !isLoading" class="resource-editor-title__status">
             <ImageSaveStatus
               :status="displayedImageSaveStatus"
               :error="displayedImageSaveError"
               :last-saved-at="effectiveImageLastSavedAt"
               :compact-on-mobile="hasImageDocumentPresence"
               :interactive="false"
+              appearance="inline"
+            />
+            <ImageDocumentPresence
+              v-if="!errorMessage"
+              :members="projectPresenceMembers"
+              :current-user-id="currentPresenceUserId"
+              :current-user="currentImagePresenceMember"
             />
           </span>
-          <ImageDocumentPresence
-            v-if="isImageEditor && !isLoading && !errorMessage"
-            :members="projectPresenceMembers"
-            :current-user-id="currentPresenceUserId"
-            :current-user="currentImagePresenceMember"
-          />
         </button>
       </template>
     </StudioTopbar>
@@ -7952,20 +7953,21 @@ onUnmounted(() => {
      the user-selected file icon, and genuine semantic states. */
   .resource-editor-title {
     display: inline-flex;
-    gap: 8px;
+    gap: 12px;
     align-items: center;
-    justify-content: center;
+    justify-content: space-between;
     width: 100%;
     box-sizing: border-box;
     min-width: 0;
     max-width: 100%;
-    height: 36px;
-    padding: 0 10px;
+    height: 40px;
+    padding: 0 12px;
     color: var(--editor-text);
     background: var(--editor-panel);
     border: 1px solid var(--editor-border);
     border-radius: var(--editor-radius-md);
     box-shadow: none;
+    text-align: left;
     cursor: pointer;
     touch-action: manipulation;
   }
@@ -7987,6 +7989,14 @@ onUnmounted(() => {
     opacity: 0.66;
   }
 
+  .resource-editor-title__identity {
+    display: inline-flex;
+    flex: 1 1 auto;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
   .resource-editor-title__icon {
     display: grid;
     flex: 0 0 auto;
@@ -8002,19 +8012,15 @@ onUnmounted(() => {
   }
 
   .resource-editor-title__name {
+    flex: 0 1 auto;
     min-width: 0;
-    max-width: min(240px, 24vw);
-    padding: 4px;
     overflow: hidden;
     color: var(--editor-text);
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 650;
+    line-height: 1.3;
     text-overflow: ellipsis;
     white-space: nowrap;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: var(--editor-radius-sm);
-    outline: none;
   }
 
   .resource-editor-title__name-input {
@@ -8078,12 +8084,13 @@ onUnmounted(() => {
     line-height: 1.5;
   }
 
-  .resource-editor-title__save-cluster {
+  .resource-editor-title__status {
     display: inline-flex;
     flex: 0 0 auto;
     align-items: center;
-    min-width: 0;
-    padding-left: 8px;
+    gap: 12px;
+    min-height: 24px;
+    padding-left: 12px;
     border-left: 1px solid var(--editor-border);
   }
 
@@ -9842,37 +9849,16 @@ onUnmounted(() => {
     }
 
     .resource-editor-title {
-      gap: 5px;
-      width: 100%;
-      padding-right: 7px;
-      padding-left: 7px;
-      box-sizing: border-box;
-    }
-
-    .resource-editor-title__name {
-      max-width: 104px;
-    }
-
-    .resource-editor-title.has-document-presence {
       height: 44px;
-      gap: 4px;
-      padding-right: 3px;
-      padding-left: 5px;
+      gap: 8px;
+      padding: 0 8px;
     }
 
-    .resource-editor-title.has-document-presence .resource-editor-title__name,
-    .resource-editor-title.has-document-presence .resource-editor-title__name-input {
-      flex: 1 1 0;
-      min-width: 0;
-      max-width: none;
-    }
+    .resource-editor-title__identity { gap: 8px; }
 
-    .resource-editor-title.has-document-presence.has-save-warning .resource-editor-title__icon {
-      display: none;
-    }
-
-    .resource-editor-title__save-cluster {
-      padding-left: 5px;
+    .resource-editor-title__status {
+      gap: 8px;
+      padding-left: 8px;
     }
 
     .resource-editor-canvas {
