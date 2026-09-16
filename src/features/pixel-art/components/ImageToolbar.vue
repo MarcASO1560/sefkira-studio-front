@@ -9,6 +9,7 @@ import {
   Pencil,
   Pipette,
   RectangleHorizontal,
+  RotateCw,
   SprayCan,
   SquareDashed,
   WandSparkles,
@@ -39,6 +40,7 @@ const tools = [
   { icon: Ellipse, label: "Ellipse", shortcut: "O", value: "ellipse" },
   { icon: SquareDashed, label: "Selection", shortcut: "S", value: "select" },
   { icon: Move, label: "Move", shortcut: "M", value: "move" },
+  { icon: RotateCw, label: "Rotate pixels", shortcut: "T", value: "rotate" },
 ] as const satisfies ReadonlyArray<{
   icon: typeof Pencil;
   label: string;

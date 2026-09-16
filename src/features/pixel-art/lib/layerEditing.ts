@@ -12,6 +12,7 @@ const IMAGE_PIXEL_MUTATION_TOOLS: ReadonlySet<ImageTool> = new Set([
   "rectangle",
   "ellipse",
   "move",
+  "rotate",
 ]);
 
 export const isImagePixelMutationTool = (tool: ImageTool) =>

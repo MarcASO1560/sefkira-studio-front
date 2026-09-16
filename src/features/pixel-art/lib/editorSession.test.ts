@@ -6,6 +6,9 @@ import {
 } from "./editorSession";
 
 describe("normalizeImageEditorSession", () => {
+  it("restores the pixel rotation tool", () => {
+    expect(normalizeImageEditorSession({ activeTool: "rotate" }).activeTool).toBe("rotate");
+  });
   it("keeps stable per-user editing context", () => {
     const session = normalizeImageEditorSession({
       activeLayerId: "layer-ink",

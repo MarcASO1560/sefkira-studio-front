@@ -17,6 +17,7 @@ const comparePresenceMembers = (
 export const getDocumentPresenceMembers = (
   members: ProjectPresenceMember[],
   currentUserId: string,
+  currentUser?: ProjectPresenceMember | null,
 ): {
   members: ProjectPresenceMember[];
   others: ProjectPresenceMember[];
@@ -36,7 +37,9 @@ export const getDocumentPresenceMembers = (
   const others = [...uniqueMembers.values()]
     .filter((member) => member.id !== currentUserId)
     .sort(comparePresenceMembers);
-  const self = uniqueMembers.get(currentUserId);
+  // The local user is already in the open document, even before their realtime
+  // presence is echoed back. Keep the indicator and their list entry visible.
+  const self = currentUser?.id === currentUserId ? currentUser : uniqueMembers.get(currentUserId);
 
   return { members: self ? [self, ...others] : [...others], others };
 };

@@ -84,7 +84,7 @@ describe("image tool color intent", () => {
     },
   );
 
-  it.each(["select", "move"] satisfies ImageTool[])(
+  it.each(["select", "move", "rotate"] satisfies ImageTool[])(
     "does not assign a color action to %s",
     (tool) => {
       expect(

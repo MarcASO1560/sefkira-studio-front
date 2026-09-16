@@ -14,7 +14,7 @@ const member = (
 });
 
 describe("getDocumentPresenceMembers", () => {
-  it("excludes the current user from the counter and puts them first in the list", () => {
+  it("separates other people and puts the current user first in the full list", () => {
     const self = member("self", { username: "Zoe" });
     const other = member("other", { username: "Alex" });
 
@@ -88,6 +88,31 @@ describe("getDocumentPresenceMembers", () => {
       members: [],
       others: [],
     });
+  });
+
+  it("keeps the local user visible before realtime reports their presence", () => {
+    const self = member("self", { username: "Marc" });
+    const result = getDocumentPresenceMembers([], "self", self);
+
+    expect(result.members).toEqual([self]);
+    expect(result.members).toHaveLength(1);
+    expect(result.others).toEqual([]);
+  });
+
+  it("counts the same account on two devices as one person including the local user", () => {
+    const self = member("self", { username: "Marc", client_id: "local-device" });
+    const secondDevice = member("self", { client_id: "other-device" });
+    const other = member("other");
+
+    expect(getDocumentPresenceMembers([self, secondDevice], "self", self).members).toEqual([self]);
+    expect(getDocumentPresenceMembers([self, secondDevice, other], "self", self).members).toEqual([self, other]);
+  });
+
+  it("does not use a local profile belonging to a different account", () => {
+    const wrongProfile = member("different-user");
+
+    expect(getDocumentPresenceMembers([], "self", wrongProfile).members).toEqual([]);
+    expect(getDocumentPresenceMembers([], "", wrongProfile).members).toEqual([]);
   });
 
   it("sorts people by display name, falling back to email and id, without mutating input", () => {

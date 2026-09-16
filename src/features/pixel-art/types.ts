@@ -21,7 +21,8 @@ export type ImageTool =
   | "rectangle"
   | "ellipse"
   | "select"
-  | "move";
+  | "move"
+  | "rotate";
 
 export type SaveStatus = "saved" | "saving" | "dirty" | "error" | "offline";
 

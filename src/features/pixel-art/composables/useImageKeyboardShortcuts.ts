@@ -33,6 +33,7 @@ const TOOL_SHORTCUTS: Readonly<Record<string, ImageTool>> = {
   i: "picker",
   l: "line",
   m: "move",
+  t: "rotate",
   o: "ellipse",
   r: "rectangle",
   s: "select",

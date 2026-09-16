@@ -5,6 +5,7 @@ import { computed } from "vue";
 import type { BrushShape } from "../lib/drawing";
 import type { ImageTool } from "../types";
 import ImageSelectionControls from "./ImageSelectionControls.vue";
+import ImageRotationControls from "./ImageRotationControls.vue";
 import type {
   ImageSelectionMode,
   ImageSelectionTool,
@@ -22,11 +23,17 @@ const props = withDefaults(defineProps<{
   selectionMode?: ImageSelectionMode;
   selectionContiguous?: boolean;
   hasSelection?: boolean;
+  rotationDegrees?: number;
+  rotationBusy?: boolean;
+  canRotate?: boolean;
 }>(), {
   selectionTool: "rectangle",
   selectionMode: "replace",
   selectionContiguous: true,
   hasSelection: false,
+  rotationDegrees: 0,
+  rotationBusy: false,
+  canRotate: false,
 });
 
 const emit = defineEmits<{
@@ -36,6 +43,8 @@ const emit = defineEmits<{
   "update:selectionTool": [tool: ImageSelectionTool];
   "update:selectionMode": [mode: ImageSelectionMode];
   "update:selectionContiguous": [contiguous: boolean];
+  "update:rotationDegrees": [degrees: number];
+  "apply-rotation": [];
   undo: [];
   redo: [];
 }>();
@@ -51,6 +60,7 @@ const toolLabels: Record<ImageTool, string> = {
   ellipse: "Ellipse",
   select: "Selection",
   move: "Move",
+  rotate: "Rotate pixels",
 };
 
 const brushTools: ReadonlySet<ImageTool> = new Set([
@@ -86,7 +96,7 @@ const updateBrushSize = (event: Event) => {
 <template>
   <div
     class="image-tool-options"
-    :class="{ 'is-selection': activeTool === 'select' }"
+    :class="{ 'is-selection': activeTool === 'select', 'is-rotation': activeTool === 'rotate' }"
     role="toolbar"
     aria-label="Tool options"
   >
@@ -94,7 +104,7 @@ const updateBrushSize = (event: Event) => {
       <button
         type="button"
         class="image-tool-options__button"
-        :disabled="!canEdit || !canUndo"
+        :disabled="!canEdit || !canUndo || rotationBusy"
         aria-label="Undo"
         aria-keyshortcuts="Control+Z Meta+Z"
         title="Undo (Ctrl/Cmd + Z)"
@@ -105,7 +115,7 @@ const updateBrushSize = (event: Event) => {
       <button
         type="button"
         class="image-tool-options__button"
-        :disabled="!canEdit || !canRedo"
+        :disabled="!canEdit || !canRedo || rotationBusy"
         aria-label="Redo"
         aria-keyshortcuts="Control+Y Meta+Y Control+Shift+Z Meta+Shift+Z"
         title="Redo (Ctrl/Cmd + Y)"
@@ -117,6 +127,15 @@ const updateBrushSize = (event: Event) => {
 
     <span class="image-tool-options__separator" aria-hidden="true"></span>
     <span class="image-tool-options__tool">{{ toolLabels[activeTool] }}</span>
+
+    <ImageRotationControls
+      v-if="activeTool === 'rotate'"
+      :degrees="rotationDegrees"
+      :busy="rotationBusy"
+      :can-edit="canEdit && canRotate"
+      @update:degrees="emit('update:rotationDegrees', $event)"
+      @apply="emit('apply-rotation')"
+    />
 
     <ImageSelectionControls
       v-if="activeTool === 'select'"
@@ -440,7 +459,8 @@ const updateBrushSize = (event: Event) => {
       flex-shrink: 0;
     }
 
-    .image-tool-options.is-selection .image-tool-options__history {
+    .image-tool-options.is-selection .image-tool-options__history,
+    .image-tool-options.is-rotation .image-tool-options__history {
       display: none;
     }
 

@@ -78,6 +78,7 @@ describe("getImageKeyboardAction", () => {
     ["o", "ellipse"],
     ["S", "select"],
     ["m", "move"],
+    ["t", "rotate"],
   ])("maps %s to the %s tool", (key, tool) => {
     expect(getImageKeyboardAction(keyboardEvent(key))).toEqual({
       type: "select-tool",

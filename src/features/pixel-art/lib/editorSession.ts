@@ -56,6 +56,7 @@ const IMAGE_TOOLS: ReadonlySet<ImageTool> = new Set([
   "ellipse",
   "select",
   "move",
+  "rotate",
 ]);
 const BRUSH_SHAPES: ReadonlySet<BrushShape> = new Set(["square", "circle", "diamond"]);
 const SELECTION_KINDS: ReadonlySet<ImageSelectionKind> = new Set([

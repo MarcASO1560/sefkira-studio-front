@@ -8,6 +8,7 @@ import { getDocumentPresenceMembers } from "../lib/documentPresence";
 const props = defineProps<{
   members: ProjectPresenceMember[];
   currentUserId: string;
+  currentUser?: ProjectPresenceMember | null;
 }>();
 
 const dialogId = `image-document-presence-${useId()}`;
@@ -21,13 +22,13 @@ let previousFocus: HTMLElement | null = null;
 let previousBodyOverflow: string | null = null;
 
 const presence = computed(() =>
-  getDocumentPresenceMembers(props.members, props.currentUserId),
+  getDocumentPresenceMembers(props.members, props.currentUserId, props.currentUser),
 );
 const listedMembers = computed(() => presence.value.members);
-const otherCount = computed(() => presence.value.others.length);
-const countLabel = computed(() => (otherCount.value > 99 ? "99+" : String(otherCount.value)));
+const memberCount = computed(() => listedMembers.value.length);
+const countLabel = computed(() => (memberCount.value > 99 ? "99+" : String(memberCount.value)));
 const triggerLabel = computed(() =>
-  `${otherCount.value} other ${otherCount.value === 1 ? "person is" : "people are"} in this drawing. Show people`,
+  `${memberCount.value} ${memberCount.value === 1 ? "person is" : "people are"} in this drawing. Show people`,
 );
 
 const displayName = (member: ProjectPresenceMember) =>
@@ -75,7 +76,7 @@ const closeDialog = () => {
   const target = previousFocus;
   previousFocus = null;
   void nextTick(() => {
-    if (target?.isConnected && (target !== trigger.value || otherCount.value > 0)) {
+    if (target?.isConnected && (target !== trigger.value || memberCount.value > 0)) {
       target.focus({ preventScroll: true });
     }
   });
@@ -112,7 +113,7 @@ function handleModalFocus(event: FocusEvent) {
 }
 
 const openDialog = async () => {
-  if (!otherCount.value || isOpen.value) return;
+  if (!memberCount.value || isOpen.value) return;
   previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : trigger.value;
   isOpen.value = true;
   previousBodyOverflow = document.body.style.overflow;
@@ -123,7 +124,7 @@ const openDialog = async () => {
   if (isOpen.value) closeButton.value?.focus({ preventScroll: true });
 };
 
-watch(otherCount, (count) => {
+watch(memberCount, (count) => {
   if (count === 0) closeDialog();
 });
 
@@ -136,10 +137,10 @@ onBeforeUnmount(() => {
 
 <template>
   <button
-    v-if="otherCount > 0"
+    v-if="memberCount > 0"
     ref="trigger"
     class="image-document-presence"
-    :class="{ 'has-many-people': otherCount > 99 }"
+    :class="{ 'has-many-people': memberCount > 99 }"
     type="button"
     data-image-shortcuts="off"
     :aria-label="triggerLabel"

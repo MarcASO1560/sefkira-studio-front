@@ -17,6 +17,7 @@ const PIXEL_PAINTING_TOOLS: ImageTool[] = [
   "rectangle",
   "ellipse",
   "move",
+  "rotate",
 ];
 
 const NON_MUTATING_TOOLS: ImageTool[] = ["picker", "select"];

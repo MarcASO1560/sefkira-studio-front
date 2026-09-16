@@ -130,6 +130,12 @@ import {
   type PixelSelectionMask,
 } from "../../pixel-art/lib/selectionMask";
 import {
+  getPixelRotationDelta,
+  getPixelRotationPivot,
+  rotateImagePixelSelection,
+  snapPixelRotationDegrees,
+} from "../../pixel-art/lib/selectionRotation";
+import {
   calculateImagePreviewSize,
   clipImagePreviewPolygonToBounds,
   IMAGE_PREVIEW_MAX_SIZE,
@@ -480,7 +486,17 @@ const isImagePinching = ref(false);
 const draggingImageMirrorAxis = ref<ImageMirrorAxis | null>(null);
 const isImageSpacePressed = ref(false);
 const isImageShiftPressed = ref(false);
-const imageInteractionKind = ref<"paint" | "shape" | "select" | "move" | null>(null);
+const imageInteractionKind = ref<"paint" | "shape" | "select" | "move" | "rotate" | null>(null);
+const imagePixelRotationDegrees = ref(0);
+const imagePixelRotationGesture = shallowRef<{
+  buffer: PixelBuffer;
+  selection: ImageSelection | null;
+  layerId: string;
+  pivot: Point;
+  lastAngle: number | null;
+  rawDegrees: number;
+  didChange: boolean;
+} | null>(null);
 const hoveredImagePixelIndex = ref<number | null>(null);
 const hoveredImageVirtualPoint = ref<Point | null>(null);
 const remoteImageCollaborators = ref<Record<string, RemoteImageCollaborator>>({});
@@ -596,10 +612,25 @@ const editorMeta = computed(() =>
   resource.value ? editorMetaByType[resource.value.type] || fallbackEditorMeta : fallbackEditorMeta,
 );
 const isImageEditor = computed(() => editorMeta.value.routeKind === "image");
+const currentImagePresenceMember = computed<ProjectPresenceMember | null>(() => {
+  if (!currentPresenceUserId.value || !resource.value) return null;
+  return {
+    id: currentPresenceUserId.value,
+    email: profileEmail.value,
+    username: profileUsername.value || profileUserName.value,
+    avatar_url: profileAvatarUrl.value || null,
+    avatar_pixel_art: profilePixelAvatar.value,
+    resource_id: props.resourceId,
+  };
+});
 const hasImageDocumentPresence = computed(
   () =>
     isImageEditor.value &&
-    getDocumentPresenceMembers(projectPresenceMembers.value, currentPresenceUserId.value).others.length > 0,
+    getDocumentPresenceMembers(
+      projectPresenceMembers.value,
+      currentPresenceUserId.value,
+      currentImagePresenceMember.value,
+    ).members.length > 0,
 );
 const projectName = computed(() => project.value?.name || "Project");
 const resourceName = computed(() => resource.value?.name || "Loading item");
@@ -1396,7 +1427,9 @@ const imageArtboardAriaLabel = computed(() => {
               ? ` ${isImageSelectionContiguous.value ? "Contiguous" : "Global"} exact-color matching.`
               : ""
           }`
-        : "";
+        : activeImageTool.value === "rotate"
+          ? " Drag around the white center cross to rotate pixels, or enter exact degrees and Apply. Shift snaps to 15 degrees. Pixels outside the canvas are clipped."
+          : "";
   const layerState =
     activeImageLayer.value && !activeImageLayer.value.visible
       ? " The active layer is hidden; show it to edit pixels."
@@ -2063,15 +2096,26 @@ const commitResourceName = () => {
   return operation;
 };
 
-const buildImageDocument = (): PixelArtDocumentV2 => ({
-  version: 2,
-  width: imageGridWidth.value,
-  height: imageGridHeight.value,
-  palette: [...usedImagePaletteColors.value],
+const buildImageDocument = (includeRotationPreview = true): PixelArtDocumentV2 => {
   // Pixel buffers are treated as immutable throughout the editor. Reusing them
   // here keeps rendering and history snapshots cheap even at the v1 limits.
-  layers: imageLayers.value.map((layer) => ({ ...layer, pixels: layer.pixels })),
-});
+  // Saving and broadcasting must exclude an uncommitted rotation preview.
+  const layers = imageLayers.value.map((layer) => ({
+    ...layer,
+    pixels: !includeRotationPreview && imagePixelRotationGesture.value?.layerId === layer.id
+      ? [...imagePixelRotationGesture.value.buffer.pixels]
+      : layer.pixels,
+  }));
+  return {
+    version: 2,
+    width: imageGridWidth.value,
+    height: imageGridHeight.value,
+    palette: !includeRotationPreview && imagePixelRotationGesture.value
+      ? deriveUsedPaletteColors(layers)
+      : [...usedImagePaletteColors.value],
+    layers,
+  };
+};
 
 const sendImageCollaborationActivity = (
   kind: ProjectEditorActivity["kind"],
@@ -2121,7 +2165,7 @@ const broadcastImageDocument = (
 ) => {
   flushImageCollaborationPixels();
   sendImageCollaborationActivity("document", {
-    document: buildImageDocument(),
+    document: buildImageDocument(false),
     ...(persistedRevision === undefined ? {} : { persisted_revision: persistedRevision }),
     ...(targetClientId ? { target_client_id: targetClientId } : {}),
   });
@@ -2191,7 +2235,9 @@ const broadcastImageSelection = () => {
     // the latest reference lets the throttle discard intermediate pointer
     // frames without bit-packing a complete 256 x 256 mask for each one.
     mode: imageSelectionMode.value,
-    selection: imageSelection.value,
+    selection: imagePixelRotationGesture.value
+      ? imagePixelRotationGesture.value.selection
+      : imageSelection.value,
   };
   const remaining = Math.max(
     0,
@@ -2361,6 +2407,7 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
 
   const patch = readCollaborativePixelPatch(activity);
   if (patch) {
+    if (imagePixelRotationGesture.value) cancelImageInteraction();
     const nextLayers = applyCollaborativePixelPatch(
       imageLayers.value,
       patch,
@@ -2402,6 +2449,7 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
     return;
   }
   lastRemoteImageMutationAt = Date.now();
+  if (imagePixelRotationGesture.value) cancelImageInteraction();
   applyRemoteImageDocument(document);
   updateRemoteImageCollaborator(activity, {});
 
@@ -2541,7 +2589,7 @@ const redoImage = () => {
 const saveImageDocument = async (_sequence: number) => {
   // Capture one immutable view only when the debounced request actually starts;
   // pointermove events merely advance a tiny sequence token.
-  let document = buildImageDocument();
+  let document = buildImageDocument(false);
 
   await enqueueResourceMutation(async () => {
     const currentResource = resource.value;
@@ -2565,7 +2613,7 @@ const saveImageDocument = async (_sequence: number) => {
       Date.now() - lastRemoteImageMutationAt < 5000
     ) {
       const latestKnownResource = resource.value || currentResource;
-      document = buildImageDocument();
+      document = buildImageDocument(false);
       nextData = serializePixelArtResourceData(latestKnownResource.data || {}, document);
       result = await patchProjectResource(props.projectId, props.resourceId, {
         data: nextData,
@@ -3427,6 +3475,11 @@ const startImageViewportInteractionFromPointer = (
   hoveredImagePixelIndex.value = null;
   hoveredImageVirtualPoint.value = null;
 
+  if (imageInteractionTool === "rotate") {
+    startImagePixelRotation(event, { x: clientX, y: clientY });
+    return;
+  }
+
   if (isImageWrapAroundEnabled.value) {
     const initialPixelIndex = getImagePixelIndexFromClientCoordinates(clientX, clientY);
     const initialVirtualPoint = getImageVirtualPixelPointFromClientCoordinates(clientX, clientY);
@@ -3477,6 +3530,10 @@ const startImageArtboardInteractionFromPointer = (
   const clientY = startPoint?.y ?? event.clientY;
   imageViewportPaintClientX = clientX;
   imageViewportPaintClientY = clientY;
+  if (imageInteractionTool === "rotate") {
+    startImagePixelRotation(event, { x: clientX, y: clientY });
+    return;
+  }
   const initialPixelIndex = getImagePixelIndexFromClientCoordinates(clientX, clientY);
   const initialVirtualPoint = getImageVirtualPixelPointFromClientCoordinates(clientX, clientY);
   isImageViewportPaintAwaitingArtboard = initialPixelIndex === null;
@@ -3520,6 +3577,10 @@ const processImagePointerSegment = (
   const from = { x: imageViewportPaintClientX, y: imageViewportPaintClientY };
   imageViewportPaintClientX = to.x;
   imageViewportPaintClientY = to.y;
+  if (imageInteractionKind.value === "rotate") {
+    continueImagePixelRotation(event, to);
+    return;
+  }
   const unrotatedFrom = mapImageClientPointToUnrotatedArtboard(from, clientSpace);
   const unrotatedTo = mapImageClientPointToUnrotatedArtboard(to, clientSpace);
 
@@ -4614,7 +4675,8 @@ const stopPaintingImage = (event?: PointerEvent) => {
   const shouldCommitHistory =
     interactionKind === "paint" ||
     interactionKind === "shape" ||
-    (interactionKind === "move" && imageMoveDidChange);
+    (interactionKind === "move" && imageMoveDidChange) ||
+    (interactionKind === "rotate" && imagePixelRotationGesture.value?.didChange === true);
   if (interactionKind === "shape" && imageShapePreviewPoints.value.length > 0) {
     applyImagePoints(imageShapePreviewPoints.value, imageInteractionColor);
   }
@@ -4650,6 +4712,8 @@ const stopPaintingImage = (event?: PointerEvent) => {
   imageMoveSourceBuffer = null;
   imageMoveSourceSelection = null;
   imageMoveDidChange = false;
+  imagePixelRotationGesture.value = null;
+  if (interactionKind === "rotate") imagePixelRotationDegrees.value = 0;
   imageSelectionDidDrag = false;
   imageSelectionGestureBase = null;
   imageSelectionGestureKind = imageSelectionKind.value;
@@ -4659,7 +4723,7 @@ const stopPaintingImage = (event?: PointerEvent) => {
   lastPaintedImagePixelIndex = null;
   scheduleImageCanvasRender();
   if (shouldCommitHistory) {
-    if (interactionKind === "move") scheduleImageAutosave();
+    if (interactionKind === "move" || interactionKind === "rotate") scheduleImageAutosave();
     commitImageHistory();
   }
 };
@@ -4720,6 +4784,15 @@ const cancelImageInteraction = (
   if (wasSelecting) {
     imageSelection.value = cloneImageSelection(imageSelectionGestureBase);
   }
+  if (interactionKind === "rotate" && imagePixelRotationGesture.value) {
+    const gesture = imagePixelRotationGesture.value;
+    imageLayers.value = imageLayers.value.map((layer) =>
+      layer.id === gesture.layerId ? { ...layer, pixels: [...gesture.buffer.pixels] } : layer,
+    );
+    imageSelection.value = cloneImageSelection(gesture.selection);
+  }
+  imagePixelRotationGesture.value = null;
+  if (interactionKind === "rotate") imagePixelRotationDegrees.value = 0;
   imageMoveSourceBuffer = null;
   imageMoveSourceSelection = null;
   imageMoveDidChange = false;
@@ -4797,6 +4870,8 @@ const resizeImageWorkspace = (nextWidth: number, nextHeight: number) => {
   if (width === imageGridWidth.value && height === imageGridHeight.value) {
     return;
   }
+
+  if (imagePixelRotationGesture.value) cancelImageInteractionBeforeLayerChange();
 
   const resizedDocument = resizePixelArtDocument(
     buildImageDocument(),
@@ -5081,6 +5156,80 @@ const activeImageBuffer = () => ({
   height: imageGridHeight.value,
   pixels: imagePixels.value,
 });
+
+const imagePixelRotationPivotStyle = computed(() => {
+  const pivot = imagePixelRotationGesture.value?.pivot ??
+    getPixelRotationPivot(imageCanvasBounds.value, imageSelection.value);
+  return {
+    left: `${pivot.x / imageGridWidth.value * 100}%`,
+    top: `${pivot.y / imageGridHeight.value * 100}%`,
+  };
+});
+
+const pixelRotationPointerAngle = (point: Point, pivot: Point) =>
+  Math.hypot(point.x - pivot.x, point.y - pivot.y) < 0.05
+    ? null
+    : Math.atan2(point.y - pivot.y, point.x - pivot.x) * 180 / Math.PI;
+
+const startImagePixelRotation = (event: PointerEvent, clientPoint: Point) => {
+  const point = getImageVirtualCanvasPositionFromClientCoordinates(clientPoint.x, clientPoint.y);
+  if (!point || !canMutateActiveImageLayerPixels.value) {
+    cancelImageInteraction();
+    return;
+  }
+  const buffer = { ...activeImageBuffer(), pixels: [...imagePixels.value] };
+  const selection = cloneImageSelection(imageSelection.value);
+  const pivot = getPixelRotationPivot(buffer, selection);
+  imagePixelRotationGesture.value = {
+    buffer, selection, pivot,
+    layerId: activeImageLayerId.value,
+    lastAngle: pixelRotationPointerAngle(point, pivot),
+    rawDegrees: 0,
+    didChange: false,
+  };
+  imagePixelRotationDegrees.value = 0;
+  imageInteractionKind.value = "rotate";
+  isPaintingImage.value = true;
+  isImageViewportPaintAwaitingArtboard = false;
+  focusAndCaptureImagePointer(event);
+};
+
+const continueImagePixelRotation = (event: PointerEvent, clientPoint: Point) => {
+  const gesture = imagePixelRotationGesture.value;
+  if (!gesture) return;
+  if (!canMutateActiveImageLayerPixels.value || gesture.layerId !== activeImageLayerId.value) {
+    cancelImageInteraction(event);
+    return;
+  }
+  const point = getImageVirtualCanvasPositionFromClientCoordinates(clientPoint.x, clientPoint.y);
+  if (!point) return;
+  const angle = pixelRotationPointerAngle(point, gesture.pivot);
+  if (angle === null) return;
+  if (gesture.lastAngle !== null) gesture.rawDegrees += getPixelRotationDelta(gesture.lastAngle, angle);
+  gesture.lastAngle = angle;
+  const degrees = snapPixelRotationDegrees(gesture.rawDegrees, event.shiftKey);
+  imagePixelRotationDegrees.value = Math.round(degrees * 100) / 100;
+  const result = rotateImagePixelSelection(gesture.buffer, gesture.selection, degrees);
+  imagePixels.value = result.pixels;
+  imageSelection.value = result.selection;
+  gesture.didChange = !imagePixelsAreEqual(gesture.buffer.pixels, result.pixels) ||
+    !imageSelectionMasksAreEqual(gesture.selection, result.selection);
+  scheduleImageCanvasRender();
+};
+
+const applyImagePixelRotation = () => {
+  const degrees = imagePixelRotationDegrees.value;
+  if (!canMutateActiveImageLayerPixels.value || imageInteractionKind.value !== null ||
+      !Number.isFinite(degrees) || degrees % 360 === 0) return;
+  const previousSelection = imageSelection.value;
+  const result = rotateImagePixelSelection(activeImageBuffer(), previousSelection, degrees);
+  imageSelection.value = result.selection;
+  const didChange = updateImagePixels(result.pixels);
+  const selectionChanged = !imageSelectionMasksAreEqual(previousSelection, result.selection);
+  if (didChange || selectionChanged) commitImageHistory();
+  if (selectionChanged) scheduleImageCanvasRender();
+  imagePixelRotationDegrees.value = 0;
+};
 
 const createImageSelectionClipboard = (
   buffer: PixelBuffer,
@@ -6137,6 +6286,11 @@ const handleResourceEditorKeydown = (event: KeyboardEvent) => {
     return;
   }
 
+  if (imageInteractionKind.value === "rotate") {
+    event.preventDefault();
+    return;
+  }
+
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
     event.preventDefault();
     void saveImageNow();
@@ -6578,6 +6732,7 @@ onUnmounted(() => {
             v-if="isImageEditor && !isLoading && !errorMessage"
             :members="projectPresenceMembers"
             :current-user-id="currentPresenceUserId"
+            :current-user="currentImagePresenceMember"
           />
         </div>
       </template>
@@ -7079,6 +7234,9 @@ onUnmounted(() => {
             :selection-mode="imageSelectionMode"
             :selection-contiguous="isImageSelectionContiguous"
             :has-selection="imageSelection !== null"
+            :rotation-degrees="imagePixelRotationDegrees"
+            :rotation-busy="imageInteractionKind === 'rotate'"
+            :can-rotate="canMutateActiveImageLayerPixels"
             :can-undo="canUndoImage"
             :can-redo="canRedoImage"
             :can-edit="canEditImage"
@@ -7088,6 +7246,8 @@ onUnmounted(() => {
             @update:selection-tool="imageSelectionKind = $event"
             @update:selection-mode="imageSelectionMode = $event"
             @update:selection-contiguous="isImageSelectionContiguous = $event"
+            @update:rotation-degrees="imagePixelRotationDegrees = $event"
+            @apply-rotation="applyImagePixelRotation"
             @undo="undoImage"
             @redo="redoImage"
           />
@@ -7335,6 +7495,12 @@ onUnmounted(() => {
             >
               Pixel art preview. Use the editor tools and keyboard shortcuts to modify the image.
             </canvas>
+            <span
+              v-if="activeImageTool === 'rotate'"
+              class="image-editor-pixel-rotation-pivot"
+              :style="imagePixelRotationPivotStyle"
+              aria-hidden="true"
+            ></span>
             <svg
               v-if="imageGridOverlayOpacity > 0"
               class="image-editor-grid-overlay"
@@ -9133,6 +9299,35 @@ onUnmounted(() => {
       rotate(var(--image-rotation, 0rad)) scale(var(--image-live-scale, 1));
     transform-origin: center;
     user-select: none;
+  }
+
+  .image-editor-pixel-rotation-pivot {
+    position: absolute;
+    z-index: 8;
+    width: 16px;
+    height: 16px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    filter: drop-shadow(0 0 1px #000000) drop-shadow(0 0 1px #000000);
+  }
+
+  .image-editor-pixel-rotation-pivot::before,
+  .image-editor-pixel-rotation-pivot::after {
+    position: absolute;
+    content: "";
+    background: #ffffff;
+  }
+
+  .image-editor-pixel-rotation-pivot::before {
+    top: 7px;
+    width: 16px;
+    height: 2px;
+  }
+
+  .image-editor-pixel-rotation-pivot::after {
+    left: 7px;
+    width: 2px;
+    height: 16px;
   }
 
   .image-editor-artboard:focus-visible {
