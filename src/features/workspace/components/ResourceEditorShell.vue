@@ -145,7 +145,6 @@ import {
 import {
   parsePixelArtResourceData,
   PixelArtMigrationError,
-  serializePixelArtResourceData,
 } from "../../pixel-art/lib/migrations";
 import {
   addPinnedPaletteColor,
@@ -158,12 +157,9 @@ import {
 } from "../../pixel-art/lib/palette";
 import { resizePixelArtDocument } from "../../pixel-art/lib/resize";
 import {
-  applyCollaborativePixelPatch,
   canSendCollaborativeActivity,
   collaboratorColor,
   readCollaborativeCursor,
-  readCollaborativeDocument,
-  readCollaborativePixelPatch,
   readCollaborativeSelection,
   serializeCollaborativeSelection,
 } from "../../pixel-art/lib/collaboration";
@@ -177,7 +173,8 @@ import {
   sanitizeImageFileName,
   type PngExportScale,
 } from "../../pixel-art/lib/importExport";
-import { useImageAutosave } from "../../pixel-art/composables/useImageAutosave";
+import { useImageOperationSync } from "../../pixel-art/composables/useImageOperationSync";
+import { rebaseImageHistoryDocument } from "../../pixel-art/lib/collaborativeHistory";
 import {
   normalizeImagePreferences,
   useImagePreferences,
@@ -369,7 +366,6 @@ const IMAGE_ROTATION_STEP_RADIANS = Math.PI / 12;
 const IMAGE_ROTATION_MIN_POINTER_RADIUS = 24;
 const IMAGE_AUTOSAVE_MS = 420;
 const IMAGE_COLLABORATION_CURSOR_INTERVAL_MS = 32;
-const IMAGE_COLLABORATION_PIXEL_INTERVAL_MS = 24;
 const IMAGE_COLLABORATION_SELECTION_INTERVAL_MS = 64;
 const IMAGE_COLLABORATOR_STALE_MS = 12000;
 const IMAGE_PALETTE = PIXEL_ART_PALETTE;
@@ -530,6 +526,7 @@ const isImageConflictOpen = ref(false);
 const imageConflictRemoteRevision = ref<number | null>(null);
 const imageConflictOperation = ref<ImageConflictOperation | null>(null);
 const isImageConflictResolving = ref(false);
+const isImageOperationReady = ref(false);
 const isRenamingResource = ref(false);
 const isDocumentInfoOpen = ref(false);
 const isResourceNameSaving = ref(false);
@@ -597,12 +594,9 @@ let pendingImageCollaborationSelection: Readonly<{
 let lastImageCollaborationCursorPosition: Readonly<{ x: number; y: number }> | null = null;
 let lastImageCollaborationCursorAt = 0;
 let lastImageCollaborationSelectionAt = 0;
-const pendingImageCollaborationPixels = new Map<string, Map<number, PixelColor>>();
-let imageCollaborationPixelsTimeout: ReturnType<typeof setTimeout> | null = null;
 const lastImageCollaborationSequence = new Map<string, number>();
 const pendingProjectEditorActivities: ProjectEditorActivity[] = [];
-let lastRemoteImageMutationAt = 0;
-let imageAutosaveSequence = 0;
+let imageCanonicalRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
 let resourceMutationQueue: Promise<void> = Promise.resolve();
 let personalImagePaletteMutationQueue: Promise<void> = Promise.resolve();
 let pendingPersonalImagePaletteMutations = 0;
@@ -678,6 +672,7 @@ const usedImagePaletteColors = computed(() => deriveUsedPaletteColors(imageLayer
 const canEditImage = computed(
   () =>
     isImageEditor.value &&
+    isImageOperationReady.value &&
     (project.value?.access_role === "owner" || project.value?.access_role === "editor"),
 );
 const canManagePersonalImagePalette = computed(
@@ -1947,6 +1942,7 @@ const normalizeImageResizeAnchor = (value: unknown): ImageResizeAnchor =>
 
 const readImagePixelsFromData = (data: Record<string, unknown>) => {
   const result = parsePixelArtResourceData(data);
+  if (result.migrated) result.document.layers[0]!.id = "legacy-layer-1";
   const legacyPixelArt =
     data.pixel_art && typeof data.pixel_art === "object"
       ? (data.pixel_art as Record<string, unknown>)
@@ -2018,10 +2014,23 @@ const persistResourceName = async (name: string) => {
         throw new Error("You no longer have permission to rename this image.");
       }
 
-      const result = await patchProjectResource(props.projectId, props.resourceId, {
+      let result = await patchProjectResource(props.projectId, props.resourceId, {
         name,
         base_revision: currentResource.revision,
       });
+
+      if (!result.ok && result.conflict) {
+        // A drawing operation can advance the revision while a name is saving.
+        // Refresh and retry only the name, never any image data.
+        const latestResource = await fetchLatestImageResource();
+        if (latestResource) {
+          await imageAutosave.acceptResource(latestResource);
+          result = await patchProjectResource(props.projectId, props.resourceId, {
+            name,
+            base_revision: latestResource.revision,
+          });
+        }
+      }
 
       if (!result.ok) {
         if (result.conflict) {
@@ -2046,6 +2055,7 @@ const persistResourceName = async (name: string) => {
         ...result.resource,
         data: currentResource.data,
       };
+      await imageAutosave.refresh();
     });
   } finally {
     isResourceNameSaving.value = false;
@@ -2193,50 +2203,25 @@ const sendImageCollaborationActivity = (
   projectPresenceConnection?.sendEditorActivity(kind, payload);
 };
 
-const flushImageCollaborationPixels = () => {
-  if (imageCollaborationPixelsTimeout !== null) {
-    window.clearTimeout(imageCollaborationPixelsTimeout);
-    imageCollaborationPixelsTimeout = null;
-  }
-
-  for (const [layerId, pixels] of pendingImageCollaborationPixels) {
-    if (pixels.size === 0) continue;
-    sendImageCollaborationActivity("pixels", {
-      changes: [...pixels.entries()],
-      height: imageGridHeight.value,
-      layer_id: layerId,
-      width: imageGridWidth.value,
-    });
-  }
-  pendingImageCollaborationPixels.clear();
-};
-
-const queueImageCollaborationPixels = (
-  changes: ReadonlyArray<Readonly<{ index: number; after: PixelColor }>>,
-) => {
-  const layerId = activeImageLayer.value?.id;
-  if (!layerId || changes.length === 0) return;
-
-  const pending = pendingImageCollaborationPixels.get(layerId) || new Map<number, PixelColor>();
-  for (const change of changes) pending.set(change.index, change.after);
-  pendingImageCollaborationPixels.set(layerId, pending);
-  if (imageCollaborationPixelsTimeout !== null) return;
-  imageCollaborationPixelsTimeout = window.setTimeout(
-    flushImageCollaborationPixels,
-    IMAGE_COLLABORATION_PIXEL_INTERVAL_MS,
-  );
-};
-
 const broadcastImageDocument = (
   persistedRevision?: number,
   targetClientId?: string,
 ) => {
-  flushImageCollaborationPixels();
+  // Peers only announce a server-confirmed revision. They never replace a canvas.
+  if (persistedRevision === undefined) return;
   sendImageCollaborationActivity("document", {
-    document: buildImageDocument(false),
-    ...(persistedRevision === undefined ? {} : { persisted_revision: persistedRevision }),
+    operation_protocol: 1,
+    persisted_revision: persistedRevision,
     ...(targetClientId ? { target_client_id: targetClientId } : {}),
   });
+};
+
+const requestImageCanonicalRefresh = () => {
+  if (imageCanonicalRefreshTimeout !== null || !isImageOperationReady.value) return;
+  imageCanonicalRefreshTimeout = setTimeout(() => {
+    imageCanonicalRefreshTimeout = null;
+    void imageAutosave.refresh();
+  }, 80);
 };
 
 const flushImageCollaborationCursor = () => {
@@ -2392,6 +2377,7 @@ const updateRemoteImageCollaborator = (
 
 const handleProjectPresenceSync = (snapshot: ProjectPresenceSnapshot) => {
   projectPresenceMembers.value = snapshot[props.resourceId] || [];
+  requestImageCanonicalRefresh();
   if (projectPresenceMembers.value.length === 0) return;
 
   remoteImageCollaborators.value = Object.fromEntries(
@@ -2412,7 +2398,10 @@ const handleProjectPresenceSync = (snapshot: ProjectPresenceSnapshot) => {
   );
 };
 
-const applyRemoteImageDocument = (document: PixelArtDocumentV2) => {
+const applyRemoteImageDocument = (
+  document: PixelArtDocumentV2,
+  previousDocument: PixelArtDocumentV2 | null,
+) => {
   const currentLayerId = activeImageLayerId.value;
   const didResize =
     document.width !== imageGridWidth.value || document.height !== imageGridHeight.value;
@@ -2428,7 +2417,14 @@ const applyRemoteImageDocument = (document: PixelArtDocumentV2) => {
     broadcastImageSelection();
   }
   syncImageDimensionDrafts();
-  resetImageHistory();
+  if (didResize || !previousDocument || !imageHistory.value) {
+    resetImageHistory();
+  } else {
+    imageHistory.value = imageHistory.value.mapSnapshots((snapshot) => ({
+      ...snapshot,
+      document: rebaseImageHistoryDocument(snapshot.document, previousDocument, document),
+    }));
+  }
   scheduleImageCanvasRender();
   void nextTick(scheduleImagePreviewViewportUpdate);
 };
@@ -2446,9 +2442,8 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
 
   if (activity.kind === "sync-request") {
     updateRemoteImageCollaborator(activity, {});
-    if (canEditImage.value) {
-      broadcastImageDocument(resource.value.revision, activity.client_id);
-    }
+    requestImageCanonicalRefresh();
+    broadcastImageDocument(resource.value.revision, activity.client_id);
     broadcastImageCursor(lastImageCollaborationCursorPosition);
     broadcastImageSelection();
     return;
@@ -2473,42 +2468,7 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
     return;
   }
 
-  const patch = readCollaborativePixelPatch(activity);
-  if (patch) {
-    if (imagePixelRotationGesture.value) cancelImageInteraction();
-    const nextLayers = applyCollaborativePixelPatch(
-      imageLayers.value,
-      patch,
-      imageGridWidth.value,
-      imageGridHeight.value,
-    );
-    if (nextLayers) {
-      imageLayers.value = nextLayers;
-      if (imageHistory.value) {
-        imageHistory.value = imageHistory.value.mapSnapshots((snapshot) => {
-          const rebasedLayers = applyCollaborativePixelPatch(
-            snapshot.document.layers,
-            patch,
-            snapshot.document.width,
-            snapshot.document.height,
-          );
-          return rebasedLayers
-            ? {
-                ...snapshot,
-                document: { ...snapshot.document, layers: rebasedLayers },
-              }
-            : snapshot;
-        });
-      }
-      lastRemoteImageMutationAt = Date.now();
-      scheduleImageCanvasRender();
-    }
-    updateRemoteImageCollaborator(activity, {});
-    return;
-  }
-
-  const document = readCollaborativeDocument(activity);
-  if (!document) return;
+  if (activity.kind !== "document") return;
   const targetClientId = activity.payload.target_client_id;
   if (
     typeof targetClientId === "string" &&
@@ -2516,24 +2476,13 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
   ) {
     return;
   }
-  lastRemoteImageMutationAt = Date.now();
-  if (imagePixelRotationGesture.value) cancelImageInteraction();
-  applyRemoteImageDocument(document);
-  updateRemoteImageCollaborator(activity, {});
-
-  const persistedRevision = activity.payload.persisted_revision;
-  if (
-    resource.value &&
-    typeof persistedRevision === "number" &&
-    Number.isInteger(persistedRevision) &&
-    persistedRevision > resource.value.revision
-  ) {
-    resource.value = {
-      ...resource.value,
-      data: serializePixelArtResourceData(resource.value.data || {}, document),
-      revision: persistedRevision,
-    };
+  // Even legacy broadcasts are only hints: read the authoritative server state.
+  // Ignore unconfirmed previews, avoiding a GET storm from older clients.
+  const revision = activity.payload.persisted_revision;
+  if (typeof revision === "number" && Number.isSafeInteger(revision) && revision > resource.value.revision) {
+    requestImageCanonicalRefresh();
   }
+  updateRemoteImageCollaborator(activity, {});
 };
 
 const createImageSnapshot = (): ImageEditorSnapshot => ({
@@ -2564,7 +2513,7 @@ const imageSnapshotDocumentsAreEqual = (
       layer.visible === other.visible &&
       layer.locked === other.locked &&
       layer.opacity === other.opacity &&
-      layer.pixels === other.pixels
+      (layer.pixels === other.pixels || imagePixelsAreEqual(layer.pixels, other.pixels))
     );
   });
 };
@@ -2632,7 +2581,7 @@ const undoImage = () => {
   );
   applyImageSnapshot(imageHistory.value.current);
   if (documentChanged) {
-    scheduleImageAutosave();
+    scheduleImageAutosave({ conditional: true });
     broadcastImageDocument();
   }
   broadcastImageSelection();
@@ -2648,80 +2597,38 @@ const redoImage = () => {
   );
   applyImageSnapshot(imageHistory.value.current);
   if (documentChanged) {
-    scheduleImageAutosave();
+    scheduleImageAutosave({ conditional: true });
     broadcastImageDocument();
   }
   broadcastImageSelection();
 };
 
-const saveImageDocument = async (_sequence: number) => {
-  // Capture one immutable view only when the debounced request actually starts;
-  // pointermove events merely advance a tiny sequence token.
-  let document = buildImageDocument(false);
-
-  await enqueueResourceMutation(async () => {
-    const currentResource = resource.value;
-    if (!currentResource || !canEditImage.value) {
-      throw new Error("You no longer have permission to save this image.");
-    }
-
-    let nextData = serializePixelArtResourceData(
-      currentResource.data || {},
-      document,
-    );
-
-    let result = await patchProjectResource(props.projectId, props.resourceId, {
-      data: nextData,
-      base_revision: currentResource.revision,
-    });
-
-    if (
-      !result.ok &&
-      result.conflict &&
-      Date.now() - lastRemoteImageMutationAt < 5000
-    ) {
-      const latestKnownResource = resource.value || currentResource;
-      document = buildImageDocument(false);
-      nextData = serializePixelArtResourceData(latestKnownResource.data || {}, document);
-      result = await patchProjectResource(props.projectId, props.resourceId, {
-        data: nextData,
-        base_revision: Math.max(
-          latestKnownResource.revision,
-          result.conflict.current_revision,
-        ),
-      });
-    }
-
-    if (!result.ok) {
-      if (result.conflict) {
-        openImageConflict({ kind: "document" }, result.conflict.current_revision);
-        throw new Error("A newer version exists. Choose which version to keep.");
-      }
-      if (result.status === 403) {
-        markImageReadOnly();
-      }
-      throw new Error(
-        result.status === 403
-          ? "You no longer have permission to save this image."
-          : `Save failed${result.status ? ` (${result.status})` : ""}. Your changes are still local.`,
-      );
-    }
-
-    resource.value = {
-      ...(resource.value || currentResource),
-      ...result.resource,
-      data: nextData,
-    };
-    broadcastImageDocument(result.resource.revision);
-  });
-};
-
-const imageAutosave = useImageAutosave<number>(saveImageDocument, {
+const imageAutosave = useImageOperationSync({
+  projectId: props.projectId,
+  resourceId: props.resourceId,
+  userId: () => currentPresenceUserId.value,
   debounceMs: IMAGE_AUTOSAVE_MS,
+  onDocument(document, context) {
+    resource.value = context.resource;
+    if (!context.previousDocument || !imageSnapshotDocumentsAreEqual(context.previousDocument, document)) {
+      applyRemoteImageDocument(document, context.previousDocument);
+    }
+    if (context.source === "ack") broadcastImageDocument(context.resource.revision);
+  },
+  onConflict() {
+    openImageConflict({ kind: "document" }, resource.value?.revision ?? null);
+  },
 });
 const imageSaveStatus = imageAutosave.status;
 const imageSaveError = imageAutosave.errorMessage;
 const imageLastSavedAt = imageAutosave.lastSavedAt;
+watch([imageSaveStatus, imageAutosave.hasPendingChanges], ([status, pending]) => {
+  if (status === "saved" && !pending && imageConflictOperation.value?.kind === "document") {
+    isImageConflictOpen.value = false;
+    imageConflictOperation.value = null;
+    imageConflictRemoteRevision.value = null;
+  }
+});
 const hasPendingImageNameChange = computed(() => {
   const nextName = resourceNameDraft.value.trim();
   return Boolean(
@@ -2787,9 +2694,23 @@ const saveImageNow = async () => {
 };
 
 const reloadImageAfterConflict = async () => {
-  await waitForPersonalImagePaletteMutations();
-  allowImageUnload = true;
-  window.location.reload();
+  if (isImageConflictResolving.value) return;
+  isImageConflictResolving.value = true;
+  try {
+    if (imageConflictOperation.value?.kind === "document") {
+      await imageAutosave.discardPending();
+      isImageConflictOpen.value = false;
+      imageConflictOperation.value = null;
+    } else {
+      await waitForPersonalImagePaletteMutations();
+      allowImageUnload = true;
+      window.location.reload();
+    }
+  } catch (error) {
+    showImageNotice(error instanceof Error ? error.message : "The remote image could not be loaded.", "error");
+  } finally {
+    isImageConflictResolving.value = false;
+  }
 };
 
 const fetchLatestImageResource = () =>
@@ -2803,6 +2724,13 @@ const keepLocalImageAfterConflict = async () => {
   const operation = imageConflictOperation.value;
   if (!operation || isImageConflictResolving.value) return;
 
+  if (operation.kind === "document") {
+    // Exceptional resize/import conflicts cannot be merged as pixel edits.
+    // Exporting preserves the local copy without overwriting another user's work.
+    exportImageJson();
+    return;
+  }
+
   isImageConflictResolving.value = true;
   try {
     const latestResource = await fetchLatestImageResource();
@@ -2810,51 +2738,16 @@ const keepLocalImageAfterConflict = async () => {
       throw new Error("The latest remote version could not be loaded.");
     }
 
-    const latestImageData =
-      operation.kind === "rename"
-        ? readImagePixelsFromData(latestResource.data || {})
-        : null;
-
-    // Keep all remote resource fields, then reapply only the local operation.
-    resource.value = latestResource;
+    await imageAutosave.acceptResource(latestResource);
     imageConflictRemoteRevision.value = null;
     imageConflictOperation.value = null;
     isImageConflictOpen.value = false;
 
-    if (operation.kind === "rename") {
-      const remoteDocument = latestImageData?.document;
-      if (!remoteDocument) {
-        throw new Error("The latest remote image could not be loaded.");
-      }
-
-      const previousActiveLayerId = activeImageLayerId.value;
-      imageGridWidth.value = remoteDocument.width;
-      imageGridHeight.value = remoteDocument.height;
-      imageLayers.value = remoteDocument.layers;
-      activeImageLayerId.value = remoteDocument.layers.some(
-        (layer) => layer.id === previousActiveLayerId,
-      )
-        ? previousActiveLayerId
-        : remoteDocument.layers[remoteDocument.layers.length - 1]?.id || "";
-      imageSelection.value = null;
-      syncImageDimensionDrafts();
-      resetImageHistory();
-      scheduleImageCanvasRender();
-      void nextTick(scheduleImagePreviewViewportUpdate);
-
-      await persistResourceName(operation.name);
-      resourceNameDraft.value = operation.name;
-      resourceNameSaveError.value = "";
-      isRenamingResource.value = false;
-      showImageNotice("Local image name kept on top of the remote version.", "success");
-      return;
-    }
-
-    imageAutosave.schedule(++imageAutosaveSequence);
-    await imageAutosave.retry();
-    if (!imageAutosave.hasPendingChanges.value) {
-      showImageNotice("Local image changes kept on top of the remote version.", "success");
-    }
+    await persistResourceName(operation.name);
+    resourceNameDraft.value = operation.name;
+    resourceNameSaveError.value = "";
+    isRenamingResource.value = false;
+    showImageNotice("Local image name kept on top of the remote version.", "success");
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "The conflict could not be resolved.";
@@ -2867,13 +2760,17 @@ const keepLocalImageAfterConflict = async () => {
   }
 };
 
-const scheduleImageAutosave = () => {
+const scheduleImageAutosave = (settings: { conditional?: boolean; forceReplace?: boolean } = {}) => {
   if (!canEditImage.value) {
     return;
   }
 
-  imageAutosave.schedule(++imageAutosaveSequence);
+  void imageAutosave.schedule(buildImageDocument(false), settings);
 };
+
+watch(imageInteractionKind, (kind) => {
+  imageAutosave.setInteractionActive(kind === "move" || kind === "rotate");
+}, { flush: "post" });
 
 const updateImagePixels = (nextPixels: ImagePixelSnapshot) => {
   if (!canMutateActiveImageLayerPixels.value) {
@@ -4193,7 +4090,6 @@ const paintImagePixels = (indexes: number[], color: PixelColor) => {
   imagePixels.value = [...mutation.buffer.pixels];
   scheduleImageCanvasRender();
   scheduleImageAutosave();
-  queueImageCollaborationPixels(mutation.changes);
 };
 
 const paintImageGraffitiPixels = (indexes: number[]) => {
@@ -4236,13 +4132,11 @@ const paintImageGraffitiPixels = (indexes: number[]) => {
 
   const nextPixels = [...imagePixels.value];
   let didChange = false;
-  const changes: Array<{ index: number; after: PixelColor }> = [];
   for (const [index, color] of pixelsByIndex) {
     if (!isImagePixelIndexWithinSelection(index)) continue;
     if (nextPixels[index] === color) continue;
     nextPixels[index] = color;
     didChange = true;
-    changes.push({ index, after: color });
   }
 
   if (!didChange) return;
@@ -4250,7 +4144,6 @@ const paintImageGraffitiPixels = (indexes: number[]) => {
   imagePixels.value = nextPixels;
   scheduleImageCanvasRender();
   scheduleImageAutosave();
-  queueImageCollaborationPixels(changes);
 };
 
 const fillImagePixelsFrom = (startIndex: number, replacementColor: PixelColor) => {
@@ -4691,7 +4584,6 @@ const continuePaintingImageFromPointer = (
           pixels: [...moveLayer(imageMoveSourceBuffer, delta).buffer.pixels],
           selection: null,
         };
-    const previousPixels = imagePixels.value;
     const nextPixels = [...result.pixels];
     imagePixels.value = nextPixels;
     imageSelection.value = result.selection;
@@ -4699,11 +4591,6 @@ const continuePaintingImageFromPointer = (
     imageMoveDidChange =
       !imagePixelsAreEqual(imageMoveSourceBuffer.pixels, imagePixels.value) ||
       !imageSelectionMasksAreEqual(imageMoveSourceSelection, result.selection);
-    const collaborationChanges: Array<{ index: number; after: PixelColor }> = [];
-    for (const [index, after] of nextPixels.entries()) {
-      if (previousPixels[index] !== after) collaborationChanges.push({ index, after });
-    }
-    queueImageCollaborationPixels(collaborationChanges);
     broadcastImageSelection();
     scheduleImageCanvasRender();
     return;
@@ -5611,7 +5498,7 @@ const applyImportedImageDocument = (document: PixelArtDocumentV2) => {
   imageSelection.value = null;
   syncImageDimensionDrafts();
   scheduleImageCanvasRender();
-  scheduleImageAutosave();
+  scheduleImageAutosave({ forceReplace: true });
   commitImageHistory();
   void nextTick(scheduleImagePreviewViewportUpdate);
 };
@@ -6482,8 +6369,10 @@ const handleResourceVisibilityChange = () => {
   if (document.visibilityState !== "visible") {
     broadcastImageCursor(null);
     flushImageCollaborationCursor();
-    flushImageCollaborationPixels();
     flushImageCollaborationSelection();
+    void imageAutosave.flush();
+  } else {
+    requestImageCanonicalRefresh();
   }
   // Presence belongs to the open document, not the focused browser tab. Keep
   // receiving updates and answering sync requests while it is in the background.
@@ -6500,6 +6389,7 @@ const connectResourcePresence = () => {
 };
 
 const removeStaleImageCollaborators = () => {
+  if (isImageOperationReady.value) void imageAutosave.refresh();
   if (document.visibilityState === "visible" && resource.value) {
     broadcastImageCursor(lastImageCollaborationCursorPosition);
   }
@@ -6514,6 +6404,7 @@ const removeStaleImageCollaborators = () => {
 
 const loadEditor = async () => {
   isLoading.value = true;
+  isImageOperationReady.value = false;
   isImageEditorSessionReady = false;
   lastSavedImageEditorSession = "";
   if (imageEditorSessionSaveTimeout !== null) {
@@ -6587,6 +6478,8 @@ const loadEditor = async () => {
       shouldFitImageAfterLoad = restoredImageEditorSession
         ? restoredImageEditorSession.viewport.mode === "fit"
         : imagePreferencesController?.preferences.zoom === undefined;
+      await imageAutosave.start(resourceDetail);
+      isImageOperationReady.value = imageAutosave.isReady.value;
       resetImageHistory();
     }
 
@@ -6680,7 +6573,10 @@ onMounted(() => {
 onUnmounted(() => {
   broadcastImageCursor(null);
   flushImageCollaborationCursor();
-  flushImageCollaborationPixels();
+  if (imageCanonicalRefreshTimeout !== null) {
+    clearTimeout(imageCanonicalRefreshTimeout);
+    imageCanonicalRefreshTimeout = null;
+  }
   window.removeEventListener("pointerup", finishImagePointerInteraction);
   window.removeEventListener("pointercancel", cancelImagePointerInteraction);
   window.removeEventListener("keydown", handleResourceEditorKeydown);

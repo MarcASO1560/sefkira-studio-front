@@ -115,7 +115,7 @@ const handleTab = (event: KeyboardEvent) => {
             {{
               operation === "rename"
                 ? "This resource changed remotely while your new local name was being saved."
-                : "This image changed remotely while you still have unsaved local changes."
+                : "The canvas or a layer changed remotely and these pending changes cannot be combined safely. Your local copy is still preserved on this device."
             }}
           </p>
         </div>
@@ -145,8 +145,13 @@ const handleTab = (event: KeyboardEvent) => {
       <p :id="consequencesId" class="image-conflict-notice__consequences">
         <strong>Reload remote</strong> discards your local
         {{ operation === "rename" ? "name" : "image changes" }}.
-        <strong>Keep local {{ operation === "rename" ? "name" : "changes" }}</strong>
-        loads the latest remote resource, then retries only your local operation on top of it.
+        <template v-if="operation === 'rename'">
+          <strong>Keep local name</strong> loads the latest remote resource, then retries only your local name.
+        </template>
+        <template v-else>
+          <strong>Export local copy</strong> downloads your image without overwriting anybody else's changes.
+          Export it before reloading if you want to keep both versions.
+        </template>
       </p>
 
       <div class="image-conflict-notice__actions">
@@ -167,7 +172,7 @@ const handleTab = (event: KeyboardEvent) => {
           @click="emit('keep-local')"
         >
           <ShieldCheck :size="15" :stroke-width="2.2" aria-hidden="true" />
-          {{ busy ? "Resolving…" : operation === "rename" ? "Keep local name" : "Keep local changes" }}
+          {{ busy ? "Resolving…" : operation === "rename" ? "Keep local name" : "Export local copy" }}
         </button>
       </div>
     </section>
