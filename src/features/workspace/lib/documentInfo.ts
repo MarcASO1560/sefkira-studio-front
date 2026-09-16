@@ -1,5 +1,18 @@
 export type DocumentInfoDetail = Readonly<{ label: string; value: string }>;
 
+export const groupDocumentInfoDetails = (details: ReadonlyArray<DocumentInfoDetail>) => {
+  const canvasLabels = new Set(["Size", "Layers"]);
+  const activityLabels = new Set(["Created", "Updated", "Revision"]);
+  return [
+    {
+      id: "document", title: "Document",
+      details: details.filter(({ label }) => !canvasLabels.has(label) && !activityLabels.has(label)),
+    },
+    { id: "canvas", title: "Canvas", details: details.filter(({ label }) => canvasLabels.has(label)) },
+    { id: "activity", title: "Activity", details: details.filter(({ label }) => activityLabels.has(label)) },
+  ].filter((section) => section.details.length > 0);
+};
+
 export const buildDocumentInfoDetails = (info: {
   projectName: string;
   typeLabel: string;

@@ -4,7 +4,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import type { ProjectPresenceMember } from "../../../lib/realtime";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
-import type { DocumentInfoDetail } from "../lib/documentInfo";
+import { groupDocumentInfoDetails, type DocumentInfoDetail } from "../lib/documentInfo";
 
 const props = defineProps<{
   open: boolean;
@@ -30,6 +30,7 @@ const presence = computed(() =>
   getDocumentPresenceMembers(props.members, props.currentUserId, props.currentUser),
 );
 const listedMembers = computed(() => presence.value.members);
+const detailSections = computed(() => groupDocumentInfoDetails(props.details));
 
 const displayName = (member: ProjectPresenceMember) =>
   member.username?.trim() || member.email || "Project member";
@@ -155,7 +156,6 @@ onBeforeUnmount(() => {
         <header class="image-document-presence-dialog__header">
           <div>
             <h2 :id="titleId">Document information</h2>
-            <p>{{ typeLabel }}</p>
           </div>
           <button
             ref="closeButton"
@@ -169,53 +169,71 @@ onBeforeUnmount(() => {
         </header>
 
         <div class="resource-document-info__body">
-          <div class="resource-document-info__name"><slot name="name" /></div>
-          <div v-if="$slots.save" class="resource-document-info__save"><slot name="save" /></div>
-          <dl class="resource-document-info__details" aria-label="Document details">
-            <div v-for="detail in details" :key="detail.label">
-              <dt>{{ detail.label }}</dt>
-              <dd>{{ detail.value }}</dd>
+          <div class="resource-document-info__identity">
+            <div class="resource-document-info__name"><slot name="name" /></div>
+            <div class="resource-document-info__summary">
+              <span class="resource-document-info__type">{{ typeLabel }}</span>
+              <div v-if="$slots.save" class="resource-document-info__save"><slot name="save" /></div>
             </div>
-          </dl>
-          <h3 v-if="showPeople" class="resource-document-info__people-title">
-            In this document <span>({{ listedMembers.length }})</span>
-          </h3>
-          <ul v-if="showPeople" class="image-document-presence-dialog__list" aria-label="People in this document">
-            <li v-for="member in listedMembers" :key="member.id" class="image-document-presence-member">
-              <span class="image-document-presence-member__avatar" aria-hidden="true">
-                <svg
-                  v-if="hasPixelAvatar(member)"
-                  :viewBox="`0 0 ${member.avatar_pixel_art?.size || 16} ${member.avatar_pixel_art?.size || 16}`"
-                  shape-rendering="crispEdges"
-                >
-                  <rect
-                    v-for="(pixel, pixelIndex) in member.avatar_pixel_art?.pixels || []"
-                    v-show="pixel"
-                    :key="pixelIndex"
-                    :x="pixelIndex % (member.avatar_pixel_art?.size || 16)"
-                    :y="Math.floor(pixelIndex / (member.avatar_pixel_art?.size || 16))"
-                    width="1"
-                    height="1"
-                    :fill="pixel || 'transparent'"
+          </div>
+          <div class="resource-document-info__sections">
+            <section
+              v-for="section in detailSections"
+              :key="section.id"
+              class="resource-document-info__section"
+              :class="`resource-document-info__section--${section.id}`"
+              :aria-labelledby="`${dialogId}-${section.id}`"
+            >
+              <h3 :id="`${dialogId}-${section.id}`">{{ section.title }}</h3>
+              <dl class="resource-document-info__details">
+                <div v-for="detail in section.details" :key="detail.label">
+                  <dt>{{ detail.label }}</dt>
+                  <dd>{{ detail.value }}</dd>
+                </div>
+              </dl>
+            </section>
+          </div>
+          <section v-if="showPeople" class="resource-document-info__people" :aria-labelledby="`${dialogId}-people`">
+            <h3 :id="`${dialogId}-people`" class="resource-document-info__people-title">
+              In this document <span>{{ listedMembers.length }}</span>
+            </h3>
+            <ul class="image-document-presence-dialog__list" aria-label="People in this document">
+              <li v-for="member in listedMembers" :key="member.id" class="image-document-presence-member">
+                <span class="image-document-presence-member__avatar" aria-hidden="true">
+                  <svg
+                    v-if="hasPixelAvatar(member)"
+                    :viewBox="`0 0 ${member.avatar_pixel_art?.size || 16} ${member.avatar_pixel_art?.size || 16}`"
+                    shape-rendering="crispEdges"
+                  >
+                    <rect
+                      v-for="(pixel, pixelIndex) in member.avatar_pixel_art?.pixels || []"
+                      v-show="pixel"
+                      :key="pixelIndex"
+                      :x="pixelIndex % (member.avatar_pixel_art?.size || 16)"
+                      :y="Math.floor(pixelIndex / (member.avatar_pixel_art?.size || 16))"
+                      width="1"
+                      height="1"
+                      :fill="pixel || 'transparent'"
+                    />
+                  </svg>
+                  <img
+                    v-else-if="canShowImageAvatar(member)"
+                    :src="member.avatar_url || ''"
+                    alt=""
+                    draggable="false"
+                    referrerpolicy="no-referrer"
+                    @error="markAvatarFailed(member)"
                   />
-                </svg>
-                <img
-                  v-else-if="canShowImageAvatar(member)"
-                  :src="member.avatar_url || ''"
-                  alt=""
-                  draggable="false"
-                  referrerpolicy="no-referrer"
-                  @error="markAvatarFailed(member)"
-                />
-                <span v-else>{{ initials(member) }}</span>
-              </span>
-              <span class="image-document-presence-member__info">
-                <span class="image-document-presence-member__name">{{ displayName(member) }}</span>
-                <span class="image-document-presence-member__status">Present</span>
-              </span>
-              <span v-if="member.id === currentUserId" class="image-document-presence-member__self">You</span>
-            </li>
-          </ul>
+                  <span v-else>{{ initials(member) }}</span>
+                </span>
+                <span class="image-document-presence-member__info">
+                  <span class="image-document-presence-member__name">{{ displayName(member) }}</span>
+                  <span class="image-document-presence-member__status">Present</span>
+                </span>
+                <span v-if="member.id === currentUserId" class="image-document-presence-member__self">You</span>
+              </li>
+            </ul>
+          </section>
         </div>
       </section>
     </div>
@@ -245,14 +263,13 @@ onBeforeUnmount(() => {
     display: flex;
     flex-direction: column;
     box-sizing: border-box;
-    width: min(100%, 400px);
-    max-height: min(640px, calc(100dvh - 40px));
+    width: min(100%, 720px);
+    max-height: calc(100dvh - 48px);
     overflow: hidden;
     color: #fff;
     background: #111212;
-    border: 1px solid #454645;
-    border-radius: 14px;
-    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.45);
+    border: 1px solid #3e403e;
+    border-radius: 16px;
     font-family: inherit;
   }
 
@@ -266,7 +283,7 @@ onBeforeUnmount(() => {
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 12px 12px 12px 18px;
+    padding: 14px 16px 14px 28px;
     border-bottom: 1px solid #303130;
   }
 
@@ -274,13 +291,6 @@ onBeforeUnmount(() => {
     margin: 0;
     font-size: 1rem;
     font-weight: 700;
-    line-height: 1.4;
-  }
-
-  .image-document-presence-dialog__header p {
-    margin: 3px 0 0;
-    color: #aaa;
-    font-size: 0.75rem;
     line-height: 1.4;
   }
 
@@ -304,9 +314,12 @@ onBeforeUnmount(() => {
   }
 
   .image-document-presence-dialog__list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 24px;
     min-height: 0;
     margin: 0;
-    padding: 6px 0 0;
+    padding: 14px 0 0;
     list-style: none;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
@@ -314,8 +327,10 @@ onBeforeUnmount(() => {
 
   .resource-document-info__body {
     min-height: 0;
-    padding: 16px 18px;
+    padding: 24px 28px 28px;
     overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #454645 transparent;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
   }
@@ -324,48 +339,104 @@ onBeforeUnmount(() => {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 12px;
     min-width: 0;
   }
 
-  .resource-document-info__save { margin-top: 12px; }
+  .resource-document-info__summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+  }
 
-  .resource-document-info__details { margin: 16px 0; }
+  .resource-document-info__type {
+    color: #b5b7b5;
+    font-size: 14px;
+  }
+
+  .resource-document-info__sections {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 24px 32px;
+    margin-top: 24px;
+    padding-top: 24px;
+    border-top: 1px solid #303130;
+  }
+
+  .resource-document-info__section { min-width: 0; }
+
+  .resource-document-info__section h3,
+  .resource-document-info__people-title {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 1.5;
+  }
+
+  .resource-document-info__section--activity {
+    grid-column: 1 / -1;
+    padding-top: 24px;
+    border-top: 1px solid #303130;
+  }
+
+  .resource-document-info__details {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+    margin: 14px 0 0;
+  }
+
+  .resource-document-info__section--activity .resource-document-info__details {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 
   .resource-document-info__details > div {
     display: grid;
-    grid-template-columns: 88px minmax(0, 1fr);
-    gap: 12px;
-    padding: 7px 0;
+    align-content: start;
+    gap: 6px;
+    min-width: 0;
   }
 
-  dt { color: #aaaaaa; font-size: 12px; }
-  dd { margin: 0; overflow-wrap: anywhere; font-size: 12px; }
+  dt { color: #a7aaa7; font-size: 13px; line-height: 1.5; }
+  dd { margin: 0; overflow-wrap: anywhere; font-size: 15px; line-height: 1.5; font-weight: 550; }
+
+  .resource-document-info__section--canvas dd { font-size: 20px; font-weight: 650; }
+
+  .resource-document-info__people {
+    margin-top: 24px;
+    padding-top: 24px;
+    border-top: 1px solid #303130;
+  }
 
   .resource-document-info__people-title {
-    margin: 18px 0 0;
-    padding-top: 16px;
-    border-top: 1px solid #303130;
-    font-size: 13px;
-    font-weight: 650;
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
 
-  .resource-document-info__people-title span { color: #aaaaaa; }
+  .resource-document-info__people-title span {
+    color: #b5b7b5;
+    font-size: 13px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
 
   .image-document-presence-member {
     display: flex;
     align-items: center;
     gap: 12px;
     min-height: 60px;
-    padding: 6px;
+    padding: 4px 0;
   }
 
   .image-document-presence-member__avatar {
     display: grid;
-    flex: 0 0 38px;
+    flex: 0 0 42px;
     place-items: center;
-    width: 38px;
-    height: 38px;
+    width: 42px;
+    height: 42px;
     overflow: hidden;
     color: #fff;
     background: #343534;
@@ -392,7 +463,7 @@ onBeforeUnmount(() => {
 
   .image-document-presence-member__name {
     overflow: hidden;
-    font-size: 0.85rem;
+    font-size: 14px;
     font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -400,7 +471,7 @@ onBeforeUnmount(() => {
 
   .image-document-presence-member__status {
     color: #aaa;
-    font-size: 0.72rem;
+    font-size: 12px;
   }
 
   .image-document-presence-member__self {
@@ -410,11 +481,11 @@ onBeforeUnmount(() => {
     background: #2b2c2b;
     border: 1px solid #505150;
     border-radius: 5px;
-    font-size: 0.65rem;
+    font-size: 11px;
     font-weight: 600;
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 600px) {
     .image-document-presence-backdrop {
       align-items: flex-end;
       padding: 0;
@@ -422,7 +493,7 @@ onBeforeUnmount(() => {
 
     .image-document-presence-dialog {
       width: 100%;
-      max-height: min(70dvh, 560px);
+      max-height: calc(100dvh - max(16px, env(safe-area-inset-top, 0px)));
       padding-bottom: env(safe-area-inset-bottom, 0px);
       border-right: 0;
       border-bottom: 0;
@@ -441,7 +512,19 @@ onBeforeUnmount(() => {
     }
 
     .image-document-presence-dialog__header {
-      padding-top: 5px;
+      padding: 5px 12px 10px 20px;
+    }
+
+    .resource-document-info__body { padding: 20px; }
+
+    .resource-document-info__sections,
+    .image-document-presence-dialog__list {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .resource-document-info__section--document .resource-document-info__details,
+    .resource-document-info__section--activity .resource-document-info__details {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 </style>

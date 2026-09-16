@@ -6793,7 +6793,7 @@ onUnmounted(() => {
           :disabled="isResourceNameSaving"
           @click="startRenamingResource"
         >Rename</button>
-        <p v-if="resourceNameSaveError" role="alert">{{ resourceNameSaveError }}</p>
+        <p v-if="resourceNameSaveError" class="resource-document-info__name-error" role="alert">{{ resourceNameSaveError }}</p>
       </template>
       <template v-if="isImageEditor" #save>
         <ImageSaveStatus
@@ -8019,18 +8019,18 @@ onUnmounted(() => {
 
   .resource-editor-title__name-input {
     width: 100%;
-    height: 28px;
-    padding: 0 6px;
+    height: 44px;
+    padding: 0 10px;
     box-sizing: border-box;
-    color: var(--editor-text);
+    color: #ffffff;
     font: inherit;
-    font-size: 13px;
+    font-size: 22px;
     font-weight: 650;
-    background: var(--editor-surface);
-    border: 1px solid var(--editor-border-strong);
-    border-radius: var(--editor-radius-sm);
-    outline: 1px solid var(--editor-focus);
-    outline-offset: 1px;
+    background: #191a19;
+    border: 1px solid #454645;
+    border-radius: 6px;
+    outline: 2px solid #ffffff;
+    outline-offset: 2px;
   }
 
   .resource-editor-title__kind {
@@ -8044,23 +8044,38 @@ onUnmounted(() => {
     flex: 1 1 auto;
     min-width: 0;
     overflow-wrap: anywhere;
-    font-size: 15px;
+    font-size: clamp(22px, 3vw, 26px);
+    font-weight: 700;
+    line-height: 1.35;
   }
 
   .resource-document-info__rename {
     flex: 0 0 auto;
-    min-height: 36px;
-    padding: 0 10px;
+    min-height: 44px;
+    padding: 0 14px;
     color: #eeeeee;
     background: #242424;
     border: 1px solid #454545;
     border-radius: 6px;
+    font: inherit;
+    font-size: 14px;
     cursor: pointer;
   }
 
   .resource-document-info__rename:focus-visible {
     outline: 2px solid #ffffff;
     outline-offset: 2px;
+  }
+
+  .resource-document-info__rename:hover:not(:disabled) { background: #303130; }
+
+  .resource-document-info__name-error {
+    flex: 1 0 100%;
+    margin: 0;
+    color: #ffabab;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.5;
   }
 
   .resource-editor-title__save-cluster {
