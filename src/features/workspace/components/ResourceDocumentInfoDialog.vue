@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { X } from "@lucide/vue";
+import { ArrowLeft, X } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import type { ProjectPresenceMember } from "../../../lib/realtime";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import { groupDocumentInfoDetails, type DocumentInfoDetail } from "../lib/documentInfo";
+import { getDocumentInfoViewportStyle } from "../lib/documentInfoViewport";
 
 const props = defineProps<{
   open: boolean;
+  closeDisabled?: boolean;
   dialogId: string;
   typeLabel: string;
   details: ReadonlyArray<DocumentInfoDetail>;
@@ -23,8 +25,16 @@ const dialog = ref<HTMLElement | null>(null);
 const closeButton = ref<HTMLButtonElement | null>(null);
 const isOpen = computed(() => props.open);
 const failedAvatarUrls = ref(new Map<string, string>());
+const mobileLayoutQuery = "(max-width: 600px), (max-width: 960px) and (max-height: 500px)";
+const isMobileLayout = ref(false);
+const viewportStyle = ref<ReturnType<typeof getDocumentInfoViewportStyle> | undefined>();
 let previousFocus: HTMLElement | null = null;
 let previousBodyOverflow: string | null = null;
+
+const updateVisibleViewport = () => {
+  viewportStyle.value = getDocumentInfoViewportStyle(window.visualViewport, window.innerHeight);
+  isMobileLayout.value = window.matchMedia(mobileLayoutQuery).matches;
+};
 
 const presence = computed(() =>
   getDocumentPresenceMembers(props.members, props.currentUserId, props.currentUser),
@@ -64,6 +74,10 @@ const stopDialogEffects = () => {
   if (typeof window === "undefined") return;
   window.removeEventListener("keydown", handleModalKeydown, true);
   document.removeEventListener("focusin", handleModalFocus, true);
+  window.removeEventListener("resize", updateVisibleViewport);
+  window.visualViewport?.removeEventListener("resize", updateVisibleViewport);
+  window.visualViewport?.removeEventListener("scroll", updateVisibleViewport);
+  viewportStyle.value = undefined;
   if (previousBodyOverflow !== null) {
     document.body.style.overflow = previousBodyOverflow;
     previousBodyOverflow = null;
@@ -71,7 +85,7 @@ const stopDialogEffects = () => {
 };
 
 const closeDialog = () => {
-  if (!isOpen.value) return;
+  if (!isOpen.value || props.closeDisabled) return;
   emit("close");
 };
 
@@ -121,6 +135,10 @@ watch(isOpen, async (open) => {
   document.body.style.overflow = "hidden";
   window.addEventListener("keydown", handleModalKeydown, true);
   document.addEventListener("focusin", handleModalFocus, true);
+  updateVisibleViewport();
+  window.addEventListener("resize", updateVisibleViewport);
+  window.visualViewport?.addEventListener("resize", updateVisibleViewport);
+  window.visualViewport?.addEventListener("scroll", updateVisibleViewport);
   await nextTick();
   if (isOpen.value) closeButton.value?.focus({ preventScroll: true });
 }, { immediate: true });
@@ -136,6 +154,7 @@ onBeforeUnmount(() => {
     <div
       v-if="isOpen"
       class="image-document-presence-backdrop"
+      :style="viewportStyle"
       @click.self="closeDialog"
       @wheel.stop
       @pointerdown.stop
@@ -152,20 +171,19 @@ onBeforeUnmount(() => {
         data-image-shortcuts="off"
         tabindex="-1"
       >
-        <span class="image-document-presence-dialog__handle" aria-hidden="true" />
         <header class="image-document-presence-dialog__header">
-          <div>
-            <h2 :id="titleId">Document information</h2>
-          </div>
           <button
             ref="closeButton"
             class="image-document-presence-dialog__close"
             type="button"
-            aria-label="Close document information"
+            :aria-label="isMobileLayout ? 'Back to document' : 'Close document information'"
+            :disabled="closeDisabled"
             @click="closeDialog"
           >
-            <X :size="20" aria-hidden="true" />
+            <ArrowLeft class="image-document-presence-dialog__back-icon" :size="22" aria-hidden="true" />
+            <X class="image-document-presence-dialog__close-icon" :size="20" aria-hidden="true" />
           </button>
+          <h2 :id="titleId">Document information</h2>
         </header>
 
         <div class="resource-document-info__body">
@@ -273,9 +291,7 @@ onBeforeUnmount(() => {
     font-family: inherit;
   }
 
-  .image-document-presence-dialog__handle {
-    display: none;
-  }
+  .image-document-presence-dialog__back-icon { display: none; }
 
   .image-document-presence-dialog__header {
     display: flex;
@@ -288,6 +304,8 @@ onBeforeUnmount(() => {
   }
 
   .image-document-presence-dialog__header h2 {
+    flex: 1 1 auto;
+    min-width: 0;
     margin: 0;
     font-size: 1rem;
     font-weight: 700;
@@ -295,6 +313,7 @@ onBeforeUnmount(() => {
   }
 
   .image-document-presence-dialog__close {
+    order: 1;
     display: grid;
     flex: 0 0 44px;
     place-items: center;
@@ -309,9 +328,11 @@ onBeforeUnmount(() => {
     touch-action: manipulation;
   }
 
-  .image-document-presence-dialog__close:hover {
+  .image-document-presence-dialog__close:hover:not(:disabled) {
     background: #2b2c2b;
   }
+
+  .image-document-presence-dialog__close:disabled { opacity: 0.45; cursor: default; }
 
   .image-document-presence-dialog__list {
     display: grid;
@@ -485,46 +506,75 @@ onBeforeUnmount(() => {
     font-weight: 600;
   }
 
-  @media (max-width: 600px) {
+  @media (max-width: 600px), (max-width: 960px) and (max-height: 500px) {
     .image-document-presence-backdrop {
-      align-items: flex-end;
+      top: var(--document-info-viewport-top, 0px);
+      bottom: auto;
+      height: var(--document-info-viewport-height, 100dvh);
       padding: 0;
+      background: #111212;
     }
 
     .image-document-presence-dialog {
       width: 100%;
-      max-height: calc(100dvh - max(16px, env(safe-area-inset-top, 0px)));
-      padding-bottom: env(safe-area-inset-bottom, 0px);
-      border-right: 0;
-      border-bottom: 0;
-      border-left: 0;
-      border-radius: 16px 16px 0 0;
+      height: 100%;
+      max-height: none;
+      border: 0;
+      border-radius: 0;
     }
 
-    .image-document-presence-dialog__handle {
-      display: block;
-      flex: 0 0 4px;
-      align-self: center;
-      width: 32px;
-      margin: 8px 0 0;
-      background: #626362;
-      border-radius: 4px;
-    }
+    .image-document-presence-dialog__back-icon { display: block; }
+    .image-document-presence-dialog__close-icon { display: none; }
+    .image-document-presence-dialog__close { order: 0; }
 
     .image-document-presence-dialog__header {
-      padding: 5px 12px 10px 20px;
+      gap: 8px;
+      padding: calc(8px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 8px max(8px, env(safe-area-inset-left, 0px));
     }
 
-    .resource-document-info__body { padding: 20px; }
+    .resource-document-info__body {
+      flex: 1 1 auto;
+      padding: 20px max(16px, env(safe-area-inset-right, 0px)) max(20px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+    }
 
     .resource-document-info__sections,
     .image-document-presence-dialog__list {
       grid-template-columns: minmax(0, 1fr);
     }
 
-    .resource-document-info__section--document .resource-document-info__details,
-    .resource-document-info__section--activity .resource-document-info__details {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+    .resource-document-info__sections {
+      gap: 20px;
+      margin-top: 20px;
+      padding-top: 20px;
+    }
+
+    .resource-document-info__section--activity { padding-top: 20px; }
+
+    .resource-document-info__section--activity .resource-document-info__details { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+
+    .resource-document-info__section--activity .resource-document-info__details > div {
+      grid-template-columns: 84px minmax(0, 1fr);
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .resource-document-info__people { margin-top: 20px; padding-top: 20px; }
+
+    .image-document-presence-member__name {
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  @media (min-width: 601px) and (max-width: 960px) and (max-height: 500px) {
+    .resource-document-info__sections,
+    .image-document-presence-dialog__list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    .resource-document-info__section--activity .resource-document-info__details { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .resource-document-info__section--activity .resource-document-info__details > div {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 6px;
     }
   }
 </style>

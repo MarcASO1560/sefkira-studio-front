@@ -532,8 +532,11 @@ const isImageConflictResolving = ref(false);
 const isRenamingResource = ref(false);
 const isDocumentInfoOpen = ref(false);
 const isResourceNameSaving = ref(false);
+const isDocumentNameSubmitting = ref(false);
 const resourceNameSaveError = ref("");
 const resourceNameDraft = ref("");
+const resourceNameInput = ref<HTMLInputElement | null>(null);
+const resourceRenameButton = ref<HTMLButtonElement | null>(null);
 let imageMoveSourceBuffer: PixelBuffer | null = null;
 let imageMoveSourceSelection: ImageSelection | null = null;
 let imageMoveDidChange = false;
@@ -2053,6 +2056,7 @@ const startRenamingResource = () => {
   resourceNameSaveError.value = "";
   resourceNameDraft.value = resource.value.name;
   isRenamingResource.value = true;
+  void nextTick(() => resourceNameInput.value?.focus({ preventScroll: true }));
 };
 
 const cancelRenamingResource = () => {
@@ -2071,8 +2075,9 @@ const performResourceNameCommit = async () => {
 
   await imageAutosave.flush();
   if (imageAutosave.hasPendingChanges.value) {
+    resourceNameSaveError.value = imageSaveError.value || "Save the pending image changes before renaming it.";
     showImageNotice(
-      imageSaveError.value || "Save the pending image changes before renaming it.",
+      resourceNameSaveError.value,
       "error",
     );
     return;
@@ -2103,6 +2108,32 @@ const commitResourceName = () => {
     }
   });
   return operation;
+};
+
+const focusDocumentNameControl = () => {
+  void nextTick(() => {
+    if (!isDocumentInfoOpen.value) return;
+    (isRenamingResource.value ? resourceNameInput.value : resourceRenameButton.value)?.focus({ preventScroll: true });
+  });
+};
+
+const cancelDocumentInfoName = () => {
+  if (isDocumentNameSubmitting.value || isResourceNameSaving.value) return;
+  cancelRenamingResource();
+  focusDocumentNameControl();
+};
+
+const commitDocumentInfoName = async () => {
+  if (isDocumentNameSubmitting.value || isResourceNameSaving.value) return;
+  isDocumentNameSubmitting.value = true;
+  try {
+    await commitResourceName();
+  } catch (error) {
+    resourceNameSaveError.value = error instanceof Error ? error.message : "The image name could not be saved.";
+  } finally {
+    isDocumentNameSubmitting.value = false;
+    focusDocumentNameControl();
+  }
 };
 
 const documentInfoDetails = computed(() => buildDocumentInfoDetails({
@@ -2696,7 +2727,7 @@ const hasPendingImageNameChange = computed(() => {
   );
 });
 const displayedImageSaveStatus = computed(() =>
-  isResourceNameSaving.value
+  isResourceNameSaving.value || isDocumentNameSubmitting.value
     ? "saving"
     : resourceNameSaveError.value
       ? "error"
@@ -6763,6 +6794,7 @@ onUnmounted(() => {
     <ResourceDocumentInfoDialog
       v-if="!isLoading && !errorMessage && resource"
       :open="isDocumentInfoOpen"
+      :close-disabled="isDocumentNameSubmitting || isResourceNameSaving"
       dialog-id="resource-document-info-dialog"
       :type-label="editorMeta.label"
       :details="documentInfoDetails"
@@ -6773,28 +6805,42 @@ onUnmounted(() => {
       @close="closeDocumentInfo"
     >
       <template #name>
-        <input
+        <form
           v-if="isRenamingResource"
-          v-model="resourceNameDraft"
-          class="resource-editor-title__name-input"
-          type="text"
-          maxlength="120"
-          aria-label="Image name"
-          autofocus
-          :disabled="isResourceNameSaving"
-          @blur="commitResourceName"
-          @keydown.enter.prevent="commitResourceName"
-        />
+          class="resource-document-info__rename-form"
+          @submit.prevent="commitDocumentInfoName"
+        >
+          <label for="resource-document-name">Document name</label>
+          <input
+            id="resource-document-name"
+            ref="resourceNameInput"
+            v-model="resourceNameDraft"
+            class="resource-editor-title__name-input"
+            type="text"
+            maxlength="120"
+            required
+            autocomplete="off"
+            enterkeyhint="done"
+            :disabled="isResourceNameSaving || isDocumentNameSubmitting"
+            :aria-invalid="Boolean(resourceNameSaveError)"
+            :aria-describedby="resourceNameSaveError ? 'resource-document-name-error' : undefined"
+          />
+          <div class="resource-document-info__rename-actions">
+            <button type="button" class="resource-document-info__rename" :disabled="isResourceNameSaving || isDocumentNameSubmitting" @click="cancelDocumentInfoName">Cancel</button>
+            <button type="submit" class="resource-document-info__rename resource-document-info__rename--confirm" :disabled="isResourceNameSaving || isDocumentNameSubmitting || !resourceNameDraft.trim()">{{ isResourceNameSaving || isDocumentNameSubmitting ? 'Saving…' : 'Save name' }}</button>
+          </div>
+        </form>
         <strong v-else class="resource-document-info__name">{{ resourceName }}</strong>
         <button
           v-if="canEditImage && !isRenamingResource"
+          ref="resourceRenameButton"
           type="button"
           class="resource-document-info__rename"
           :aria-label="`Rename ${resourceName}`"
-          :disabled="isResourceNameSaving"
+          :disabled="isResourceNameSaving || isDocumentNameSubmitting"
           @click="startRenamingResource"
         >Rename</button>
-        <p v-if="resourceNameSaveError" class="resource-document-info__name-error" role="alert">{{ resourceNameSaveError }}</p>
+        <p v-if="resourceNameSaveError" id="resource-document-name-error" class="resource-document-info__name-error" role="alert">{{ resourceNameSaveError }}</p>
       </template>
       <template v-if="isImageEditor" #save>
         <ImageSaveStatus
@@ -8030,14 +8076,29 @@ onUnmounted(() => {
     box-sizing: border-box;
     color: #ffffff;
     font: inherit;
-    font-size: 22px;
+    font-size: 18px;
     font-weight: 650;
     background: #191a19;
     border: 1px solid #454645;
     border-radius: 6px;
+    outline: none;
+  }
+
+  .resource-editor-title__name-input:focus-visible {
     outline: 2px solid #ffffff;
     outline-offset: 2px;
   }
+
+  .resource-document-info__rename-form {
+    display: grid;
+    flex: 1 0 100%;
+    min-width: 0;
+    gap: 12px;
+  }
+
+  .resource-document-info__rename-form label { color: #b5b7b5; font-size: 13px; }
+
+  .resource-document-info__rename-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
   .resource-editor-title__kind {
     flex: 0 0 auto;
@@ -8074,6 +8135,10 @@ onUnmounted(() => {
   }
 
   .resource-document-info__rename:hover:not(:disabled) { background: #303130; }
+
+  .resource-document-info__rename--confirm { color: #111212; background: #eeeeee; border-color: #eeeeee; }
+  .resource-document-info__rename--confirm:hover:not(:disabled) { background: #ffffff; }
+  .resource-document-info__rename:disabled { cursor: default; opacity: 0.5; }
 
   .resource-document-info__name-error {
     flex: 1 0 100%;
