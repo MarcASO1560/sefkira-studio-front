@@ -35,10 +35,13 @@ import {
 } from "../../../lib/api";
 import {
   connectProjectPresence,
+  connectUserRealtime,
   type ProjectEditorActivity,
   type ProjectPresenceConnection,
   type ProjectPresenceMember,
   type ProjectPresenceSnapshot,
+  type RealtimeConnection,
+  type RealtimeEventPayload,
 } from "../../../lib/realtime";
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
 import ImageDocumentPresence from "./ImageDocumentPresence.vue";
@@ -405,6 +408,7 @@ const IMAGE_GRID_SUBDIVISION_THICKNESS_OPTIONS: ImageGridSubdivisionThickness[] 
 const isLoading = ref(true);
 const errorMessage = ref("");
 const project = ref<ProjectPublic | null>(null);
+const isResourceProjectAccessRevoked = ref(false);
 const resource = ref<ProjectResourceDetail | null>(null);
 const imageGridWidth = ref(DEFAULT_IMAGE_WIDTH);
 const imageGridHeight = ref(DEFAULT_IMAGE_HEIGHT);
@@ -582,6 +586,9 @@ let imageEditorSessionSaveInFlight: Promise<void> | null = null;
 let imageEditorSessionSaveQueued = false;
 let lastSavedImageEditorSession = "";
 let projectPresenceConnection: ProjectPresenceConnection | null = null;
+let resourceAccessConnection: RealtimeConnection | null = null;
+let resourceAccessRefresh: Promise<void> | null = null;
+let resourceEditorDisposed = false;
 const projectPresenceMembers = shallowRef<ProjectPresenceMember[]>([]);
 let imageCollaborationCursorTimeout: ReturnType<typeof setTimeout> | null = null;
 let imageCollaborationSelectionTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -673,6 +680,7 @@ const canEditImage = computed(
   () =>
     isImageEditor.value &&
     isImageOperationReady.value &&
+    !isResourceProjectAccessRevoked.value &&
     !imageAutosave.isHistoryBusy.value &&
     (project.value?.access_role === "owner" || project.value?.access_role === "editor"),
 );
@@ -2377,9 +2385,14 @@ const updateRemoteImageCollaborator = (
 };
 
 const handleProjectPresenceSync = (snapshot: ProjectPresenceSnapshot) => {
+  if (isResourceProjectAccessRevoked.value) return;
   projectPresenceMembers.value = snapshot[props.resourceId] || [];
   requestImageCanonicalRefresh();
-  if (projectPresenceMembers.value.length === 0) return;
+  if (projectPresenceMembers.value.length === 0) {
+    remoteImageCollaborators.value = {};
+    pendingProjectEditorActivities.length = 0;
+    return;
+  }
 
   remoteImageCollaborators.value = Object.fromEntries(
     Object.entries(remoteImageCollaborators.value).map(([clientId, collaborator]) => {
@@ -2437,6 +2450,7 @@ const applyRemoteImageDocument = (
 };
 
 const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
+  if (isResourceProjectAccessRevoked.value) return;
   if (activity.resource_id !== props.resourceId) return;
   if (!resource.value || !isImageEditor.value) {
     pendingProjectEditorActivities.push(activity);
@@ -2584,8 +2598,11 @@ const imageAutosave = useImageOperationSync({
   onConflict() {
     openImageConflict({ kind: "document" }, resource.value?.revision ?? null);
   },
-  onAccessDenied() {
+  onAccessDenied(status) {
     markImageReadOnly();
+    // A write-only 403 may just be a demotion to viewer; preserve their
+    // legitimate presence. Missing read access is handled by the room lease.
+    if (status === 401 || status === 404) revokeResourceProjectAccess();
     resetImageTouchPointers();
     cancelImageInteraction(undefined, { commitHistory: false });
     showImageNotice("Editing access is no longer available. Your pending local copy is preserved; you can export it without overwriting the document.", "error");
@@ -6373,13 +6390,75 @@ const handleResourceVisibilityChange = () => {
   // receiving updates and answering sync requests while it is in the background.
 };
 
+const revokeResourceProjectAccess = () => {
+  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
+  isResourceProjectAccessRevoked.value = true;
+  markImageReadOnly();
+  projectPresenceConnection?.close();
+  projectPresenceConnection = null;
+  projectPresenceMembers.value = [];
+  remoteImageCollaborators.value = {};
+  pendingProjectEditorActivities.length = 0;
+  pendingImageCollaborationCursor = null;
+  pendingImageCollaborationSelection = null;
+  resetImageTouchPointers();
+  cancelImageInteraction(undefined, { commitHistory: false });
+  if (isImageEditor.value) {
+    showImageNotice("Access to this project is no longer available. Your local image is preserved; export a copy before leaving.", "error");
+  } else {
+    errorMessage.value = "Access to this project is no longer available.";
+  }
+};
+
+const refreshResourceProjectAccess = () => {
+  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return Promise.resolve();
+  if (resourceAccessRefresh) return resourceAccessRefresh;
+  resourceAccessRefresh = (async () => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(`/api/v1/projects/${encodeURIComponent(props.projectId)}`, {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      });
+      if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
+      if ([401, 403, 404].includes(response.status)) {
+        revokeResourceProjectAccess();
+      } else if (response.ok) {
+        const updatedProject = await response.json() as ProjectPublic;
+        if (resourceEditorDisposed || isResourceProjectAccessRevoked.value || updatedProject.id !== props.projectId) return;
+        project.value = updatedProject;
+        if (updatedProject.access_role === "viewer") {
+          resetImageTouchPointers();
+          cancelImageInteraction(undefined, { commitHistory: false });
+        }
+      }
+    } catch {
+      // A network outage is not a revocation. The image queue remains durable.
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  })().finally(() => { resourceAccessRefresh = null; });
+  return resourceAccessRefresh;
+};
+
+const handleResourceProjectAccessUpdated = (payload: RealtimeEventPayload) => {
+  if (payload.project_id !== props.projectId || resourceEditorDisposed) return;
+  void projectPresenceConnection?.refresh();
+  void refreshResourceProjectAccess();
+  if (isImageOperationReady.value) requestImageCanonicalRefresh();
+};
+
 const connectResourcePresence = () => {
+  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
   projectPresenceConnection?.close();
   projectPresenceConnection = connectProjectPresence(
     props.projectId,
     handleProjectPresenceSync,
     props.resourceId,
     handleProjectEditorActivity,
+    revokeResourceProjectAccess,
   );
 };
 
@@ -6559,12 +6638,19 @@ onMounted(() => {
   // The route already identifies the resource, so announce presence while the
   // document, layers, and per-user editor state load in parallel.
   connectResourcePresence();
+  resourceAccessConnection = connectUserRealtime({
+    "project.access.updated": handleResourceProjectAccessUpdated,
+    "project.deleted": handleResourceProjectAccessUpdated,
+  });
   void loadEditor().then(() => {
     if (!resource.value) projectPresenceConnection?.setResourceId(null);
   });
 });
 
 onUnmounted(() => {
+  resourceEditorDisposed = true;
+  resourceAccessConnection?.close();
+  resourceAccessConnection = null;
   broadcastImageCursor(null);
   flushImageCollaborationCursor();
   if (imageCanonicalRefreshTimeout !== null) {

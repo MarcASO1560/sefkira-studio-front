@@ -6,6 +6,7 @@ import {
   type PixelAvatarData,
   type ProjectAccessRole,
   type ProjectAccessUserPublic,
+  type ProjectBlockedUserPublic,
   type ProjectPublic,
   type ProjectShareLinkPublic,
   type UserPublic,
@@ -17,6 +18,16 @@ import {
   type RealtimeEventPayload,
 } from "../../../lib/realtime";
 import { WORKSPACE_TRANSITION_STORAGE_KEY } from "../../../lib/routeTransition";
+import {
+  canBlockProjectMember,
+  isShareLinkExpired,
+  projectAccessFailureMessage,
+  SHARE_EXPIRATION_OPTIONS,
+  shareExpirationToUtc,
+  shareLinkFailureMessage,
+  utcToLocalDateTimeInput,
+  type ShareExpirationPreset,
+} from "../lib/shareLinkExpiration";
 import StudioTopbarCommandBar from "../../navigation/components/StudioTopbarCommandBar.vue";
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
 import { PIXEL_ART_PALETTE } from "../../pixel-art/lib/palette";
@@ -83,11 +94,27 @@ const projectPendingDelete = ref<ExplorerProject | null>(null);
 const isDeletingProject = ref(false);
 const projectPendingShare = ref<ExplorerProject | null>(null);
 const projectShareLink = ref<ProjectShareLinkPublic | null>(null);
+const shareLinkLoaded = ref(false);
 const shareRole = ref<ShareLinkRole>("editor");
 const shareMessage = ref("");
 const isSharingProject = ref(false);
+let isSyncingShareLink = false;
+let shareSnapshotVersion = 0;
+const shareExpirationPreset = ref<ShareExpirationPreset>("7days");
+const shareCustomExpiration = ref("");
+const shareExpirationDirty = ref(false);
+const shareDisablePending = ref(false);
+const shareNow = ref(Date.now());
+let shareClockIntervalId: number | null = null;
+let shareDialogVersion = 0;
+let accessDialogVersion = 0;
+let accessSyncVersion = 0;
 const projectPendingInfo = ref<ExplorerProject | null>(null);
 const projectAccessUsers = ref<ProjectAccessUserPublic[]>([]);
+const projectBlockedUsers = ref<ProjectBlockedUserPublic[]>([]);
+const blockedMessage = ref("");
+const isLoadingBlockedUsers = ref(false);
+const accessManagementDenied = ref(false);
 const accessMessage = ref("");
 const isLoadingProjectAccess = ref(false);
 const isSyncingProjectAccess = ref(false);
@@ -95,6 +122,9 @@ const projectAccessSyncStartedAt = ref<number | null>(null);
 const accessUpdatingUserId = ref<string | null>(null);
 const accessRemovingUserId = ref<string | null>(null);
 const accessUserPendingRemove = ref<ProjectAccessUserPublic | null>(null);
+const accessBlockingUserId = ref<string | null>(null);
+const accessUnblockingUserId = ref<string | null>(null);
+const accessUserPendingBlock = ref<ProjectAccessUserPublic | null>(null);
 const leavingProjectId = ref<string | null>(null);
 const editingProjectId = ref<string | null>(null);
 const createName = ref("");
@@ -169,9 +199,19 @@ const shareProjectUrl = computed(() => {
   return new URL(sharePath, window.location.origin).toString();
 });
 
-const shareRoleLabel = computed(
-  () => shareRoleOptions.find((option) => option.value === shareRole.value)?.label || "Can edit",
-);
+const shareExpired = computed(() => isShareLinkExpired(projectShareLink.value, shareNow.value));
+const formatDateTime = (value: string) => new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium", timeStyle: "short",
+}).format(new Date(value));
+const shareExpirationLabel = computed(() => {
+  const link = projectShareLink.value;
+  if (!shareLinkLoaded.value) return isSharingProject.value ? "Loading share link..." : "Share link could not be loaded";
+  if (!link) return "No active share link";
+  if (!link.expires_at) return "No expiration";
+  return `${shareExpired.value ? "Expired" : "Expires"} ${formatDateTime(link.expires_at)}`;
+});
+const accessMutationBusy = computed(() => Boolean(accessUpdatingUserId.value || accessRemovingUserId.value ||
+  accessBlockingUserId.value || accessUnblockingUserId.value));
 
 const projectAccessCountLabel = computed(() => {
   const count = projectAccessUsers.value.length;
@@ -182,7 +222,8 @@ const projectAccessCountLabel = computed(() => {
   return count === 1 ? "1 person has access" : `${count} people have access`;
 });
 
-const accessUserName = (user: ProjectAccessUserPublic) =>
+type AccessProfile = Pick<ProjectAccessUserPublic, "email" | "username">;
+const accessUserName = (user: AccessProfile) =>
   user.username ? `@${user.username}` : user.email.split("@")[0] || "User";
 
 const accessRoleLabel = (roleOrUser: ProjectAccessRole | ProjectAccessUserPublic) => {
@@ -193,7 +234,7 @@ const accessRoleLabel = (roleOrUser: ProjectAccessRole | ProjectAccessUserPublic
 };
 
 const canManageProjectAccess = computed(
-  () => projectPendingInfo.value?.accessRole === "owner" && !projectPendingInfo.value.id.startsWith("local-"),
+  () => projectPendingInfo.value?.accessRole === "owner" && !projectPendingInfo.value.id.startsWith("local-") && !accessManagementDenied.value,
 );
 
 const canLeaveProject = (project: ExplorerProject) => {
@@ -215,7 +256,7 @@ const canDeleteProject = (project: ExplorerProject) => {
 const isCurrentAccessUser = (user: ProjectAccessUserPublic) =>
   user.email === currentUserEmail.value;
 
-const accessUserInitials = (user: ProjectAccessUserPublic) => {
+const accessUserInitials = (user: AccessProfile) => {
   const label = user.username || user.email;
   const [firstPart = ""] = label.split("@");
   const initials = firstPart
@@ -226,6 +267,13 @@ const accessUserInitials = (user: ProjectAccessUserPublic) => {
     .join("");
 
   return initials || "U";
+};
+
+const handleProjectManagementError = (error: unknown) => {
+  if (error instanceof ProjectRequestError && [401, 403, 404].includes(error.status)) {
+    accessManagementDenied.value = true;
+    projectBlockedUsers.value = [];
+  }
 };
 
 const visibleProjects = computed(() => {
@@ -313,6 +361,12 @@ const buildLocalProject = (): ExplorerProject => {
   };
 };
 
+class ProjectRequestError extends Error {
+  constructor(public status: number, public detail: unknown) {
+    super(projectAccessFailureMessage(detail, status));
+  }
+}
+
 const requestJson = async <ResponseBody,>(
   path: string,
   init: RequestInit = {},
@@ -343,18 +397,15 @@ const requestJson = async <ResponseBody,>(
   }
 
   if (!response.ok) {
-    let message = `API request failed: ${response.status}`;
-
+    let detail: unknown;
     try {
-      const payload = (await response.json()) as { detail?: string };
-      if (payload.detail) {
-        message = payload.detail;
-      }
+      const payload = (await response.json()) as { detail?: unknown };
+      detail = payload.detail;
     } catch {
       // Keep the generic status message when the API returns an empty body.
     }
 
-    throw new Error(message);
+    throw new ProjectRequestError(response.status, detail);
   }
 
   if (response.status === 204) {
@@ -406,14 +457,23 @@ const applyWorkspaceProjects = (nextProjects: ExplorerProject[]) => {
     const syncedProject = syncPendingProject(projectPendingInfo.value);
     if (syncedProject) {
       projectPendingInfo.value = syncedProject;
+      if (syncedProject.accessRole !== "owner") {
+        projectBlockedUsers.value = [];
+        accessUserPendingBlock.value = null;
+        accessUserPendingRemove.value = null;
+      }
     } else {
       const projectName = projectPendingInfo.value.name;
-      closeProjectInfoDialog();
+      resetProjectInfoDialog();
       showLoadMessage(`You no longer have access to "${projectName}".`);
     }
   }
 
-  projectPendingShare.value = syncPendingProject(projectPendingShare.value);
+  if (projectPendingShare.value) {
+    const syncedShareProject = syncPendingProject(projectPendingShare.value);
+    if (syncedShareProject?.accessRole === "owner") projectPendingShare.value = syncedShareProject;
+    else resetShareDialog();
+  }
   projectPendingLeave.value = syncPendingProject(projectPendingLeave.value);
   projectPendingDelete.value = syncPendingProject(projectPendingDelete.value);
 
@@ -498,8 +558,8 @@ const acceptProjectShareFromUrl = async () => {
     ];
     selectedProjectId.value = explorerProject.id;
     showLoadMessage(`"${explorerProject.name}" has been added to your studio.`);
-  } catch {
-    showLoadMessage("This share link is not available anymore.");
+  } catch (error) {
+    showLoadMessage(error instanceof ProjectRequestError ? shareLinkFailureMessage(error.status, error.detail) : "The shared project could not be opened. Check your connection and try again.");
   } finally {
     url.searchParams.delete("share");
     window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
@@ -752,27 +812,57 @@ const closeShareDialog = () => {
   if (isSharingProject.value) {
     return;
   }
+  resetShareDialog();
+};
 
+const resetShareDialog = () => {
   projectPendingShare.value = null;
+  shareDialogVersion += 1;
   projectShareLink.value = null;
   shareRole.value = "editor";
   shareMessage.value = "";
+  shareExpirationPreset.value = "7days";
+  shareCustomExpiration.value = "";
+  shareExpirationDirty.value = false;
+  shareDisablePending.value = false;
+  shareLinkLoaded.value = false;
+  isSharingProject.value = false;
+  isSyncingShareLink = false;
+  shareSnapshotVersion += 1;
 };
 
 const normalizeShareRole = (role: ProjectAccessRole): ShareLinkRole =>
   role === "viewer" ? "viewer" : "editor";
 
-const saveShareLink = async (project: ExplorerProject, role: ShareLinkRole) =>
+const saveShareLink = async (project: ExplorerProject, changes: {
+  role?: ShareLinkRole; expires_at?: string | null; rotate_token?: boolean;
+}) =>
   requestJson<ProjectShareLinkPublic>(`/projects/${project.id}/share-link`, {
     method: "POST",
-    body: JSON.stringify({ role }),
+    body: JSON.stringify(changes),
   });
 
+const applyShareLink = (link: ProjectShareLinkPublic | null) => {
+  shareLinkLoaded.value = true;
+  projectShareLink.value = link;
+  shareRole.value = link ? normalizeShareRole(link.role) : "editor";
+  shareExpirationPreset.value = link ? (link.expires_at ? "custom" : "never") : "7days";
+  shareCustomExpiration.value = link?.expires_at ? utcToLocalDateTimeInput(link.expires_at) : "";
+  shareExpirationDirty.value = false;
+  shareNow.value = Date.now();
+};
+
 const openShareDialog = async (project: ExplorerProject) => {
+  if (isSharingProject.value || project.accessRole !== "owner" || project.id.startsWith("local-")) return;
+  const version = ++shareDialogVersion;
+  shareSnapshotVersion += 1;
+  isSyncingShareLink = false;
+  const isCurrent = () => shareDialogVersion === version && projectPendingShare.value?.id === project.id;
   activeMenuProjectId.value = null;
   projectPendingShare.value = project;
-  projectShareLink.value = null;
-  shareRole.value = "editor";
+  applyShareLink(null);
+  shareLinkLoaded.value = false;
+  shareDisablePending.value = false;
   shareMessage.value = "";
   isSharingProject.value = true;
 
@@ -780,49 +870,147 @@ const openShareDialog = async (project: ExplorerProject) => {
     const existingShareLink = await requestJson<ProjectShareLinkPublic | null>(
       `/projects/${project.id}/share-link`,
     );
-    projectShareLink.value =
-      existingShareLink || (await saveShareLink(project, shareRole.value));
-    shareRole.value = normalizeShareRole(projectShareLink.value.role);
+    if (isCurrent()) applyShareLink(existingShareLink);
   } catch (error) {
-    shareMessage.value =
-      error instanceof Error ? error.message : "Share link could not be created.";
+    if (isCurrent()) shareMessage.value =
+      error instanceof Error ? error.message : "Share link could not be loaded.";
   } finally {
-    isSharingProject.value = false;
+    if (isCurrent()) isSharingProject.value = false;
+  }
+};
+
+const syncOpenShareLink = async () => {
+  const project = projectPendingShare.value;
+  if (!project || isSharingProject.value || isSyncingShareLink || !shareLinkLoaded.value ||
+    shareDisablePending.value || shareExpirationDirty.value ||
+    (shareExpired.value && projectShareLink.value && shareRole.value !== projectShareLink.value.role)) return;
+  const version = shareDialogVersion;
+  const snapshotVersion = ++shareSnapshotVersion;
+  const isCurrent = () => version === shareDialogVersion && snapshotVersion === shareSnapshotVersion && projectPendingShare.value?.id === project.id;
+  isSyncingShareLink = true;
+  try {
+    const link = await requestJson<ProjectShareLinkPublic | null>(`/projects/${project.id}/share-link`);
+    if (!isCurrent()) return;
+    if (shareExpirationDirty.value || shareDisablePending.value) return;
+    const previous = projectShareLink.value;
+    if (previous?.token !== link?.token || previous?.expires_at !== link?.expires_at || previous?.role !== link?.role || previous?.is_expired !== link?.is_expired) {
+      applyShareLink(link);
+      shareMessage.value = !link ? "This link was disabled in another session. Existing members keep their access." :
+        previous && previous.token !== link.token ? "The link was renewed in another session. The previous link no longer works." : "Share link settings updated in another session.";
+    }
+  } catch (error) {
+    if (isCurrent() && error instanceof ProjectRequestError && [401, 403, 404].includes(error.status)) {
+      resetShareDialog();
+      showLoadMessage("You no longer have permission to manage this project's sharing.");
+    }
+  } finally {
+    if (isCurrent()) isSyncingShareLink = false;
   }
 };
 
 const updateShareRole = async (role: ShareLinkRole) => {
-  if (!projectPendingShare.value || shareRole.value === role) {
+  const project = projectPendingShare.value;
+  if (!project || !shareLinkLoaded.value || project.accessRole !== "owner" || isSharingProject.value || shareDisablePending.value || shareRole.value === role) {
     return;
   }
-
   const previousRole = shareRole.value;
   shareRole.value = role;
   shareMessage.value = "";
+  shareSnapshotVersion += 1;
+  isSyncingShareLink = false;
+  // Inactive links require an explicit Create/Renew, never a permission click.
+  if (!projectShareLink.value || isShareLinkExpired(projectShareLink.value, Date.now())) {
+    shareNow.value = Date.now();
+    return;
+  }
+  const version = shareDialogVersion;
+  const isCurrent = () => shareDialogVersion === version && projectPendingShare.value?.id === project.id;
   isSharingProject.value = true;
 
   try {
-    projectShareLink.value = await saveShareLink(projectPendingShare.value, role);
+    const link = await saveShareLink(project, { role }); // Omit expiry to preserve the actual deadline.
+    if (isCurrent()) projectShareLink.value = link;
   } catch (error) {
-    shareRole.value = previousRole;
-    shareMessage.value =
-      error instanceof Error ? error.message : "Share permission could not be updated.";
+    if (isCurrent()) {
+      shareRole.value = previousRole;
+      shareMessage.value = error instanceof Error ? error.message : "Share permission could not be updated.";
+    }
   } finally {
-    isSharingProject.value = false;
+    if (isCurrent()) isSharingProject.value = false;
+  }
+};
+
+const updateShareExpiration = async (renew = false) => {
+  const project = projectPendingShare.value;
+  if (!project || !shareLinkLoaded.value || isSharingProject.value || shareDisablePending.value || project.accessRole !== "owner") return;
+  const version = shareDialogVersion;
+  shareSnapshotVersion += 1;
+  isSyncingShareLink = false;
+  const isCurrent = () => shareDialogVersion === version && projectPendingShare.value?.id === project.id;
+  const oldToken = projectShareLink.value?.token;
+  // Renewing an existing date, including an expired custom date, gets a fresh 7-day deadline.
+  const preset = renew && !shareExpirationDirty.value && shareExpirationPreset.value === "custom" ? "7days" : shareExpirationPreset.value;
+  let expiresAt: string | null;
+  try {
+    expiresAt = shareExpirationToUtc(preset, shareCustomExpiration.value);
+  } catch (error) {
+    shareMessage.value = error instanceof Error ? error.message : "Choose a valid expiration date.";
+    return;
+  }
+  shareMessage.value = "";
+  isSharingProject.value = true;
+  try {
+    const link = await saveShareLink(project, {
+      ...(!oldToken || renew ? { role: shareRole.value } : {}),
+      expires_at: expiresAt, ...(renew ? { rotate_token: true } : {}),
+    });
+    if (isCurrent()) {
+      applyShareLink(link);
+      shareMessage.value = oldToken && oldToken !== link.token ? "Link renewed. The previous link no longer works." :
+        oldToken ? "Expiration updated." : "Share link created.";
+    }
+  } catch (error) {
+    if (isCurrent()) shareMessage.value = error instanceof Error ? error.message : "Share link could not be updated.";
+  } finally {
+    if (isCurrent()) isSharingProject.value = false;
+  }
+};
+
+const disableShareLink = async () => {
+  const project = projectPendingShare.value;
+  if (!project || !projectShareLink.value || isSharingProject.value || !shareDisablePending.value || project.accessRole !== "owner") return;
+  const version = shareDialogVersion;
+  shareSnapshotVersion += 1;
+  isSyncingShareLink = false;
+  const isCurrent = () => shareDialogVersion === version && projectPendingShare.value?.id === project.id;
+  isSharingProject.value = true;
+  shareMessage.value = "";
+  try {
+    await requestJson<void>(`/projects/${project.id}/share-link`, { method: "DELETE" });
+    if (isCurrent()) {
+      applyShareLink(null);
+      shareDisablePending.value = false;
+      shareMessage.value = "Link disabled. It no longer works. People already in the project keep their access.";
+    }
+  } catch (error) {
+    if (isCurrent()) shareMessage.value = error instanceof Error ? error.message : "Share link could not be disabled.";
+  } finally {
+    if (isCurrent()) isSharingProject.value = false;
   }
 };
 
 const copyShareLink = async () => {
   const shareUrl = shareProjectUrl.value;
-  if (!shareUrl) {
+  if (!shareUrl || !shareLinkLoaded.value || isSharingProject.value || shareDisablePending.value || isShareLinkExpired(projectShareLink.value, Date.now())) {
+    shareNow.value = Date.now();
     return;
   }
-
+  const version = shareDialogVersion;
   try {
     await navigator.clipboard.writeText(shareUrl);
-    shareMessage.value = "Link copied.";
+    if (version === shareDialogVersion) shareMessage.value = "Link copied.";
   } catch (error) {
-    shareMessage.value = error instanceof Error ? error.message : "Link could not be copied.";
+    if (version === shareDialogVersion) shareMessage.value = error instanceof Error ? error.message : "Link could not be copied.";
   }
 };
 
@@ -838,14 +1026,28 @@ const buildLocalProjectAccess = (): ProjectAccessUserPublic => ({
 });
 
 const closeProjectInfoDialog = () => {
+  if (accessMutationBusy.value) return;
+  resetProjectInfoDialog();
+};
+
+const resetProjectInfoDialog = () => {
+  accessDialogVersion += 1;
+  accessSyncVersion += 1;
   projectPendingInfo.value = null;
   projectAccessUsers.value = [];
+  projectBlockedUsers.value = [];
+  blockedMessage.value = "";
+  isLoadingBlockedUsers.value = false;
+  accessManagementDenied.value = false;
   accessMessage.value = "";
   isLoadingProjectAccess.value = false;
   isSyncingProjectAccess.value = false;
   accessUpdatingUserId.value = null;
   accessRemovingUserId.value = null;
   accessUserPendingRemove.value = null;
+  accessUserPendingBlock.value = null;
+  accessBlockingUserId.value = null;
+  accessUnblockingUserId.value = null;
 };
 
 const applyProjectAccessSnapshot = (
@@ -874,12 +1076,14 @@ const syncOpenProjectAccess = async ({
     !project ||
     project.id.startsWith("local-") ||
     isSyncingProjectAccess.value ||
-    accessUpdatingUserId.value ||
-    accessRemovingUserId.value
+    accessMutationBusy.value || accessUserPendingBlock.value || accessUserPendingRemove.value
   ) {
     return;
   }
 
+  const version = accessDialogVersion;
+  const syncVersion = ++accessSyncVersion;
+  const isCurrent = () => accessDialogVersion === version && accessSyncVersion === syncVersion && projectPendingInfo.value?.id === project.id;
   isSyncingProjectAccess.value = true;
   projectAccessSyncStartedAt.value = Date.now();
   if (showLoading) {
@@ -890,17 +1094,45 @@ const syncOpenProjectAccess = async ({
     const accessUsers = await requestJson<ProjectAccessUserPublic[]>(
       `/projects/${project.id}/access`,
     );
+    if (!isCurrent()) return;
     applyProjectAccessSnapshot(project.id, accessUsers);
+    accessMessage.value = "";
+    accessManagementDenied.value = false;
+    if (canManageProjectAccess.value) {
+      isLoadingBlockedUsers.value = showLoading;
+      try {
+        const users = await requestJson<ProjectBlockedUserPublic[]>(`/projects/${project.id}/blocked-users`);
+        if (isCurrent() && canManageProjectAccess.value) {
+          projectBlockedUsers.value = users;
+          blockedMessage.value = "";
+        } else if (isCurrent()) projectBlockedUsers.value = [];
+      } catch (error) {
+        if (isCurrent()) {
+          if (error instanceof ProjectRequestError && [401, 403, 404].includes(error.status)) {
+            projectBlockedUsers.value = [];
+            accessManagementDenied.value = true;
+            accessMessage.value = "Project access has changed. Refreshing your permissions...";
+          } else blockedMessage.value = error instanceof Error ? error.message : "Blocked people could not be loaded.";
+        }
+      } finally {
+        if (isCurrent()) isLoadingBlockedUsers.value = false;
+      }
+    } else {
+      projectBlockedUsers.value = [];
+      blockedMessage.value = "";
+    }
   } catch (error) {
+    if (!isCurrent()) return;
     if (showLoading) {
       accessMessage.value =
         error instanceof Error ? error.message : "Project access could not be loaded.";
-    } else if (showMissingMessage) {
+    } else if (showMissingMessage && error instanceof ProjectRequestError && [401, 403, 404].includes(error.status)) {
       closeProjectInfoDialog();
       projects.value = projects.value.filter((currentProject) => currentProject.id !== project.id);
       showLoadMessage(`You no longer have access to "${project.name}".`);
     }
   } finally {
+    if (!isCurrent()) return;
     if (showLoading) {
       isLoadingProjectAccess.value = false;
     }
@@ -910,6 +1142,8 @@ const syncOpenProjectAccess = async ({
 };
 
 const openProjectInfoDialog = async (project: ExplorerProject) => {
+  if (accessMutationBusy.value) return;
+  closeProjectInfoDialog();
   activeMenuProjectId.value = null;
   projectPendingInfo.value = project;
   projectAccessUsers.value = [];
@@ -944,43 +1178,53 @@ const updateStoredProjectAccessCount = (projectId: string, accessCount: number) 
 };
 
 const updateAccessUserRole = async (user: ProjectAccessUserPublic, role: ProjectAccessRole) => {
+  const project = projectPendingInfo.value;
   if (
-    !projectPendingInfo.value ||
+    !project || !canManageProjectAccess.value ||
     user.role === role ||
-    accessUpdatingUserId.value
+    accessMutationBusy.value || isLoadingProjectAccess.value || accessUserPendingBlock.value || accessUserPendingRemove.value
   ) {
     return;
   }
 
+  const version = accessDialogVersion;
+  const isCurrent = () => version === accessDialogVersion && projectPendingInfo.value?.id === project.id;
+  accessSyncVersion += 1; // Discard any periodic snapshot started before this mutation.
+  isSyncingProjectAccess.value = false;
   accessUpdatingUserId.value = user.id;
   accessMessage.value = "";
 
   try {
     const updatedUser = await requestJson<ProjectAccessUserPublic>(
-      `/projects/${projectPendingInfo.value.id}/members/${user.id}`,
+      `/projects/${project.id}/members/${user.id}`,
       {
         method: "PATCH",
         body: JSON.stringify({ role }),
       },
     );
+    if (!isCurrent()) return;
     projectAccessUsers.value = projectAccessUsers.value.map((accessUser) =>
       accessUser.id === updatedUser.id ? updatedUser : accessUser,
     );
 
     if (isCurrentAccessUser(updatedUser)) {
-      updateStoredProjectRole(projectPendingInfo.value.id, updatedUser.role);
+      updateStoredProjectRole(project.id, updatedUser.role);
     }
   } catch (error) {
-    accessMessage.value =
-      error instanceof Error ? error.message : "Project access could not be updated.";
+    if (isCurrent()) {
+      handleProjectManagementError(error);
+      accessMessage.value = error instanceof Error ? error.message : "Project access could not be updated.";
+    }
   } finally {
-    accessUpdatingUserId.value = null;
-    void syncOpenProjectAccess({ showMissingMessage: false });
+    if (isCurrent()) {
+      accessUpdatingUserId.value = null;
+      void syncOpenProjectAccess({ showMissingMessage: false });
+    }
   }
 };
 
 const requestRemoveAccessUser = (user: ProjectAccessUserPublic) => {
-  if (!projectPendingInfo.value || user.is_owner || isCurrentAccessUser(user)) {
+  if (!canManageProjectAccess.value || accessMutationBusy.value || accessUserPendingBlock.value || user.is_owner || isCurrentAccessUser(user)) {
     return;
   }
 
@@ -996,29 +1240,36 @@ const closeRemoveAccessUserDialog = () => {
 };
 
 const removeAccessUser = async (user: ProjectAccessUserPublic) => {
-  if (!projectPendingInfo.value || user.is_owner || isCurrentAccessUser(user)) {
+  const project = projectPendingInfo.value;
+  if (!project || !canManageProjectAccess.value || accessMutationBusy.value || user.is_owner || isCurrentAccessUser(user)) {
     return false;
   }
 
+  const version = accessDialogVersion;
+  const isCurrent = () => version === accessDialogVersion && projectPendingInfo.value?.id === project.id;
+  accessSyncVersion += 1;
+  isSyncingProjectAccess.value = false;
   accessRemovingUserId.value = user.id;
   accessMessage.value = "";
 
   try {
-    await requestJson<void>(`/projects/${projectPendingInfo.value.id}/members/${user.id}`, {
+    await requestJson<void>(`/projects/${project.id}/members/${user.id}`, {
       method: "DELETE",
     });
+    if (!isCurrent()) return false;
     projectAccessUsers.value = projectAccessUsers.value.filter(
       (accessUser) => accessUser.id !== user.id,
     );
-    updateStoredProjectAccessCount(projectPendingInfo.value.id, projectAccessUsers.value.length);
+    updateStoredProjectAccessCount(project.id, projectAccessUsers.value.length);
     return true;
   } catch (error) {
-    accessMessage.value =
-      error instanceof Error ? error.message : "Project access could not be removed.";
+    if (isCurrent()) {
+      handleProjectManagementError(error);
+      accessMessage.value = error instanceof Error ? error.message : "Project access could not be removed.";
+    }
     return false;
   } finally {
-    accessRemovingUserId.value = null;
-    void syncOpenProjectAccess({ showMissingMessage: false });
+    if (isCurrent()) accessRemovingUserId.value = null;
   }
 };
 
@@ -1030,6 +1281,77 @@ const confirmRemoveAccessUser = async () => {
   const didRemove = await removeAccessUser(accessUserPendingRemove.value);
   if (didRemove) {
     accessUserPendingRemove.value = null;
+    void syncOpenProjectAccess({ showMissingMessage: false });
+  }
+};
+
+const requestBlockAccessUser = (user: ProjectAccessUserPublic) => {
+  if (!canManageProjectAccess.value || accessMutationBusy.value || accessUserPendingRemove.value ||
+    !canBlockProjectMember(user, currentUserEmail.value)) return;
+  accessMessage.value = "";
+  accessUserPendingBlock.value = user;
+};
+
+const closeBlockAccessUserDialog = () => {
+  if (!accessBlockingUserId.value) accessUserPendingBlock.value = null;
+};
+
+const confirmBlockAccessUser = async () => {
+  const user = accessUserPendingBlock.value;
+  const project = projectPendingInfo.value;
+  if (!user || !project || !canManageProjectAccess.value || accessMutationBusy.value ||
+    !canBlockProjectMember(user, currentUserEmail.value)) return;
+  const version = accessDialogVersion;
+  const isCurrent = () => version === accessDialogVersion && projectPendingInfo.value?.id === project.id;
+  accessSyncVersion += 1;
+  isSyncingProjectAccess.value = false;
+  accessBlockingUserId.value = user.id;
+  accessMessage.value = "";
+  try {
+    const blockedUser = await requestJson<ProjectBlockedUserPublic>(`/projects/${project.id}/blocked-users/${user.id}`, { method: "POST" });
+    if (isCurrent()) {
+      projectAccessUsers.value = projectAccessUsers.value.filter((member) => member.id !== user.id);
+      projectBlockedUsers.value = [blockedUser, ...projectBlockedUsers.value.filter((member) => member.id !== user.id)];
+      updateStoredProjectAccessCount(project.id, projectAccessUsers.value.length);
+      accessUserPendingBlock.value = null;
+      blockedMessage.value = `${accessUserName(user)} is blocked and can no longer join this project.`;
+    }
+  } catch (error) {
+    if (isCurrent()) {
+      handleProjectManagementError(error);
+      accessMessage.value = error instanceof Error ? error.message : "This person could not be blocked.";
+    }
+  } finally {
+    if (isCurrent()) {
+      accessBlockingUserId.value = null;
+      void syncOpenProjectAccess({ showMissingMessage: false });
+    }
+  }
+};
+
+const unblockAccessUser = async (user: ProjectBlockedUserPublic) => {
+  const project = projectPendingInfo.value;
+  if (!project || !canManageProjectAccess.value || accessMutationBusy.value || accessUserPendingBlock.value || accessUserPendingRemove.value) return;
+  const version = accessDialogVersion;
+  const isCurrent = () => version === accessDialogVersion && projectPendingInfo.value?.id === project.id;
+  accessSyncVersion += 1;
+  isSyncingProjectAccess.value = false;
+  accessUnblockingUserId.value = user.id;
+  blockedMessage.value = "";
+  try {
+    await requestJson<void>(`/projects/${project.id}/blocked-users/${user.id}`, { method: "DELETE" });
+    if (isCurrent()) {
+      projectBlockedUsers.value = projectBlockedUsers.value.filter((member) => member.id !== user.id);
+      blockedMessage.value = `${accessUserName(user)} is unblocked. This does not restore project access; they can join again using a valid share link.`;
+    }
+  } catch (error) {
+    if (isCurrent()) {
+      handleProjectManagementError(error);
+      accessMessage.value = error instanceof Error ? error.message : "This person could not be unblocked.";
+      blockedMessage.value = accessMessage.value;
+    }
+  } finally {
+    if (isCurrent()) accessUnblockingUserId.value = null;
   }
 };
 
@@ -1177,6 +1499,7 @@ const syncSharedState = () => {
   }
   void refreshWorkspace();
   void syncOpenProjectAccess({ showMissingMessage: false });
+  void syncOpenShareLink();
 };
 
 const scheduleWorkspaceRefresh = () => {
@@ -1238,7 +1561,10 @@ const connectRealtimeEvents = () => {
     "project.updated": handleRealtimeProjectEvent,
     "project.deleted": handleRealtimeProjectEvent,
     "project.access.updated": handleRealtimeProjectEvent,
-    "project.share.updated": handleRealtimeProjectEvent,
+    "project.share.updated": (payload) => {
+      handleRealtimeProjectEvent(payload);
+      if (payload.project_id === projectPendingShare.value?.id) void syncOpenShareLink();
+    },
   });
 };
 
@@ -1265,14 +1591,24 @@ onMounted(() => {
     WORKSPACE_SYNC_INTERVAL_MS,
   );
   projectAccessSyncIntervalId.value = window.setInterval(
-    () => void syncOpenProjectAccess({ showMissingMessage: false }),
+    () => {
+      void syncOpenProjectAccess({ showMissingMessage: false });
+      void syncOpenShareLink();
+    },
     PROJECT_ACCESS_SYNC_INTERVAL_MS,
   );
+  shareClockIntervalId = window.setInterval(() => {
+    if (projectPendingShare.value) shareNow.value = Date.now();
+  }, 1000);
   window.addEventListener("focus", syncSharedState);
   document.addEventListener("visibilitychange", syncSharedState);
 });
 
 onUnmounted(() => {
+  shareDialogVersion += 1;
+  accessDialogVersion += 1;
+  accessSyncVersion += 1;
+  if (shareClockIntervalId !== null) window.clearInterval(shareClockIntervalId);
   clearLoadMessageTimeout();
   disconnectRealtimeEvents();
   if (workspaceSyncIntervalId.value !== null) {
@@ -1553,6 +1889,7 @@ onUnmounted(() => {
             type="button"
             class="project-modal__close"
             aria-label="Close"
+            :disabled="accessMutationBusy"
             @click="closeProjectInfoDialog"
           >
             <span aria-hidden="true"></span>
@@ -1618,8 +1955,7 @@ onUnmounted(() => {
                     :aria-pressed="user.role === option.value"
                     :disabled="
                       user.role === option.value ||
-                      accessUpdatingUserId === user.id ||
-                      accessRemovingUserId === user.id
+                      accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)
                     "
                     @click="updateAccessUserRole(user, option.value)"
                   >
@@ -1631,18 +1967,63 @@ onUnmounted(() => {
                   type="button"
                   class="access-remove-button"
                   :aria-label="`Remove ${accessUserName(user)} from project`"
-                  :disabled="accessUpdatingUserId === user.id || accessRemovingUserId === user.id"
+                  :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
                   @click="requestRemoveAccessUser(user)"
                 >
                   {{ accessRemovingUserId === user.id ? "Removing..." : "Remove" }}
                 </button>
+                <button
+                  v-if="canManageProjectAccess && canBlockProjectMember(user, currentUserEmail)"
+                  type="button"
+                  class="access-remove-button"
+                  :aria-label="`Block ${accessUserName(user)} from project`"
+                  :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
+                  @click="requestBlockAccessUser(user)"
+                >
+                  Block
+                </button>
               </div>
             </li>
           </ul>
+
+          <section v-if="canManageProjectAccess" class="blocked-people-section" aria-labelledby="blocked-people-title">
+            <h3 id="blocked-people-title">Blocked people <span>{{ projectBlockedUsers.length }}</span></h3>
+            <p>Blocked people cannot join this project, even with a valid share link. Unblocking does not restore project access.</p>
+            <p v-if="blockedMessage" class="access-dialog__message" role="status">{{ blockedMessage }}</p>
+            <div v-if="isLoadingBlockedUsers" class="access-dialog__loading">
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span>Loading blocked people...</span>
+            </div>
+            <ul v-else-if="projectBlockedUsers.length" class="access-list">
+              <li v-for="user in projectBlockedUsers" :key="`blocked-${user.id}`">
+                <div class="access-user-avatar" aria-hidden="true">
+                  <div v-if="user.avatar_pixel_art?.pixels?.length" class="access-user-avatar__pixels">
+                    <span v-for="(pixel, index) in user.avatar_pixel_art.pixels" :key="`blocked-pixel-${user.id}-${index}`" :style="{ backgroundColor: pixel || 'transparent' }"></span>
+                  </div>
+                  <img v-else-if="user.avatar_url" :src="user.avatar_url" alt="" loading="lazy" />
+                  <span v-else>{{ accessUserInitials(user) }}</span>
+                </div>
+                <div class="access-user-copy">
+                  <strong>{{ accessUserName(user) }}</strong>
+                  <span>{{ user.email }}</span>
+                  <span>Blocked {{ formatDateTime(user.blocked_at) }}</span>
+                </div>
+                <div class="access-user-controls">
+                  <button type="button" class="secondary-action access-unblock-button"
+                    :aria-label="`Unblock ${accessUserName(user)} from project`"
+                    :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
+                    @click="unblockAccessUser(user)">
+                    {{ accessUnblockingUserId === user.id ? "Unblocking..." : "Unblock" }}
+                  </button>
+                </div>
+              </li>
+            </ul>
+            <p v-else>No blocked people.</p>
+          </section>
         </div>
 
         <footer>
-          <button type="button" class="primary-action" @click="closeProjectInfoDialog">
+          <button type="button" class="primary-action" :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)" @click="closeProjectInfoDialog">
             Done
           </button>
         </footer>
@@ -1682,8 +2063,9 @@ onUnmounted(() => {
             <strong>{{ accessUserName(accessUserPendingRemove) }}</strong>
             will lose access to
             <strong>{{ projectPendingInfo?.name || "this project" }}</strong>.
-            They will need a new share link to join again.
+            They can join again using a valid share link. To prevent rejoining, block them instead.
           </p>
+          <p v-if="accessMessage" class="access-dialog__message" role="alert">{{ accessMessage }}</p>
         </div>
 
         <footer>
@@ -1709,6 +2091,31 @@ onUnmounted(() => {
             <span>
               {{ accessRemovingUserId === accessUserPendingRemove.id ? "Removing..." : "Remove access" }}
             </span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="accessUserPendingBlock" class="modal-layer remove-access-confirm-layer" role="presentation">
+      <section class="remove-access-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="block-access-title" @click.stop>
+        <header>
+          <div>
+            <p>Project access</p>
+            <h2 id="block-access-title">Block this person?</h2>
+          </div>
+          <button type="button" class="project-modal__close" aria-label="Close" :disabled="Boolean(accessBlockingUserId)" @click="closeBlockAccessUserDialog">
+            <span aria-hidden="true"></span>
+          </button>
+        </header>
+        <div class="remove-access-confirm-dialog__body">
+          <p><strong>{{ accessUserName(accessUserPendingBlock) }}</strong> will be removed from <strong>{{ projectPendingInfo?.name }}</strong> and cannot rejoin, even with a valid share link, until a project owner unblocks them.</p>
+          <p v-if="accessMessage" class="access-dialog__message" role="alert">{{ accessMessage }}</p>
+        </div>
+        <footer>
+          <button type="button" class="secondary-action" :disabled="Boolean(accessBlockingUserId)" @click="closeBlockAccessUserDialog">Cancel</button>
+          <button type="button" class="danger-action" :disabled="Boolean(accessBlockingUserId) || !canManageProjectAccess" @click="confirmBlockAccessUser">
+            <span v-if="accessBlockingUserId" class="button-spinner" aria-hidden="true"></span>
+            <span>{{ accessBlockingUserId ? "Blocking..." : "Block person" }}</span>
           </button>
         </footer>
       </section>
@@ -1743,6 +2150,11 @@ onUnmounted(() => {
         </header>
 
         <div class="share-dialog__body">
+          <div class="share-dialog__summary">
+            <strong>{{ projectPendingShare.name }}</strong>
+            <span :class="{ 'is-expired': shareExpired }" role="status">{{ shareExpirationLabel }}</span>
+          </div>
+          <p v-if="shareExpired" class="share-dialog__hint">This link has expired and cannot be used to join. Renew it to create a new link; the previous link will no longer work.</p>
           <fieldset class="share-role-fieldset">
             <legend>Permission</legend>
             <div
@@ -1759,12 +2171,27 @@ onUnmounted(() => {
                 }"
                 :aria-label="`${option.label}. ${option.description}`"
                 :aria-pressed="shareRole === option.value"
-                :disabled="isSharingProject"
+                :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending"
                 @click="updateShareRole(option.value)"
               >
                 <span>{{ option.label }}</span>
               </button>
             </div>
+          </fieldset>
+
+          <fieldset class="share-role-fieldset share-expiration-fieldset">
+            <legend>Expiration</legend>
+            <div class="share-expiration-row">
+              <select v-model="shareExpirationPreset" aria-label="Share link expiration" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" @change="shareExpirationDirty = true">
+                <option v-for="option in SHARE_EXPIRATION_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
+              </select>
+              <button v-if="projectShareLink && !shareExpired" type="button" class="secondary-action" :disabled="isSharingProject || !shareExpirationDirty || shareDisablePending" @click="updateShareExpiration(false)">Save expiration</button>
+            </div>
+            <label v-if="shareExpirationPreset === 'custom'">
+              <span class="share-dialog__label">Date and time</span>
+              <input v-model="shareCustomExpiration" type="datetime-local" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" aria-label="Share link expiration date and time" @input="shareExpirationDirty = true" />
+            </label>
+            <p class="share-dialog__hint">Dates and times use your device’s local timezone. Changing expiration does not remove people who already have access.</p>
           </fieldset>
 
           <label>
@@ -1782,12 +2209,12 @@ onUnmounted(() => {
                 type="text"
                 readonly
                 aria-label="Project share link"
-                :placeholder="`Creating ${shareRoleLabel.toLowerCase()} link...`"
+                placeholder="No active share link"
               />
               <button
                 type="button"
                 class="secondary-action share-copy-button"
-                :disabled="isSharingProject || !projectShareLink"
+                :disabled="isSharingProject || !projectShareLink || shareExpired || shareDisablePending"
                 @click="copyShareLink"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -1799,7 +2226,23 @@ onUnmounted(() => {
             </div>
           </label>
 
-          <p v-if="shareMessage" class="share-dialog__message">{{ shareMessage }}</p>
+          <div v-if="!shareDisablePending" class="share-dialog__actions">
+            <button v-if="!shareLinkLoaded" type="button" class="secondary-action" :disabled="isSharingProject" @click="openShareDialog(projectPendingShare)">Retry loading</button>
+            <button v-else-if="!projectShareLink" type="button" class="primary-action" :disabled="isSharingProject" @click="updateShareExpiration(false)">Create link</button>
+            <template v-else>
+              <button type="button" class="secondary-action" :disabled="isSharingProject" @click="updateShareExpiration(true)">Renew link</button>
+              <button type="button" class="access-remove-button" :disabled="isSharingProject" @click="shareDisablePending = true">Disable link</button>
+            </template>
+          </div>
+          <div v-else class="share-disable-confirmation">
+            <p>Disable this link for <strong>{{ projectPendingShare.name }}</strong>? It will stop working. Existing members keep their access.</p>
+            <div class="share-dialog__actions">
+              <button type="button" class="secondary-action" :disabled="isSharingProject" @click="shareDisablePending = false">Cancel</button>
+              <button type="button" class="danger-action" :disabled="isSharingProject" @click="disableShareLink">Disable link</button>
+            </div>
+          </div>
+          <p v-if="projectShareLink && !shareDisablePending" class="share-dialog__hint">Renewing creates a new token and invalidates the previous link. Without a new expiration choice, dated links renew for 7 days.</p>
+          <p v-if="shareMessage" class="share-dialog__message" role="status">{{ shareMessage }}</p>
 
           <footer>
             <button
@@ -2584,6 +3027,26 @@ onUnmounted(() => {
     width: min(460px, 100%);
   }
 
+  .access-dialog,
+  .share-dialog {
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100dvh - 48px);
+  }
+
+  .access-dialog > header,
+  .access-dialog > footer,
+  .share-dialog > header {
+    flex-shrink: 0;
+  }
+
+  .access-dialog__body,
+  .share-dialog__body {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
   .access-dialog {
     width: min(540px, 100%);
     background: rgba(16, 17, 17, 0.98);
@@ -2781,6 +3244,7 @@ onUnmounted(() => {
     align-items: center;
     justify-content: flex-end;
     min-width: 0;
+    max-width: 245px;
   }
 
   .access-user-controls .access-role {
@@ -2869,6 +3333,29 @@ onUnmounted(() => {
     opacity: 0.6;
   }
 
+  .access-unblock-button {
+    min-height: 36px;
+    padding: 8px 12px;
+  }
+
+  .blocked-people-section {
+    display: grid;
+    gap: 14px;
+    border-top: 1px solid var(--line);
+    padding-top: 18px;
+  }
+
+  .blocked-people-section h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .blocked-people-section h3 span {
+    color: rgba(247, 241, 231, 0.58);
+    font-size: 0.85rem;
+  }
+
   @media (max-width: 560px) {
     .access-dialog__body {
       padding: 16px 18px 12px;
@@ -2888,6 +3375,84 @@ onUnmounted(() => {
     display: grid;
     gap: 16px;
     padding: 20px 20px 18px;
+  }
+
+  .share-dialog__summary {
+    display: grid;
+    gap: 6px;
+  }
+
+  .share-dialog__summary strong {
+    overflow-wrap: anywhere;
+    font-size: 1.1rem;
+  }
+
+  .share-dialog__summary span,
+  .share-dialog__hint {
+    margin: 0;
+    color: rgba(247, 241, 231, 0.62);
+    font-size: 0.8rem;
+    line-height: 1.5;
+  }
+
+  .share-dialog__summary .is-expired {
+    color: #ffb09f;
+  }
+
+  .share-expiration-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .share-expiration-row select {
+    flex: 1;
+    min-width: 170px;
+    min-height: 44px;
+    color: var(--text);
+    background: #191a1a;
+    border: 1px solid rgba(255, 252, 244, 0.2);
+    border-radius: 8px;
+    padding: 0 12px;
+    font: inherit;
+  }
+
+  .share-expiration-row select:focus-visible {
+    outline: 2px solid rgba(247, 241, 231, 0.5);
+    outline-offset: 2px;
+  }
+
+  .share-expiration-fieldset input {
+    color-scheme: dark;
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .share-dialog__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .share-dialog__actions .access-remove-button {
+    min-height: 44px;
+    padding: 0 12px;
+  }
+
+  .share-disable-confirmation {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .share-disable-confirmation p {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.5;
   }
 
   .share-dialog__body label {

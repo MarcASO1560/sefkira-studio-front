@@ -109,6 +109,7 @@ export type RealtimeConnection = {
 
 export type ProjectPresenceConnection = RealtimeConnection & {
   clientId: string;
+  refresh: () => Promise<void>;
   sendEditorActivity: (
     kind: ProjectEditorActivityKind,
     payload: Record<string, unknown>,
@@ -118,6 +119,8 @@ export type ProjectPresenceConnection = RealtimeConnection & {
 
 const INITIAL_SUBSCRIPTION_TIMEOUT_MS = 8000;
 const TOKEN_REFRESH_MARGIN_MS = 60000;
+const PROJECT_PRESENCE_LEASE_MS = 15000;
+const PROJECT_PRESENCE_CHECK_INTERVAL_MS = 10000;
 const MAX_CATCH_UP_BATCHES = 20;
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -142,16 +145,24 @@ const fetchRealtimeConfig = async () => {
   return (await response.json()) as RealtimeConfig;
 };
 
-const fetchProjectPresenceConfig = async (projectId: string) => {
+class ProjectPresenceAccessError extends Error {
+  constructor(readonly status: number) {
+    super(`Realtime presence configuration failed with ${status}`);
+  }
+}
+
+const fetchProjectPresenceConfig = async (projectId: string, signal: AbortSignal) => {
   const response = await fetch(
     `${API_V1_URL}/events/presence/config?project_id=${encodeURIComponent(projectId)}`,
     {
       credentials: "same-origin",
+      cache: "no-store",
       headers: { Accept: "application/json" },
+      signal,
     },
   );
   if (!response.ok) {
-    throw new Error(`Realtime presence configuration failed with ${response.status}`);
+    throw new ProjectPresenceAccessError(response.status);
   }
   return (await response.json()) as ProjectPresenceConfig;
 };
@@ -511,6 +522,7 @@ export const connectProjectPresence = (
   onSync: (snapshot: ProjectPresenceSnapshot) => void,
   initialResourceId: string | null = null,
   onEditorActivity: (activity: ProjectEditorActivity) => void = () => undefined,
+  onAccessDenied: (status: number) => void = () => undefined,
 ): ProjectPresenceConnection => {
   let closed = false;
   let activeResourceId = initialResourceId;
@@ -521,24 +533,92 @@ export const connectProjectPresence = (
   let channel: RealtimeChannel | null = null;
   let subscribed = false;
   let tracked = false;
+  let roomGeneration = 0;
+  let validationGeneration = 0;
+  let verifiedAt: number | null = null;
+  let verifying = false;
+  let refreshPromise: Promise<void> | null = null;
+  let refreshAbort: AbortController | null = null;
+  let leaseInterval: ReturnType<typeof setInterval> | null = null;
+  let leaseExpiry: ReturnType<typeof setTimeout> | null = null;
+
+  const isOnline = () => typeof navigator === "undefined" || navigator.onLine !== false;
+  const hasFreshLease = () => {
+    const expiresAt = Date.parse(activeConfig?.expires_at || "");
+    const elapsed = verifiedAt === null ? Infinity : Date.now() - verifiedAt;
+    return !closed && isOnline() && activeConfig !== null && verifiedAt !== null &&
+      elapsed >= 0 && elapsed < PROJECT_PRESENCE_LEASE_MS &&
+      Number.isFinite(expiresAt) && expiresAt > Date.now();
+  };
+
+  // Realtime caches RLS for each joined room. Retire the entire old socket,
+  // rather than letting delayed callbacks/pushes leak across a project epoch.
+  const retireRoom = () => {
+    roomGeneration += 1;
+    const oldChannel = channel;
+    const oldClient = client;
+    const wasTracked = tracked;
+    channel = null;
+    client = null;
+    activeConfig = null;
+    verifiedAt = null;
+    subscribed = false;
+    tracked = false;
+    if (leaseExpiry !== null) clearTimeout(leaseExpiry);
+    leaseExpiry = null;
+    if (oldClient) {
+      if (oldChannel) {
+        if (wasTracked) void oldChannel.untrack().catch(() => undefined);
+        void oldClient.removeChannel(oldChannel).catch(() => undefined);
+      }
+      // Do not wait for an unsubscribe acknowledgement from a failing socket.
+      oldClient.disconnect();
+    }
+    onSync({});
+  };
+
+  const verifyLease = (config: EnabledProjectPresenceConfig) => {
+    verifiedAt = Date.now();
+    if (leaseExpiry !== null) clearTimeout(leaseExpiry);
+    leaseExpiry = setTimeout(() => {
+      leaseExpiry = null;
+      if (!closed && !hasFreshLease()) {
+        retireRoom();
+        void refresh();
+      }
+    }, Math.min(PROJECT_PRESENCE_LEASE_MS, Date.parse(config.expires_at) - Date.now()));
+  };
+
+  const canUseRoom = () => {
+    if (closed || !subscribed || !channel || !activeConfig) return false;
+    if (!hasFreshLease()) {
+      retireRoom();
+      void refresh();
+      return false;
+    }
+    return !verifying;
+  };
 
   const publishPresence = async () => {
-    if (closed || !subscribed || !channel || !activeConfig) return;
+    if (!canUseRoom() || !channel || !activeConfig) return;
+    const currentChannel = channel;
     if (!activeResourceId) {
       if (tracked) {
-        await channel.untrack();
         tracked = false;
+        await currentChannel.untrack();
       }
       return;
     }
 
-    await channel.track({
+    // Mark the dispatched track immediately: a later resource exit must send
+    // untrack even if this track's acknowledgement is delayed or lost.
+    tracked = true;
+    await currentChannel.track({
       ...activeConfig.user,
       client_id: clientId,
       resource_id: activeResourceId,
       online_at: new Date().toISOString(),
     });
-    tracked = true;
   };
 
   const queuePresencePublish = () => {
@@ -551,7 +631,7 @@ export const connectProjectPresence = (
     kind: ProjectEditorActivityKind,
     payload: Record<string, unknown>,
   ) => {
-    if (closed || !subscribed || !channel || !activeConfig || !activeResourceId) {
+    if (!canUseRoom() || !channel || !activeConfig || !activeResourceId) {
       return;
     }
 
@@ -586,116 +666,173 @@ export const connectProjectPresence = (
       });
   };
 
-  if (typeof window !== "undefined") {
-    void (async () => {
+  const installRoom = async (config: EnabledProjectPresenceConfig, interrupted: Promise<never>) => {
+    const currentGeneration = roomGeneration;
+    activeConfig = config;
+    verifyLease(config);
+    const realtimeUrl = `${config.supabase_url.replace(/^http/i, "ws")}/realtime/v1`;
+    const currentClient = new RealtimeClient(realtimeUrl, {
+      accessToken: async () => {
+        if (closed || currentGeneration !== roomGeneration) return null;
+        const expiresAt = Date.parse(activeConfig?.expires_at || "");
+        if (!hasFreshLease() || expiresAt - Date.now() <= TOKEN_REFRESH_MARGIN_MS) await refresh();
+        return currentGeneration === roomGeneration && hasFreshLease() ? activeConfig!.access_token : null;
+      },
+      params: { apikey: config.publishable_key },
+      // Workers keep heartbeats alive in background tabs, but a stale lease
+      // still requires a fresh API authorization before activity is exposed.
+      worker: typeof window.Worker === "function",
+    });
+    client = currentClient;
+    await Promise.race([currentClient.setAuth(config.access_token), interrupted]);
+    if (closed || currentGeneration !== roomGeneration || currentClient !== client) return;
+    const currentChannel = currentClient.channel(config.channel, {
+      config: {
+        broadcast: { ack: false, self: false },
+        private: true,
+        presence: { enabled: true, key: config.user.id },
+      },
+    });
+    channel = currentChannel;
+    const isCurrentRoom = () => !closed && currentGeneration === roomGeneration && currentChannel === channel;
+    currentChannel.on("broadcast", { event: "editor.activity" }, ({ payload }) => {
+      if (!isCurrentRoom() || !canUseRoom() || !isObject(payload)) return;
+      const kind = payload.kind;
+      const validKind = kind === "cursor" || kind === "document" || kind === "pixels" ||
+        kind === "selection" || kind === "sync-request";
+      if (
+        !validKind || typeof payload.client_id !== "string" || payload.client_id === clientId ||
+        typeof payload.resource_id !== "string" || typeof payload.sent_at !== "string" ||
+        typeof payload.sequence !== "number" || !Number.isSafeInteger(payload.sequence) || payload.sequence < 1 ||
+        !isObject(payload.user) || typeof payload.user.id !== "string" || typeof payload.user.email !== "string" ||
+        (payload.user.username !== undefined && payload.user.username !== null && typeof payload.user.username !== "string") ||
+        (payload.user.avatar_pixel_art !== undefined && payload.user.avatar_pixel_art !== null && !isObject(payload.user.avatar_pixel_art)) ||
+        !isObject(payload.payload)
+      ) return;
+      onEditorActivity(payload as ProjectEditorActivity);
+    });
+    currentChannel.on("presence", { event: "sync" }, () => {
+      if (isCurrentRoom() && canUseRoom()) onSync(groupProjectPresenceState(currentChannel.presenceState()));
+    });
+    verifying = false;
+    currentChannel.subscribe((status) => {
+      if (!isCurrentRoom()) return;
+      if (status === "SUBSCRIBED") {
+        subscribed = true;
+        queuePresencePublish();
+        sendEditorActivity("sync-request", {});
+      } else if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        subscribed = false;
+        onSync({});
+      }
+    });
+  };
+
+  const refresh = (): Promise<void> => {
+    if (closed || typeof window === "undefined") return Promise.resolve();
+    if (!isOnline()) {
+      retireRoom();
+      return Promise.resolve();
+    }
+    if (refreshPromise) return refreshPromise;
+    if (activeConfig && !hasFreshLease()) retireRoom();
+    const currentValidation = ++validationGeneration;
+    const controller = new AbortController();
+    refreshAbort = controller;
+    verifying = true;
+    const nextPromise = (async () => {
+      let abortListener: (() => void) | undefined;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        abortListener = () => reject(new Error("Realtime presence verification was interrupted or timed out."));
+        controller.signal.addEventListener("abort", abortListener, { once: true });
+      });
+      const timeout = setTimeout(() => controller.abort(), INITIAL_SUBSCRIPTION_TIMEOUT_MS);
       try {
-        const config = await fetchProjectPresenceConfig(projectId);
-        if (closed || !isProjectPresenceConfig(config)) {
-          onSync({});
+        const config = await Promise.race([fetchProjectPresenceConfig(projectId, controller.signal), aborted]);
+        if (closed || currentValidation !== validationGeneration) return;
+        if (!isOnline() || !config.enabled) {
+          retireRoom();
           return;
         }
-        activeConfig = config;
-
-        const getAccessToken = async () => {
-          if (!activeConfig) return null;
-          const expiresAt = Date.parse(activeConfig.expires_at);
-          if (Number.isFinite(expiresAt) && expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) {
-            return activeConfig.access_token;
-          }
-
-          const refreshedConfig = await fetchProjectPresenceConfig(projectId);
-          if (!isProjectPresenceConfig(refreshedConfig)) return null;
-          activeConfig = refreshedConfig;
-          return activeConfig.access_token;
-        };
-
-        const realtimeUrl = `${config.supabase_url.replace(/^http/i, "ws")}/realtime/v1`;
-        client = new RealtimeClient(realtimeUrl, {
-          accessToken: getAccessToken,
-          params: { apikey: config.publishable_key },
-          // Browser-tab timers are throttled in the background. Run the
-          // heartbeat in Supabase's worker when the browser supports it.
-          worker: typeof window.Worker === "function",
-        });
-        await client.setAuth(config.access_token);
-        if (closed) {
-          client.disconnect();
-          client = null;
-          return;
+        if (!isProjectPresenceConfig(config) || !Number.isFinite(Date.parse(config.expires_at)) || Date.parse(config.expires_at) <= Date.now()) {
+          throw new Error("Realtime presence configuration is invalid or expired.");
         }
-        channel = client.channel(config.channel, {
-          config: {
-            broadcast: { ack: false, self: false },
-            private: true,
-            presence: { enabled: true, key: config.user.id },
-          },
-        });
-        channel.on("broadcast", { event: "editor.activity" }, ({ payload }) => {
-          if (closed || !isObject(payload)) return;
-
-          const kind = payload.kind;
-          const validKind =
-            kind === "cursor" ||
-            kind === "document" ||
-            kind === "pixels" ||
-            kind === "selection" ||
-            kind === "sync-request";
-          if (
-            !validKind ||
-            typeof payload.client_id !== "string" ||
-            payload.client_id === clientId ||
-            typeof payload.resource_id !== "string" ||
-            typeof payload.sent_at !== "string" ||
-            typeof payload.sequence !== "number" ||
-            !Number.isSafeInteger(payload.sequence) ||
-            payload.sequence < 1 ||
-            !isObject(payload.user) ||
-            typeof payload.user.id !== "string" ||
-            typeof payload.user.email !== "string" ||
-            (payload.user.username !== undefined &&
-              payload.user.username !== null &&
-              typeof payload.user.username !== "string") ||
-            (payload.user.avatar_pixel_art !== undefined &&
-              payload.user.avatar_pixel_art !== null &&
-              !isObject(payload.user.avatar_pixel_art)) ||
-            !isObject(payload.payload)
-          ) {
-            return;
-          }
-
-          onEditorActivity(payload as ProjectEditorActivity);
-        });
-        channel.on("presence", { event: "sync" }, () => {
-          if (!closed && channel) {
-            onSync(groupProjectPresenceState(channel.presenceState()));
-          }
-        });
-        channel.subscribe((status) => {
-          if (closed) return;
-          if (status === "SUBSCRIBED") {
-            subscribed = true;
-            queuePresencePublish();
-            sendEditorActivity("sync-request", {});
-          } else if (
-            status === "CLOSED" ||
-            status === "CHANNEL_ERROR" ||
-            status === "TIMED_OUT"
-          ) {
-            subscribed = false;
-            onSync({});
-          }
-        });
+        const sameRoom = client && channel && activeConfig &&
+          activeConfig.channel === config.channel && activeConfig.supabase_url === config.supabase_url &&
+          activeConfig.publishable_key === config.publishable_key && activeConfig.user.id === config.user.id;
+        if (!sameRoom) {
+          retireRoom();
+          await installRoom(config, aborted);
+        } else {
+          const currentClient = client!;
+          const currentGeneration = roomGeneration;
+          activeConfig = config;
+          verifyLease(config);
+          await Promise.race([currentClient.setAuth(config.access_token), aborted]);
+          if (closed || currentValidation !== validationGeneration || currentGeneration !== roomGeneration) return;
+          verifying = false;
+          if (canUseRoom() && channel) onSync(groupProjectPresenceState(channel.presenceState()));
+        }
       } catch (error) {
-        if (!closed) {
-          console.warn("Supabase Presence unavailable.", error);
-          onSync({});
+        if (closed || currentValidation !== validationGeneration) return;
+        if (error instanceof ProjectPresenceAccessError && [401, 403, 404].includes(error.status)) {
+          close();
+          onAccessDenied(error.status);
+        } else {
+          retireRoom();
+          console.warn("Supabase Presence verification unavailable; activity paused until retry.", error);
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (abortListener) controller.signal.removeEventListener("abort", abortListener);
+        if (currentValidation === validationGeneration) {
+          verifying = false;
+          refreshAbort = null;
         }
       }
-    })();
+    })().finally(() => {
+      if (refreshPromise === nextPromise) refreshPromise = null;
+    });
+    refreshPromise = nextPromise;
+    return nextPromise;
+  };
+
+  const recheckAccess = () => { void refresh(); };
+  const pauseOffline = () => {
+    validationGeneration += 1;
+    refreshAbort?.abort();
+    refreshAbort = null;
+    refreshPromise = null;
+    verifying = false;
+    retireRoom();
+  };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    validationGeneration += 1;
+    refreshAbort?.abort();
+    refreshAbort = null;
+    if (leaseInterval !== null) clearInterval(leaseInterval);
+    leaseInterval = null;
+    if (typeof window !== "undefined") {
+      window.removeEventListener?.("online", recheckAccess);
+      window.removeEventListener?.("offline", pauseOffline);
+    }
+    if (typeof document !== "undefined") document.removeEventListener?.("visibilitychange", recheckAccess);
+    retireRoom();
+  };
+
+  if (typeof window !== "undefined") {
+    leaseInterval = setInterval(recheckAccess, PROJECT_PRESENCE_CHECK_INTERVAL_MS);
+    window.addEventListener?.("online", recheckAccess);
+    window.addEventListener?.("offline", pauseOffline);
+    if (typeof document !== "undefined") document.addEventListener?.("visibilitychange", recheckAccess);
+    void refresh();
   }
 
   return {
     clientId,
+    refresh,
     sendEditorActivity,
     setResourceId: (resourceId) => {
       const changed = activeResourceId !== resourceId;
@@ -703,23 +840,6 @@ export const connectProjectPresence = (
       queuePresencePublish();
       if (changed && resourceId) sendEditorActivity("sync-request", {});
     },
-    close: () => {
-      if (closed) return;
-      closed = true;
-      subscribed = false;
-      onSync({});
-
-      const currentChannel = channel;
-      const currentClient = client;
-      channel = null;
-      client = null;
-      if (currentChannel && currentClient) {
-        const untrack = tracked
-          ? currentChannel.untrack().catch(() => undefined)
-          : Promise.resolve();
-        tracked = false;
-        void untrack.finally(() => removeSupabaseConnection(currentClient, currentChannel));
-      }
-    },
+    close,
   };
 };

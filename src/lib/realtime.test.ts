@@ -353,7 +353,7 @@ describe("project presence", () => {
       supabase_url: "https://project.supabase.co",
       publishable_key: "sb_publishable_test",
       access_token: "realtime-token",
-      expires_at: "2099-09-14T12:00:00Z",
+      expires_at: new Date(Date.now() + 65_000).toISOString(),
       channel: "project:project-1:presence",
       user: {
         id: "user-1",
@@ -486,7 +486,9 @@ describe("project presence", () => {
     };
     expect(await options.accessToken()).toBe("realtime-token");
     expect(fetch).toHaveBeenCalledOnce();
-    vi.spyOn(Date, "now").mockReturnValue(Date.parse(config.expires_at) - 30_000);
+    // Renew a nearly expired JWT while the independently checked room lease
+    // is still fresh. A jump of decades must instead retire the stale room.
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(config.expires_at) - 60_000);
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
       ...config,
       access_token: "refreshed-token",

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 
 import { API_V1_URL, type ProjectPublic } from "../../../lib/api";
 import { WORKSPACE_TRANSITION_STORAGE_KEY } from "../../../lib/routeTransition";
+import { shareLinkFailureMessage, shouldShareLinkRedirectToLogin } from "../lib/shareLinkExpiration";
 
 const props = defineProps<{
   token: string;
@@ -12,6 +13,9 @@ const status = ref<"joining" | "redirecting" | "error">("joining");
 const message = ref("Joining shared project...");
 
 const canRetry = computed(() => status.value === "error");
+const controller = new AbortController();
+let mounted = true;
+let redirectTimeout: number | null = null;
 
 const studioPath = "/studio";
 
@@ -28,37 +32,60 @@ const redirectToStudio = () => {
 };
 
 const joinSharedProject = async () => {
-  const response = await fetch(
-    `${API_V1_URL}/projects/share-links/${encodeURIComponent(props.token)}/accept`,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: {
-        Accept: "application/json",
+  const timeout = window.setTimeout(() => controller.abort(), 18000);
+  try {
+    const response = await fetch(
+      `${API_V1_URL}/projects/share-links/${encodeURIComponent(props.token)}/accept`,
+      {
+        method: "POST",
+        signal: controller.signal,
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
       },
-    },
-  );
+    );
 
-  if (response.status === 401 || response.status === 403) {
-    redirectToLogin();
-    return;
+    if (!mounted) return;
+    if (response.status === 401) {
+      redirectToLogin();
+      return;
+    }
+
+    const project = response.ok ? ((await response.json()) as ProjectPublic) : null;
+    if (!mounted) return;
+
+    if (!project) {
+      let detail: unknown;
+      try { detail = ((await response.json()) as { detail?: unknown }).detail; } catch { /* Empty error body. */ }
+      if (!mounted) return;
+      if (shouldShareLinkRedirectToLogin(response.status, detail)) {
+        redirectToLogin();
+        return;
+      }
+      status.value = "error";
+      message.value = shareLinkFailureMessage(response.status, detail);
+      return;
+    }
+
+    status.value = "redirecting";
+    message.value = "Project added. Opening studio...";
+    redirectTimeout = window.setTimeout(redirectToStudio, 260);
+  } catch {
+    if (mounted) {
+      status.value = "error";
+      message.value = "The project could not be opened. Check your connection and try the link again.";
+    }
+  } finally {
+    window.clearTimeout(timeout);
   }
-
-  const project = response.ok ? ((await response.json()) as ProjectPublic) : null;
-
-  if (!project) {
-    status.value = "error";
-    message.value = "This share link is not available anymore.";
-    return;
-  }
-
-  status.value = "redirecting";
-  message.value = "Project added. Opening studio...";
-  window.setTimeout(redirectToStudio, 260);
 };
 
 onMounted(() => {
   void joinSharedProject();
+});
+onUnmounted(() => {
+  mounted = false;
+  controller.abort();
+  if (redirectTimeout !== null) window.clearTimeout(redirectTimeout);
 });
 </script>
 

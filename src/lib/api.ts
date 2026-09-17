@@ -153,6 +153,8 @@ export type ProjectShareLinkPublic = {
   role: ProjectAccessRole;
   created_at: string;
   updated_at: string;
+  expires_at: string | null;
+  is_expired: boolean;
 };
 
 export type ProjectAccessUserPublic = {
@@ -164,6 +166,15 @@ export type ProjectAccessUserPublic = {
   role: ProjectAccessRole;
   is_owner: boolean;
   joined_at?: string | null;
+};
+
+export type ProjectBlockedUserPublic = {
+  id: string;
+  username?: string | null;
+  email: string;
+  avatar_url?: string | null;
+  avatar_pixel_art?: PixelAvatarData | null;
+  blocked_at: string;
 };
 
 export type WorkspaceBootstrap = {

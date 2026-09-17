@@ -120,6 +120,7 @@ const PROJECT_SYNC_FOCUS_COOLDOWN_MS = PROJECT_SYNC_INTERVAL_MS;
 const REALTIME_REFRESH_DELAY_MS = 180;
 const STALE_SYNC_MS = REQUEST_TIMEOUT_MS + 5000;
 const project = ref<ProjectPublic | null>(props.initialProjectWorkspace?.project || null);
+const isProjectAccessRevoked = ref(false);
 const tree = ref<ProjectTree | null>(props.initialProjectWorkspace?.tree || null);
 const localFolders = ref<ProjectFolderPublic[]>([]);
 const localResources = ref<ProjectResourcePublic[]>([]);
@@ -1602,6 +1603,7 @@ const reconcileExplorerState = (nextTree: ProjectTree) => {
 };
 
 const applyProjectSnapshot = (nextProject: ProjectPublic, nextTree: ProjectTree) => {
+  if (isProjectAccessRevoked.value) return;
   project.value = nextProject;
   tree.value = nextTree;
   localFolders.value = [];
@@ -1611,7 +1613,16 @@ const applyProjectSnapshot = (nextProject: ProjectPublic, nextTree: ProjectTree)
   reconcileExplorerState(nextTree);
 };
 
+class ProjectRequestError extends Error {
+  constructor(readonly status: number) {
+    super(`Request failed: ${status}`);
+  }
+}
+
 const requestJson = async <ResponseBody,>(path: string, init: RequestInit = {}) => {
+  if (isProjectAccessRevoked.value && (init.method || "GET").toUpperCase() !== "GET") {
+    throw new ProjectRequestError(403);
+  }
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -1628,7 +1639,7 @@ const requestJson = async <ResponseBody,>(path: string, init: RequestInit = {}) 
     });
 
     if (!response.ok) {
-      throw new Error(`Request failed: ${response.status}`);
+      throw new ProjectRequestError(response.status);
     }
 
     if (response.status === 204) {
@@ -1908,6 +1919,7 @@ const refreshProject = async ({
   showLoading = false,
   showError = false,
 } = {}) => {
+  if (isProjectAccessRevoked.value) return;
   resetStaleProjectSync();
   if (isSyncingProject.value) {
     return;
@@ -1924,7 +1936,11 @@ const refreshProject = async ({
       `/workspace/projects/${encodeURIComponent(props.projectId)}`,
     );
     applyProjectSnapshot(snapshot.project, snapshot.tree);
-  } catch {
+  } catch (error) {
+    if (error instanceof ProjectRequestError && [401, 403, 404].includes(error.status)) {
+      revokeProjectAccess();
+      return;
+    }
     if (showError || !project.value) {
       errorMessage.value = "This project is not available.";
     }
@@ -1963,6 +1979,11 @@ const handleRealtimeProjectUnavailable = (payload: RealtimeEventPayload) => {
     return;
   }
 
+  isProjectAccessRevoked.value = true;
+  projectPresenceConnection.value?.close();
+  projectPresenceConnection.value = null;
+  projectPresenceByResource.value = {};
+
   closeCreateResourceDialog(true);
   closeProjectEditDialog();
   isProfileDialogOpen.value = false;
@@ -1980,12 +2001,23 @@ const handleRealtimeProjectUnavailable = (payload: RealtimeEventPayload) => {
 
 const handleRealtimeProjectAccessUpdated = (payload: RealtimeEventPayload) => {
   if (isCurrentProjectRealtimeEvent(payload)) {
+    void projectPresenceConnection.value?.refresh();
     scheduleProjectRefresh({ showError: true });
   }
 };
 
+const revokeProjectAccess = () => {
+  if (isProjectAccessRevoked.value) return;
+  isProjectAccessRevoked.value = true;
+  if (project.value) project.value = { ...project.value, access_role: "viewer" };
+  projectPresenceConnection.value?.close();
+  projectPresenceConnection.value = null;
+  projectPresenceByResource.value = {};
+  handleRealtimeProjectUnavailable({ project_id: props.projectId });
+};
+
 const connectRealtimeEvents = () => {
-  if (typeof window === "undefined") {
+  if (typeof window === "undefined" || isProjectAccessRevoked.value) {
     return;
   }
 
@@ -2002,6 +2034,9 @@ const connectRealtimeEvents = () => {
     (snapshot) => {
       projectPresenceByResource.value = snapshot;
     },
+    null,
+    undefined,
+    revokeProjectAccess,
   );
 };
 
