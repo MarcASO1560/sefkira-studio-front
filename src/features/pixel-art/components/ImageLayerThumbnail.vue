@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 
+import { writeImageCanvasBitmapPixels } from "../lib/canvasRendering";
 import type { PixelColor } from "../types";
 
 const props = defineProps<{
@@ -11,6 +12,8 @@ const props = defineProps<{
 }>();
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
+let thumbnailImageData: ImageData | null = null;
+let thumbnailRenderFrame: number | null = null;
 
 const renderThumbnail = () => {
   const canvas = canvasRef.value;
@@ -18,39 +21,50 @@ const renderThumbnail = () => {
   const height = Math.max(1, Math.floor(props.height));
   if (!canvas) return;
 
-  canvas.width = width;
-  canvas.height = height;
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
   const context = canvas.getContext("2d");
   if (!context) return;
 
   context.imageSmoothingEnabled = false;
-  const imageData = context.createImageData(width, height);
+  if (!thumbnailImageData || thumbnailImageData.width !== width || thumbnailImageData.height !== height) {
+    thumbnailImageData = context.createImageData(width, height);
+  }
+  const imageData = thumbnailImageData;
   const layerOpacity = Math.min(1, Math.max(0, props.opacity));
-  const pixelCount = Math.min(props.pixels.length, width * height);
-
-  for (let index = 0; index < pixelCount; index += 1) {
-    const color = props.pixels[index];
-    if (!color) continue;
-
-    const hex = color.slice(1);
-    const dataIndex = index * 4;
-    imageData.data[dataIndex] = Number.parseInt(hex.slice(0, 2), 16);
-    imageData.data[dataIndex + 1] = Number.parseInt(hex.slice(2, 4), 16);
-    imageData.data[dataIndex + 2] = Number.parseInt(hex.slice(4, 6), 16);
-    const pixelOpacity = hex.length === 8 ? Number.parseInt(hex.slice(6, 8), 16) / 255 : 1;
-    imageData.data[dataIndex + 3] = Math.round(255 * pixelOpacity * layerOpacity);
+  const pixels = props.pixels.length === width * height
+    ? props.pixels
+    : Array.from({ length: width * height }, (_, index) => props.pixels[index] ?? null);
+  writeImageCanvasBitmapPixels(pixels, null, imageData.data);
+  if (layerOpacity !== 1) {
+    for (let offset = 3; offset < imageData.data.length; offset += 4) {
+      imageData.data[offset] = Math.round(imageData.data[offset]! * layerOpacity);
+    }
   }
 
   context.putImageData(imageData, 0, 0);
 };
 
+const scheduleThumbnailRender = () => {
+  if (thumbnailRenderFrame !== null) return;
+  thumbnailRenderFrame = requestAnimationFrame(() => {
+    thumbnailRenderFrame = null;
+    renderThumbnail();
+  });
+};
+
 watch(
   () => [props.pixels, props.width, props.height, props.opacity] as const,
-  () => void nextTick(renderThumbnail),
+  scheduleThumbnailRender,
   { flush: "post" },
 );
 
-onMounted(renderThumbnail);
+onMounted(scheduleThumbnailRender);
+onUnmounted(() => {
+  if (thumbnailRenderFrame !== null) cancelAnimationFrame(thumbnailRenderFrame);
+  thumbnailRenderFrame = null;
+  thumbnailImageData = null;
+});
 </script>
 
 <template>

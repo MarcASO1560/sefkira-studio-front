@@ -1,7 +1,7 @@
 import { computed, ref } from "vue";
 import type { ProjectResourceDetail } from "../../../lib/api";
-import type { PixelArtDocumentV2, SaveStatus } from "../types";
-import { clonePixelArtDocument } from "../lib/document";
+import type { PixelArtDocumentV2, PixelColor, SaveStatus } from "../types";
+import { clonePixelArtDocument, normalizePixelColor } from "../lib/document";
 import { parsePixelArtResourceData } from "../lib/migrations";
 import { applyImageActions, diffImageDocuments, ImageOperationConflict, rebaseImageOperationActions, splitImageActionBatches, validateImageOperation, type ImageOperation, type ImageOperationTransform, type ImageResizeOperation, type SharedImageHistory } from "../lib/imageOperations";
 import { claimImageOperationSession, createImageOperationId, createIndexedDbImageOperationStore, type ImageOperationStore, type StoredImageOperationQueue } from "../lib/imageOperationStore";
@@ -26,11 +26,15 @@ export type ImageOperationSyncOptions = {
   debounceMs?: number;
   isOnline?: () => boolean;
 };
-type PendingEntry = { operation: ImageOperation; durable: boolean; acknowledgedRevision?: number; previewSequence?: number };
+export type ImageOperationScheduleSettings = { conditional?: boolean; forceReplace?: boolean; resize?: ImageResizeOperation; historyGroupId?: string; previewSequence?: number };
+export type ImageOperationPixelChange = Readonly<{ index: number; after: PixelColor; before?: PixelColor }>;
+export type ImageOperationPixelScheduleSettings = Pick<ImageOperationScheduleSettings, "conditional" | "historyGroupId" | "previewSequence">;
+type PendingEntry = { operation: ImageOperation; durable: boolean; acknowledgedRevision?: number; previewSequence?: number; historySendStarted?: boolean };
 const resourceDocument = (resource: ProjectResourceDetail) => resource.data.pixel_art as PixelArtDocumentV2;
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const sameDocumentContent = (left: PixelArtDocumentV2, right: PixelArtDocumentV2) => JSON.stringify({ ...left, palette: [] }) === JSON.stringify({ ...right, palette: [] });
 const message = (error: unknown) => error instanceof Error ? error.message : "Unable to synchronize changes. Your pending operations have been retained.";
+const isSharedHistoryOperation = (operation: ImageOperation) => operation.actions.some((action) => action.type === "undo" || action.type === "redo");
 
 /** A single writer per tab. An operation leaves the queue only after a valid ACK. */
 export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
@@ -51,6 +55,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
   const transport = options.transport ?? createImageOperationTransport(options.projectId, options.resourceId);
   const debounceMs = options.debounceMs ?? 100;
   let canonical: ProjectResourceDetail | null = null;
+  let journalCanonical: { source: ProjectResourceDetail; snapshot: ProjectResourceDetail } | null = null;
   let observed: PixelArtDocumentV2 | null = null;
   let entries: PendingEntry[] = [];
   let store: ImageOperationStore | null = options.store ?? null;
@@ -118,6 +123,14 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     }
     if (error instanceof ImageOperationConflict || error instanceof ImageOperationHttpError && error.status === 409) options.onConflict?.(error);
   };
+  const canonicalForJournal = () => {
+    if (!canonical) return null;
+    // The canonical resource is replaced, never edited by this synchronizer.
+    // Keep a private snapshot detached from the resource exposed to UI callbacks
+    // and copy it once per accepted snapshot, not once per pointer frame.
+    if (journalCanonical?.source !== canonical) journalCanonical = { source: canonical, snapshot: copy(canonical) };
+    return journalCanonical.snapshot;
+  };
   const persist = () => {
     persistenceVersion += 1;
     dirtyWrites = 1;
@@ -134,7 +147,10 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         const acknowledgedIds = new Set(entries.filter((entry) => entry.acknowledgedRevision !== undefined).map((entry) => entry.operation.operation_id));
         const pending = entries.filter((entry) => !acknowledgedIds.has(entry.operation.operation_id)).map((entry) => copy(entry.operation));
         const savedPayloads = new Map(pending.map((operation) => [operation.operation_id, JSON.stringify(operation)]));
-        await store!.write({ version: 1, resource: canonical ? copy(canonical) : null, operations: pending, transforms: copy(transforms), history: copy(sharedHistory.value), ...((pending.length || unencodableLocalChanges) && observed ? { localDocument: clonePixelArtDocument(observed), localDocumentUnencodable: unencodableLocalChanges, localDocumentRevision: observedCanonicalRevision } : {}) });
+        // observed is private and updated by copy-on-write. A store's asynchronous
+        // transaction may safely retain this exact frame while later pointers
+        // create another one; it still stores the complete recoverable local copy.
+        await store!.write({ version: 1, resource: canonicalForJournal(), operations: pending, transforms: copy(transforms), history: copy(sharedHistory.value), ...((pending.length || unencodableLocalChanges) && observed ? { localDocument: observed, localDocumentUnencodable: unencodableLocalChanges, localDocumentRevision: observedCanonicalRevision } : {}) });
         entries = entries.filter((entry) => !acknowledgedIds.has(entry.operation.operation_id));
         for (const entry of entries) if (savedPayloads.get(entry.operation.operation_id) === JSON.stringify(entry.operation)) entry.durable = true;
         for (const checkpoint of persistenceCheckpoints) {
@@ -196,13 +212,14 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
       options.onDocument(document, { resource: canonical, previousDocument, source, pendingCount: entries.length });
     } catch (error) { report(error); }
   };
-  const accept = (resource: ProjectResourceDetail, source: ImageOperationDocumentContext["source"]) => {
-    const normalized = normalizeImageOperationResource(resource, options.projectId, options.resourceId);
+  const acceptNormalized = (normalized: ProjectResourceDetail, source: ImageOperationDocumentContext["source"]) => {
     if (canonical && normalized.revision < canonical.revision) return false;
     canonical = normalized;
     publish(source);
     return true;
   };
+  const accept = (resource: ProjectResourceDetail, source: ImageOperationDocumentContext["source"]) =>
+    acceptNormalized(normalizeImageOperationResource(resource, options.projectId, options.resourceId), source);
   const mergeState = (revision: number, history?: SharedImageHistory, events?: ImageOperationTransform[]) => {
     if (events) {
       const byRevision = new Map(transforms.map((event) => [event.revision, event]));
@@ -289,7 +306,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         const state = validateImageOperationState(await transport.fetchState(since), options.projectId, options.resourceId);
         if (!disposed && !discarding) {
           mergeState(state.resource.revision, state.history, state.transforms);
-          accept(state.resource, "remote");
+          acceptNormalized(state.resource, "remote");
         }
       } else {
         const resource = await transport.fetchResource();
@@ -312,9 +329,12 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         const entry = entries[0]!;
         const operation = entry.operation;
         const normalDelta = operation.actions.every((action) => action.type === "pixels" || action.type === "layer-update");
-        if (!normalDelta || operation._client_attempted || resyncVersion > synchronizedVersion) {
-          // Reconnect/retry and structural/history commands retain a fresh server
-          // barrier. Normal deltas are rebased atomically by the server already.
+        const sharedHistoryCommand = isSharedHistoryOperation(operation);
+        if (!normalDelta && !sharedHistoryCommand || operation._client_attempted || resyncVersion > synchronizedVersion) {
+          // Reconnect/retry and structural edits retain a fresh server barrier.
+          // History commands select the global head under the server's row lock,
+          // independent of the cached canvas frame; a pre-send GET cannot make
+          // that selection more current and only adds another round trip.
           transportFailure = true;
           await fetchCanonical(!normalDelta || operation._client_attempted === true);
           transportFailure = false;
@@ -334,11 +354,12 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         if (!alreadyAttempted) entry.durable = false;
         // Freeze this packet before waiting for its transaction. New pointer
         // frames use a different entry and cannot postpone this packet's write.
-        try { await persistUntil(() => entry.durable); } catch (error) { if (!alreadyAttempted) operation._client_attempted = false; throw error; }
-        if (disposed || discarding || !online()) return;
+        try { await persistUntil(() => entry.durable || !entries.includes(entry)); } catch (error) { if (!alreadyAttempted) operation._client_attempted = false; throw error; }
+        if (disposed || discarding || !online() || !entries.includes(entry)) return;
         verifyScope();
         const packet: ImageOperation = { operation_id: operation.operation_id, base_revision: operation.base_revision, width: operation.width, height: operation.height, actions: copy(operation.actions), ...(operation.history_group_id ? { history_group_id: operation.history_group_id } : {}), ...(operation.coordinate_after_operation_id ? { coordinate_after_operation_id: operation.coordinate_after_operation_id } : {}) };
         transportFailure = true;
+        if (sharedHistoryCommand) entry.historySendStarted = true;
         const response = await transport.sendOperation(packet);
         transportFailure = false;
         const acknowledgement = validateImageOperationAcknowledgement(response, operation, options.projectId, options.resourceId);
@@ -346,7 +367,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         entry.acknowledgedRevision = acknowledgement.applied_revision;
         for (const pending of entries) if (pending.operation.coordinate_after_operation_id === operation.operation_id || pending.operation._client_frame_dependency === operation.operation_id) pending.operation._client_dependency_revision = acknowledgement.applied_revision;
         mergeState(acknowledgement.resource.revision, acknowledgement.history, acknowledgement.transforms);
-        accept(acknowledgement.resource, "ack");
+        acceptNormalized(acknowledgement.resource, "ack");
         options.onAcknowledged?.({
           operationId: operation.operation_id,
           appliedRevision: acknowledgement.applied_revision,
@@ -392,14 +413,8 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     timer = setTimeout(() => { timer = null; void run(); }, debounceMs);
   }
 
-  const schedule = async (document: PixelArtDocumentV2, settings: { conditional?: boolean; forceReplace?: boolean; resize?: ImageResizeOperation; historyGroupId?: string; previewSequence?: number } = {}) => {
-    if (disposed || !isReady.value || !canonical || !observed) return Promise.resolve();
-    let actions;
-    try { verifyScope(); actions = diffImageDocuments(observed, document, { conditional: settings.conditional, replace: settings.forceReplace, resize: settings.resize }); }
-    catch (error) { report(error); return Promise.resolve(); }
-    const before = observed;
-    observed = clonePixelArtDocument(document);
-    if (!actions.length) return Promise.resolve();
+  const queueActions = async (before: PixelArtDocumentV2, actions: Parameters<typeof splitImageActionBatches>[0], settings: ImageOperationScheduleSettings) => {
+    if (!actions.length) return;
     const isNormalPixels = (value: ImageOperation) => value.actions.every((action) => action.type === "pixels" && action.changes.every((change) => change.length === 2));
     let batches;
     try { batches = splitImageActionBatches(actions); }
@@ -432,6 +447,54 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     if (online() && !active) scheduleTimer();
     // Pointer handlers need not await: state/queue were updated synchronously.
     return stored.catch(() => undefined);
+  };
+  const schedule = async (document: PixelArtDocumentV2, settings: ImageOperationScheduleSettings = {}) => {
+    if (disposed || !isReady.value || !canonical || !observed) return;
+    let actions;
+    try { verifyScope(); actions = diffImageDocuments(observed, document, { conditional: settings.conditional, replace: settings.forceReplace, resize: settings.resize }); }
+    catch (error) { report(error); return; }
+    const before = observed;
+    observed = clonePixelArtDocument(document);
+    return queueActions(before, actions, settings);
+  };
+  /** A brush submits exact sparse deltas, never a trusted replacement document. */
+  const schedulePixels = async (width: number, height: number, layerId: string, changes: readonly ImageOperationPixelChange[], settings: ImageOperationPixelScheduleSettings = {}) => {
+    if (disposed || !isReady.value || !canonical || !observed) return;
+    try {
+      verifyScope();
+      if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || width > 256 || height < 1 || height > 256 || width !== observed.width || height !== observed.height) throw new Error("The pixel changes do not match this tab's observed canvas dimensions.");
+      const layerIndex = observed.layers.findIndex((layer) => layer.id === layerId);
+      if (typeof layerId !== "string" || !layerId.trim() || layerIndex < 0) throw new Error("The pixel changes do not match an observed image layer.");
+      if (!Array.isArray(changes) || changes.length > 65536) throw new Error("The local pixel changes are invalid.");
+      const layer = observed.layers[layerIndex]!;
+      const desired = new Map<number, PixelColor>();
+      for (const change of changes) {
+        if (!change || typeof change !== "object" || !Number.isInteger(change.index) || change.index < 0 || change.index >= width * height) throw new Error("The local pixel changes contain an invalid index.");
+        const after = change.after === null ? null : normalizePixelColor(change.after);
+        if (change.after !== null && after === null) throw new Error("The local pixel changes contain an invalid color.");
+        if (change.before !== undefined) {
+          const before = change.before === null ? null : normalizePixelColor(change.before);
+          if (change.before !== null && before === null) throw new Error("The local pixel changes contain an invalid previous color.");
+          if (before !== layer.pixels[change.index] && before !== desired.get(change.index)) throw new Error("The local pixel changes do not match this tab's observed pixels.");
+        }
+        desired.set(change.index, after);
+      }
+      const tuples: import("../lib/imageOperations").ImagePixelChange[] = [];
+      for (const [index, after] of desired) {
+        const before = layer.pixels[index]!;
+        if (before === after) continue;
+        tuples.push(settings.conditional ? [index, after, before] : [index, after]);
+      }
+      if (!tuples.length) return;
+      tuples.sort((left, right) => left[0] - right[0]);
+      const before = observed;
+      const pixels = layer.pixels.slice();
+      for (const [index, after] of tuples) pixels[index] = after;
+      const layers = observed.layers.slice();
+      layers[layerIndex] = { ...layer, pixels };
+      observed = { ...observed, layers };
+      return queueActions(before, [{ type: "pixels", layer_id: layerId, changes: tuples }], settings);
+    } catch (error) { report(error); }
   };
   const flush = async () => {
     clearTimer();
@@ -509,16 +572,17 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
       // pending stroke(s). Never initiate a new global history action offline.
       await flush();
       if (entries.length || disposed || !online()) return false;
-      if (!await refresh(true)) return false;
-      if (!online() || (kind === "undo" ? !sharedHistory.value.can_undo : !sharedHistory.value.can_redo)) return false;
       verifyScope();
       const operation: ImageOperation = { operation_id: createImageOperationId(), base_revision: canonical.revision, width: resourceDocument(canonical).width, height: resourceDocument(canonical).height, actions: [{ type: kind }] };
-      entries.push({ operation, durable: false });
+      // Do not veto a command using stale cached history flags. The server may
+      // have received another editor's change or Undo since the last snapshot.
+      const entry: PendingEntry = { operation, durable: false, historySendStarted: false };
+      entries.push(entry);
       syncPending();
       status.value = online() ? "dirty" : "offline";
       await persist();
       if (online()) await flush();
-      return operation._client_attempted === true && !entries.some((entry) => entry.operation.operation_id === operation.operation_id);
+      return entry.acknowledgedRevision !== undefined && !entries.includes(entry);
     } catch (error) { report(error); return false; }
     finally { historyRequestActive = false; syncPending(); }
   };
@@ -540,7 +604,11 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     connectionOnline.value = false;
     clearTimer();
     status.value = "offline";
-    const retained = entries.filter((entry) => entry.operation._client_attempted || !entry.operation.actions.some((action) => action.type === "undo" || action.type === "redo"));
+    // Marking a packet attempted in the journal precedes its actual send. A
+    // command interrupted during that disk write is known never to have reached
+    // the server and must not become an unrelated global Undo on reconnection.
+    // Recovered attempted packets have unknown send state and remain retryable.
+    const retained = entries.filter((entry) => !isSharedHistoryOperation(entry.operation) || entry.operation._client_attempted && entry.historySendStarted !== false);
     if (retained.length !== entries.length) { entries = retained; syncPending(); void persist().catch(() => undefined); }
   };
   if (typeof window !== "undefined") {
@@ -551,8 +619,10 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     disposed = true;
     clearTimer();
     if (typeof window !== "undefined") { window.removeEventListener("online", handleOnline); window.removeEventListener("offline", handleOffline); }
+    const retained = entries.filter((entry) => !isSharedHistoryOperation(entry.operation) || entry.historySendStarted !== false);
+    if (retained.length !== entries.length) { entries = retained; syncPending(); void persist().catch(() => undefined); }
     // Let the last local write finish before releasing the tab's ownership.
     void persistence.catch(() => undefined).finally(() => { store?.dispose?.(); releaseSession?.(); });
   };
-  return { status, errorMessage, hasPendingChanges, lastSavedAt, isReady, pendingCount, sharedHistory, canUndo, canRedo, isHistoryBusy, undo, redo, start, schedule, flush, refresh, retry, acceptResource, discardPending, setInteractionActive, getCachedResource, dispose };
+  return { status, errorMessage, hasPendingChanges, lastSavedAt, isReady, pendingCount, sharedHistory, canUndo, canRedo, isHistoryBusy, undo, redo, start, schedule, schedulePixels, flush, refresh, retry, acceptResource, discardPending, setInteractionActive, getCachedResource, dispose };
 };

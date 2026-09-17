@@ -168,10 +168,20 @@ const intersectRect = (rect: Rect, bounds: PixelBounds): Rect | null => {
 const pixelAt = (pixels: ReadonlyArray<PixelColor>, index: number): PixelColor =>
   pixels[index] ?? null;
 
+// Buffers are immutable. Remember arrays normalized by this module so ordinary
+// brush frames can use one native copy; legacy short/sparse arrays still pass
+// through the null-normalizing fallback when first encountered.
+const normalizedPixelArrays = new WeakSet<ReadonlyArray<PixelColor>>();
+
 const normalizedPixels = (buffer: PixelBuffer) => {
   const width = dimension(buffer.width);
   const height = dimension(buffer.height);
-  return Array.from({ length: width * height }, (_, index) => pixelAt(buffer.pixels, index));
+  const length = width * height;
+  const pixels = normalizedPixelArrays.has(buffer.pixels) && buffer.pixels.length === length
+    ? buffer.pixels.slice()
+    : Array.from({ length }, (_, index) => pixelAt(buffer.pixels, index));
+  normalizedPixelArrays.add(pixels);
+  return pixels;
 };
 
 const mutationFromPixels = (
@@ -379,11 +389,33 @@ export const paintPixels = (
     return emptyMutation(buffer);
   }
 
-  const pixels = normalizedPixels(buffer);
+  const changes: PixelChange[] = [];
+  let minX = bounds.width;
+  let minY = bounds.height;
+  let maxX = -1;
+  let maxY = -1;
   for (const point of validPoints) {
-    pixels[point.y * bounds.width + point.x] = color;
+    const index = point.y * bounds.width + point.x;
+    const before = pixelAt(buffer.pixels, index);
+    if (before === color) continue;
+    changes.push({ index, point, before, after: color });
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
   }
-  return mutationFromPixels(buffer, pixels);
+  if (changes.length === 0) return emptyMutation(buffer);
+
+  // The old whole-canvas comparison reported changes in row-major order.
+  // Preserve that contract while examining only the touched pixels.
+  changes.sort((left, right) => left.index - right.index);
+  const pixels = normalizedPixels(buffer);
+  for (const change of changes) pixels[change.index] = change.after;
+  return {
+    buffer: { width: bounds.width, height: bounds.height, pixels },
+    changes,
+    dirtyBounds: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+  };
 };
 
 /** Fills a four-connected region from the given point. */

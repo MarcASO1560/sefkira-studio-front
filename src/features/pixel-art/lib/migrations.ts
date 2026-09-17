@@ -6,7 +6,7 @@ import {
   normalizePixelColor,
   normalizePalette,
 } from "./document";
-import type { PixelArtDocumentV2 } from "../types";
+import type { PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
 
 export type PixelArtParseResult = {
   document: PixelArtDocumentV2;
@@ -70,13 +70,8 @@ const isValidDimension = (value: unknown): value is number =>
   value >= MIN_IMAGE_DIMENSION &&
   value <= MAX_IMAGE_DIMENSION;
 
-const isValidPixelColor = (value: unknown) =>
-  value === null || normalizePixelColor(value) !== null;
-
-const isValidPaletteColor = (value: unknown) =>
-  typeof value === "string" && normalizePixelColor(value) !== null;
-
-const assertValidV2Document = (payload: Record<string, unknown>) => {
+/** Validate every external value while constructing each normalized layer once. */
+const parseV2Document = (payload: Record<string, unknown>): PixelArtDocumentV2 => {
   if (!isValidDimension(payload.width) || !isValidDimension(payload.height)) {
     throw new PixelArtMigrationError(
       "invalid-document",
@@ -85,12 +80,32 @@ const assertValidV2Document = (payload: Record<string, unknown>) => {
     );
   }
 
-  if (!Array.isArray(payload.palette) || !payload.palette.every(isValidPaletteColor)) {
-    throw new PixelArtMigrationError(
-      "invalid-document",
-      "Stored pixel-art v2 palette is invalid.",
-      { version: 2 },
-    );
+  const normalizedColors = new Map<string, string>();
+  const normalizeCachedColor = (value: string): PixelColor => {
+    const cached = normalizedColors.get(value);
+    if (cached !== undefined) return cached;
+    const normalized = normalizePixelColor(value);
+    if (normalized !== null) normalizedColors.set(value, normalized);
+    return normalized;
+  };
+  const invalidPalette = () => new PixelArtMigrationError(
+    "invalid-document",
+    "Stored pixel-art v2 palette is invalid.",
+    { version: 2 },
+  );
+  if (!Array.isArray(payload.palette)) {
+    throw invalidPalette();
+  }
+  const palette: string[] = [];
+  const paletteColors = new Set<string>();
+  for (let index = 0; index < payload.palette.length; index += 1) {
+    // Array.every previously skipped holes, but rejected explicit undefined.
+    // Preserve that legacy distinction while returning a dense normalized list.
+    if (!(index in payload.palette)) continue;
+    const value = payload.palette[index];
+    const normalized = typeof value === "string" ? normalizeCachedColor(value) : null;
+    if (normalized === null) throw invalidPalette();
+    if (!paletteColors.has(normalized)) { paletteColors.add(normalized); palette.push(normalized); }
   }
 
   if (
@@ -106,6 +121,7 @@ const assertValidV2Document = (payload: Record<string, unknown>) => {
 
   const expectedPixelCount = payload.width * payload.height;
   const layerIds = new Set<string>();
+  const layers: PixelLayer[] = [];
   for (const [index, layer] of payload.layers.entries()) {
     if (!isRecord(layer)) {
       throw new PixelArtMigrationError(
@@ -128,8 +144,7 @@ const assertValidV2Document = (payload: Record<string, unknown>) => {
       layer.opacity < 0 ||
       layer.opacity > 1 ||
       !Array.isArray(layer.pixels) ||
-      layer.pixels.length !== expectedPixelCount ||
-      !layer.pixels.every(isValidPixelColor)
+      layer.pixels.length !== expectedPixelCount
     ) {
       throw new PixelArtMigrationError(
         "invalid-document",
@@ -138,8 +153,24 @@ const assertValidV2Document = (payload: Record<string, unknown>) => {
       );
     }
 
+    const pixels: PixelColor[] = Array(expectedPixelCount);
+    for (let pixel = 0; pixel < expectedPixelCount; pixel += 1) {
+      if (!(pixel in layer.pixels)) { pixels[pixel] = null; continue; }
+      const value = layer.pixels[pixel];
+      const normalized = value === null ? null : typeof value === "string" ? normalizeCachedColor(value) : undefined;
+      if (normalized === undefined || value !== null && normalized === null) {
+        throw new PixelArtMigrationError(
+          "invalid-document",
+          `Stored pixel-art v2 layer ${index + 1} is invalid.`,
+          { version: 2 },
+        );
+      }
+      pixels[pixel] = normalized;
+    }
     layerIds.add(layer.id);
+    layers.push({ id: layer.id, name: layer.name.trim(), visible: layer.visible, locked: layer.locked, opacity: Math.max(0, layer.opacity), pixels });
   }
+  return { version: 2, width: payload.width, height: payload.height, palette, layers };
 };
 
 export const parsePixelArtResourceData = (value: unknown): PixelArtParseResult => {
@@ -155,22 +186,7 @@ export const parsePixelArtResourceData = (value: unknown): PixelArtParseResult =
   }
 
   if (payload.version === 2) {
-    assertValidV2Document(payload);
-    const document = createPixelArtDocument(Number(payload.width), Number(payload.height), {
-      palette: normalizePalette(payload.palette),
-      layers: (payload.layers as Record<string, unknown>[]).map((layer, index) =>
-        createPixelLayer(Number(payload.width), Number(payload.height), {
-          id: typeof layer.id === "string" ? layer.id : undefined,
-          name: typeof layer.name === "string" ? layer.name : `Layer ${index + 1}`,
-          visible: layer.visible !== false,
-          locked: layer.locked === true,
-          opacity: typeof layer.opacity === "number" ? layer.opacity : 1,
-          pixels: layer.pixels,
-        }),
-      ),
-    });
-
-    return { document, migrated: false, warnings };
+    return { document: parseV2Document(payload), migrated: false, warnings };
   }
 
   const width = Number(payload.width ?? payload.size);

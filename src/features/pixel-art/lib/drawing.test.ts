@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   brushPoints,
@@ -149,6 +149,61 @@ describe("pixel mutations", () => {
     expect(mutation.buffer).toBe(source);
     expect(mutation.changes).toEqual([]);
     expect(mutation.dirtyBounds).toBeNull();
+  });
+
+  it("reports only touched changes on a 256-square canvas, sorted with exact before/after values", () => {
+    const pixels = Array<PixelColor>(256 * 256).fill(null); pixels[2] = "#ffffff"; pixels[255 * 256 + 255] = "#111111";
+    const source = Object.freeze(makeBuffer(256, 256, Object.freeze(pixels)));
+    const mutation = paintPixels(source, [{ x: 255, y: 255 }, { x: 2, y: 0 }, { x: 4, y: 3 }, { x: 4, y: 3 }, { x: 256, y: 255 }, { x: -1, y: 0 }], "#ffffff");
+    expect(mutation.buffer.width).toBe(256); expect(mutation.buffer.height).toBe(256); expect(mutation.buffer.pixels).toHaveLength(65536);
+    expect(mutation.changes).toEqual([
+      { index: 772, point: { x: 4, y: 3 }, before: null, after: "#ffffff" },
+      { index: 65535, point: { x: 255, y: 255 }, before: "#111111", after: "#ffffff" },
+    ]);
+    expect(mutation.dirtyBounds).toEqual({ x: 4, y: 3, width: 252, height: 253 }); expect(source.pixels[772]).toBeNull(); expect(source.pixels[65535]).toBe("#111111");
+  });
+
+  it("uses one normalizing array copy initially and one native copy for subsequent brush frames", () => {
+    const source = makeBuffer(256, 256, Array<PixelColor>(65536).fill(null));
+    const from = vi.spyOn(Array, "from"); let firstCopies = 0; let followingCopies = 0; let mutation!: ReturnType<typeof paintPixels>;
+    try {
+      mutation = paintPixels(source, [{ x: 0, y: 0 }], "#ffffff"); firstCopies = from.mock.calls.length; from.mockClear();
+      Object.freeze(mutation.buffer.pixels);
+      mutation = paintPixels(mutation.buffer, [{ x: 1, y: 0 }], "#111111"); followingCopies = from.mock.calls.length;
+    } finally { from.mockRestore(); }
+    expect(firstCopies).toBe(1); expect(followingCopies).toBe(0); expect(mutation.buffer.pixels.slice(0, 3)).toEqual(["#ffffff", "#111111", null]); expect(mutation.changes).toHaveLength(1);
+  });
+
+  it("does not copy the canvas pixel array for an unchanged or entirely clipped brush stamp", () => {
+    const source = makeBuffer(256, 256, Array<PixelColor>(65536).fill("#ffffff")); const from = vi.spyOn(Array, "from"); let calls = 0;
+    let unchanged!: ReturnType<typeof paintPixels>; let clipped!: ReturnType<typeof paintPixels>;
+    try { unchanged = paintPixels(source, [{ x: 255, y: 255 }, { x: 0, y: 0 }], "#ffffff"); clipped = paintPixels(source, [{ x: -1, y: 0 }, { x: 256, y: 256 }], null); calls = from.mock.calls.length; } finally { from.mockRestore(); }
+    expect(calls).toBe(0); expect(unchanged.buffer).toBe(source); expect(clipped.buffer).toBe(source); expect(unchanged.changes).toEqual([]); expect(clipped.dirtyBounds).toBeNull();
+  });
+
+  it.each([
+    { name: "short", pixels: ["A"] as PixelColor[] },
+    { name: "sparse", pixels: Object.assign(Array<PixelColor>(4), { 0: "A" }) },
+    { name: "undefined", pixels: ["A", undefined, null, undefined] as unknown as PixelColor[] },
+    { name: "oversized", pixels: ["A", null, null, null, "out-of-bounds"] as PixelColor[] },
+  ])("normalizes a legacy $name buffer in its single copy without changing its input", ({ pixels }) => {
+    const originalKeys = Object.keys(pixels); const originalLength = pixels.length; const source = makeBuffer(2, 2, Object.freeze(pixels));
+    const mutation = paintPixels(source, [{ x: 1, y: 1 }], "B");
+    expect(mutation.buffer.pixels).toEqual(["A", null, null, "B"]); expect(Object.keys(pixels)).toEqual(originalKeys); expect(pixels).toHaveLength(originalLength);
+    expect(mutation.changes).toEqual([{ index: 3, point: { x: 1, y: 1 }, before: null, after: "B" }]); expect(mutation.dirtyBounds).toEqual({ x: 1, y: 1, width: 1, height: 1 });
+  });
+
+  it("erases only opaque touched pixels and excludes already-transparent cells from dirty bounds", () => {
+    const source = makeBuffer(3, 2, [null, "A", null, "B", null, null]); const mutation = paintPixels(source, [{ x: 2, y: 1 }, { x: 0, y: 1 }, { x: 1, y: 0 }, { x: 1, y: 0 }], null);
+    expect(mutation.buffer.pixels).toEqual(Array<PixelColor>(6).fill(null)); expect(mutation.changes).toEqual([
+      { index: 1, point: { x: 1, y: 0 }, before: "A", after: null },
+      { index: 3, point: { x: 0, y: 1 }, before: "B", after: null },
+    ]); expect(mutation.dirtyBounds).toEqual({ x: 0, y: 0, width: 2, height: 2 }); expect(source.pixels).toEqual([null, "A", null, "B", null, null]);
+  });
+
+  it("keeps normalized fractional dimensions and point rounding in the sparse-change path", () => {
+    const source = makeBuffer(2.9, 2.8, [null]); const mutation = paintPixels(source, [{ x: 0.6, y: 1.4 }, { x: 1.2, y: 1.1 }, { x: 2, y: 1 }], "A");
+    expect(mutation.buffer).toEqual({ width: 2, height: 2, pixels: [null, null, null, "A"] }); expect(mutation.changes).toEqual([{ index: 3, point: { x: 1, y: 1 }, before: null, after: "A" }]);
   });
 
   it("flood-fills only the four-connected region", () => {

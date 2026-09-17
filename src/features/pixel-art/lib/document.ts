@@ -38,9 +38,11 @@ export const normalizePalette = (value: unknown) => {
   }
 
   const colors: string[] = [];
+  const seen = new Set<string>();
   for (const entry of value) {
     const color = normalizePixelColor(entry);
-    if (color && !colors.includes(color)) {
+    if (color && !seen.has(color)) {
+      seen.add(color);
       colors.push(color);
     }
   }
@@ -203,8 +205,40 @@ export const compositeVisibleLayers = (document: PixelArtDocumentV2) => {
       continue;
     }
 
+    // Pixel-art usually repeats a small palette. Blend each distinct pair once
+    // per layer instead of parsing and formatting HEX colors for every pixel.
+    // Keep these caches local: arbitrary imported palettes must not accumulate
+    // forever, and documents/pixel buffers remain immutable.
+    const solidColors = new Map<string, string>();
+    const blends = new Map<PixelColor, Map<string, PixelColor>>();
+    const fullyOpaqueLayer = layer.opacity >= 1;
     for (let index = 0; index < pixels.length; index += 1) {
-      pixels[index] = blendPixelColors(pixels[index], layer.pixels[index], layer.opacity);
+      const foreground = layer.pixels[index];
+      if (!foreground) continue;
+
+      if (fullyOpaqueLayer && (foreground.length === 7 || foreground.slice(7).toUpperCase() === "FF")) {
+        let solidColor = solidColors.get(foreground);
+        if (solidColor === undefined) {
+          solidColor = foreground.slice(0, 7).toUpperCase();
+          solidColors.set(foreground, solidColor);
+        }
+        pixels[index] = solidColor;
+        continue;
+      }
+
+      const background = pixels[index];
+      let foregroundBlends = blends.get(background);
+      if (!foregroundBlends) {
+        foregroundBlends = new Map();
+        blends.set(background, foregroundBlends);
+      }
+      if (foregroundBlends.has(foreground)) {
+        pixels[index] = foregroundBlends.get(foreground)!;
+      } else {
+        const blended = blendPixelColors(background, foreground, layer.opacity);
+        foregroundBlends.set(foreground, blended);
+        pixels[index] = blended;
+      }
     }
   }
 

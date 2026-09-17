@@ -59,7 +59,7 @@ import {
   isCompleteImageColor,
   normalizeImageColorDraft,
 } from "../../pixel-art/lib/color";
-import { createImageCanvasRenderPlan } from "../../pixel-art/lib/canvasRendering";
+import { createImageCanvasRenderPlan, writeImageCanvasBitmapPixels } from "../../pixel-art/lib/canvasRendering";
 import {
   clampCanvasMirrorAxis,
   expandCanvasMirrorPoints,
@@ -158,6 +158,7 @@ import {
   type PinnedPaletteColor,
 } from "../../pixel-art/lib/palette";
 import { resizePixelArtDocument } from "../../pixel-art/lib/resize";
+import { createIncrementalUsedPaletteColors } from "../../pixel-art/lib/incrementalPalette";
 import {
   canSendCollaborativeActivity,
   collaboratorColor,
@@ -687,7 +688,8 @@ const imagePixels = computed<PixelColor[]>({
     );
   },
 });
-const usedImagePaletteColors = computed(() => deriveUsedPaletteColors(imageLayers.value));
+const imageUsedPalette = createIncrementalUsedPaletteColors();
+const usedImagePaletteColors = computed(() => imageUsedPalette.derive(imageLayers.value));
 const canEditImage = computed(
   () =>
     isImageEditor.value &&
@@ -1643,7 +1645,7 @@ const imageColorPickerStyle = computed(() => ({
   "--selected-image-hue-color": selectedImageHueColor.value,
 }));
 
-const renderImageCanvas = () => {
+const renderImageCanvas = (bitmap: ImageData) => {
   const canvas = imageCanvasRef.value;
   if (!canvas) {
     return;
@@ -1657,8 +1659,8 @@ const renderImageCanvas = () => {
     gridHeight: height,
     gridWidth: width,
   });
-  canvas.width = Math.max(1, renderPlan.bitmapWidth);
-  canvas.height = Math.max(1, renderPlan.bitmapHeight);
+  if (canvas.width !== renderPlan.bitmapWidth) canvas.width = renderPlan.bitmapWidth;
+  if (canvas.height !== renderPlan.bitmapHeight) canvas.height = renderPlan.bitmapHeight;
   canvas.style.width = `${renderPlan.cssWidth}px`;
   canvas.style.height = `${renderPlan.cssHeight}px`;
 
@@ -1668,33 +1670,7 @@ const renderImageCanvas = () => {
   }
 
   context.imageSmoothingEnabled = false;
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  // Remote ink is a render-only overlay: it never enters saves, exports or Undo.
-  const visiblePixels = compositeVisibleLayers(
-    imageLivePreviews.render(buildImageDocument(), imageLivePreviewCanonicalRevision),
-  );
-
-  for (let index = 0; index < visiblePixels.length; index += 1) {
-    const column = index % width;
-    const row = Math.floor(index / width);
-    context.fillStyle = customImageBackground.value;
-    context.fillRect(
-      column * renderPlan.cellStride,
-      row * renderPlan.cellStride,
-      renderPlan.cellSize,
-      renderPlan.cellSize,
-    );
-    const color = visiblePixels[index];
-    if (color) {
-      context.fillStyle = color;
-      context.fillRect(
-        column * renderPlan.cellStride,
-        row * renderPlan.cellStride,
-        renderPlan.cellSize,
-        renderPlan.cellSize,
-      );
-    }
-  }
+  context.putImageData(bitmap, 0, 0);
 
   if (imageShapePreviewPoints.value.length > 0) {
     context.save();
@@ -1743,7 +1719,7 @@ const resetImageColors = () => {
   secondaryImageColor.value = "#000000";
 };
 
-const renderImagePreviewCanvas = () => {
+const renderImagePreviewCanvas = (bitmap: ImageData) => {
   const canvas = imagePreviewCanvasRef.value;
   if (!canvas) {
     return;
@@ -1751,8 +1727,8 @@ const renderImagePreviewCanvas = () => {
 
   const width = imageGridWidth.value;
   const height = imageGridHeight.value;
-  canvas.width = Math.max(1, width);
-  canvas.height = Math.max(1, height);
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
 
   const context = canvas.getContext("2d");
   if (!context) {
@@ -1760,30 +1736,14 @@ const renderImagePreviewCanvas = () => {
   }
 
   context.imageSmoothingEnabled = false;
-  context.fillStyle = customImageBackground.value;
-  context.fillRect(0, 0, width, height);
-  const visiblePixels = compositeVisibleLayers(
-    imageLivePreviews.render(buildImageDocument(), imageLivePreviewCanonicalRevision),
-  );
-
-  for (let index = 0; index < visiblePixels.length; index += 1) {
-    const color = visiblePixels[index];
-    if (!color) {
-      continue;
-    }
-
-    const column = index % width;
-    const row = Math.floor(index / width);
-    context.fillStyle = color;
-    context.fillRect(column, row, 1, 1);
-  }
+  context.putImageData(bitmap, 0, 0);
 };
 
 watch(
   imagePreviewCanvasRef,
   (canvas) => {
     if (canvas) {
-      renderImagePreviewCanvas();
+      scheduleImageCanvasRender();
     }
   },
   { flush: "post" },
@@ -1860,6 +1820,7 @@ const renderImageColorTriangleCanvas = () => {
 };
 
 let imageCanvasRenderFrame: number | null = null;
+let imageCanvasBitmap: ImageData | null = null;
 const scheduleImageCanvasRender = () => {
   if (typeof window === "undefined") {
     return;
@@ -1872,8 +1833,21 @@ const scheduleImageCanvasRender = () => {
 
   imageCanvasRenderFrame = window.requestAnimationFrame(() => {
     imageCanvasRenderFrame = null;
-    renderImageCanvas();
-    renderImagePreviewCanvas();
+    const width = imageGridWidth.value;
+    const height = imageGridHeight.value;
+    const context = (imageCanvasRef.value || imagePreviewCanvasRef.value)?.getContext("2d");
+    if (!context) return;
+    if (!imageCanvasBitmap || imageCanvasBitmap.width !== width || imageCanvasBitmap.height !== height) {
+      imageCanvasBitmap = context.createImageData(width, height);
+    }
+    // Compose the display-only remote overlay once; both canvases share the
+    // same logical-resolution bitmap. Neither ink nor background enters saves.
+    const visiblePixels = compositeVisibleLayers(
+      imageLivePreviews.render(buildImageDocument(true, false), imageLivePreviewCanonicalRevision),
+    );
+    writeImageCanvasBitmapPixels(visiblePixels, customImageBackground.value, imageCanvasBitmap.data);
+    renderImageCanvas(imageCanvasBitmap);
+    renderImagePreviewCanvas(imageCanvasBitmap);
   });
 };
 
@@ -2198,7 +2172,7 @@ const closeDocumentInfo = () => {
   isDocumentInfoOpen.value = false;
 };
 
-const buildImageDocument = (includeRotationPreview = true): PixelArtDocumentV2 => {
+const buildImageDocument = (includeRotationPreview = true, includePalette = true): PixelArtDocumentV2 => {
   // Pixel buffers are treated as immutable throughout the editor. Reusing them
   // here keeps rendering and history snapshots cheap even at the v1 limits.
   // Saving and broadcasting must exclude an uncommitted rotation preview.
@@ -2212,7 +2186,7 @@ const buildImageDocument = (includeRotationPreview = true): PixelArtDocumentV2 =
     version: 2,
     width: imageGridWidth.value,
     height: imageGridHeight.value,
-    palette: !includeRotationPreview && imagePixelRotationGesture.value
+    palette: !includePalette ? [] : !includeRotationPreview && imagePixelRotationGesture.value
       ? deriveUsedPaletteColors(layers)
       : [...usedImagePaletteColors.value],
     layers,
@@ -2866,11 +2840,17 @@ const scheduleImageAutosave = (settings: {
   } else {
     imageLivePreviewSender.clear();
   }
-  void imageAutosave.schedule(nextDocument, {
+  const syncSettings = {
     ...settings,
     ...(previewSequence === undefined ? {} : { previewSequence }),
     ...(!settings.historyGroupId && imageHistoryGroupId ? { historyGroupId: imageHistoryGroupId } : {}),
-  });
+  };
+  if (knownPixelChanges?.length && !settings.forceReplace && !settings.resize) {
+    void imageAutosave.schedulePixels(nextDocument.width, nextDocument.height,
+      activeImageLayerId.value, knownPixelChanges, syncSettings);
+  } else {
+    void imageAutosave.schedule(nextDocument, syncSettings);
+  }
 };
 
 watch(imageInteractionKind, (kind) => {
@@ -4189,7 +4169,9 @@ const paintImagePixels = (indexes: number[], color: PixelColor) => {
 
   if (!didChange) return;
 
-  imagePixels.value = [...mutation.buffer.pixels];
+  imageUsedPalette.registerMutation({ layerId: activeImageLayerId.value,
+    previousPixels: imagePixels.value, nextPixels: mutation.buffer.pixels, changes: mutation.changes });
+  imagePixels.value = mutation.buffer.pixels;
   scheduleImageCanvasRender();
   scheduleImageAutosave({}, mutation.changes);
 };
@@ -4245,6 +4227,8 @@ const paintImageGraffitiPixels = (indexes: number[]) => {
 
   if (!didChange) return;
 
+  imageUsedPalette.registerMutation({ layerId: activeImageLayerId.value,
+    previousPixels: imagePixels.value, nextPixels, changes });
   imagePixels.value = nextPixels;
   scheduleImageCanvasRender();
   scheduleImageAutosave({}, changes);
@@ -6762,6 +6746,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   resourceEditorDisposed = true;
+  imageUsedPalette.clear();
+  imageCanvasBitmap = null;
   imageLivePreviewSender.dispose();
   imageLivePreviews.clear();
   resourceAccessConnection?.close();
