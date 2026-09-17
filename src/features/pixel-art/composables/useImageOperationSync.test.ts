@@ -141,6 +141,123 @@ describe("durable image operation synchronization", () => {
     await local.sync.schedule(two, { conditional: true });
     expect(disk.saved?.operations).toHaveLength(2); await local.sync.flush(); expect(remote.sendOperation).toHaveBeenCalledTimes(2); local.sync.dispose();
   });
+  it("sends bounded batches during a continuous stroke instead of waiting for a pause", async () => {
+    const remote = server(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);
+    for (let frame = 0; frame < 20; frame += 1) {
+      const drawing = local.document;
+      drawing.layers[0]!.pixels[0] = frame % 2 ? "#00FF00" : "#FF0000";
+      await local.sync.schedule(drawing, { historyGroupId: "continuous-stroke" });
+      await vi.advanceTimersByTimeAsync(25);
+      if (frame === 3) expect(remote.sendOperation).toHaveBeenCalledOnce();
+    }
+    expect(remote.sendOperation.mock.calls.length).toBeGreaterThanOrEqual(5);
+    expect(remote.sendOperation.mock.calls.every(([operation]) => operation.history_group_id === "continuous-stroke")).toBe(true);
+    expect(local.sync.hasPendingChanges.value).toBe(false); local.sync.dispose();
+  });
+  it("normal pixel and layer-field batches do not fetch the full canvas before each POST", async () => {
+    const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);
+    vi.mocked(remote.transport.fetchState!).mockClear();
+    const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(red); await local.sync.flush();
+    const renamed = local.document; renamed.layers[0]!.name = "Renamed layer"; await local.sync.schedule(renamed); await local.sync.flush();
+    expect(remote.sendOperation).toHaveBeenCalledTimes(2); expect(remote.transport.fetchState).not.toHaveBeenCalled();
+    expect(local.document.layers[0]!).toMatchObject({ name: "Renamed layer", pixels: ["#FF0000", null, null, null] }); local.sync.dispose();
+  });
+  it("server-confirmed deltas rebase through an unseen anchored resize without a pre-send GET", async () => {
+    const remote = sharedServer(); const onConflict = vi.fn(); const local = client(memoryStore().store, remote.transport, { onConflict }); const other = client(memoryStore().store, remote.transport);
+    await local.sync.start(remote.current); await other.sync.start(remote.current);
+    const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(red);
+    const resize = { width: 3, height: 3, anchor: "bottom-right" as const };
+    await other.sync.schedule(applyImageActions(other.document, [{ type: "resize", ...resize }]), { resize }); await other.sync.flush();
+    vi.mocked(remote.transport.fetchState!).mockClear(); await local.sync.flush();
+    expect(remote.transport.fetchState).not.toHaveBeenCalled(); expect(local.document.width).toBe(3);
+    expect(local.document.layers[0]!.pixels[4]).toBe("#FF0000"); expect(onConflict).not.toHaveBeenCalled();
+    expect(remote.sendOperation.mock.calls.at(-1)![0]).toMatchObject({ width: 2, height: 2, base_revision: 0 }); local.sync.dispose(); other.sync.dispose();
+  });
+  it("coalesces concurrent canonical refresh requests into one GET", async () => {
+    const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);
+    const fetch = remote.transport.fetchState!; const gate = deferred<void>();
+    remote.transport.fetchState = vi.fn(async (since) => { await gate.promise; return fetch(since); });
+    const refreshing = [local.sync.refresh(), local.sync.refresh(), local.sync.refresh()]; await settle();
+    expect(remote.transport.fetchState).toHaveBeenCalledOnce(); gate.resolve();
+    expect(await Promise.all(refreshing)).toEqual([true, true, true]); local.sync.dispose();
+  });
+  it("a fresh ACK-triggered refresh bypasses an older in-flight GET without accepting its late snapshot", async () => {
+    const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); const other = client(memoryStore().store, remote.transport);
+    await local.sync.start(remote.current); await other.sync.start(remote.current);
+    const fetch = remote.transport.fetchState!; const oldResponse = deferred<void>(); let requests = 0;
+    remote.transport.fetchState = vi.fn(async (since) => {
+      requests += 1;
+      if (requests === 1) { const snapshot = await fetch(since); await oldResponse.promise; return snapshot; }
+      return fetch(since);
+    });
+    const ordinary = local.sync.refresh(); await settle(); expect(remote.transport.fetchState).toHaveBeenCalledOnce();
+    const red = other.document; red.layers[0]!.pixels[0] = "#FF0000"; await other.sync.schedule(red); await other.sync.flush();
+    const fresh = local.sync.refresh(true); await settle(); expect(remote.transport.fetchState).toHaveBeenCalledTimes(2);
+    expect(await fresh).toBe(true); expect(local.document.layers[0]!.pixels[0]).toBe("#FF0000");
+    oldResponse.resolve(); expect(await ordinary).toBe(true);
+    expect(local.document.layers[0]!.pixels[0]).toBe("#FF0000"); expect(local.sync.canUndo.value).toBe(true); local.sync.dispose(); other.sync.dispose();
+  });
+  it("fetches older coordinate history when new pending changes cannot use an in-flight GET", async () => {
+    const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); const other = client(memoryStore().store, remote.transport);
+    await local.sync.start(remote.current); await other.sync.start(remote.current); local.sync.setInteractionActive(true);
+    const resize = { width: 3, height: 3, anchor: "bottom-right" as const };
+    await other.sync.schedule(applyImageActions(other.document, [{ type: "resize", ...resize }]), { resize }); await other.sync.flush(); await local.sync.refresh();
+    const fetch = remote.transport.fetchState!; const gate = deferred<void>(); let first = true;
+    remote.transport.fetchState = vi.fn(async (since) => { if (first) { first = false; await gate.promise; } return fetch(since); });
+    const refreshing = local.sync.refresh(); await settle(); expect(remote.transport.fetchState).toHaveBeenCalledWith(1);
+    const oldFrame = local.document; oldFrame.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(oldFrame);
+    const following = local.sync.refresh(); await settle(); expect(remote.transport.fetchState).toHaveBeenCalledOnce(); gate.resolve();
+    expect(await refreshing).toBe(true); expect(await following).toBe(true); expect(remote.transport.fetchState).toHaveBeenCalledTimes(2);
+    expect(remote.transport.fetchState).toHaveBeenLastCalledWith(0); local.sync.setInteractionActive(false);
+    expect(local.document.layers[0]!.pixels[4]).toBe("#FF0000"); await local.sync.flush(); local.sync.dispose(); other.sync.dispose();
+  });
+  it("does not starve a durable frozen packet while later pointer frames keep writing", async () => {
+    const remote = server(); const disk = memoryStore(); const save = disk.store.write;
+    const writes: Array<{ queue: StoredImageOperationQueue; gate: ReturnType<typeof deferred<void>> }> = [];
+    disk.store.write = vi.fn(async (queue) => { const snapshot = clone(queue); const gate = deferred<void>(); writes.push({ queue: snapshot, gate }); await gate.promise; await save(snapshot); });
+    const send = remote.transport.sendOperation;
+    remote.transport.sendOperation = vi.fn(async (operation) => {
+      const stored = disk.saved!.operations.find((pending) => pending.operation_id === operation.operation_id);
+      expect(stored?._client_attempted).toBe(true); expect(stored?.actions).toEqual(operation.actions); return send(operation);
+    });
+    const local = client(disk.store, remote.transport); await local.sync.start(remote.current);
+    const first = local.document; first.layers[0]!.pixels[0] = "#FF0000"; const savingFirst = local.sync.schedule(first); await settle();
+    await vi.advanceTimersByTimeAsync(100); expect(remote.sendOperation).not.toHaveBeenCalled();
+    const second = clone(first); second.layers[0]!.pixels[1] = "#00FF00"; const savingSecond = local.sync.schedule(second);
+    writes[0]!.gate.resolve(); await settle(); expect(writes).toHaveLength(2);
+    const third = clone(second); third.layers[0]!.pixels[2] = "#0000FF"; const savingThird = local.sync.schedule(third);
+    writes[1]!.gate.resolve(); await settle();
+    expect(writes.length).toBeGreaterThanOrEqual(3); expect(remote.sendOperation).toHaveBeenCalledOnce();
+    expect(remote.sendOperation.mock.calls[0]![0].actions).toEqual([{ type: "pixels", layer_id: "layer", changes: [[0, "#FF0000"]] }]);
+    for (let index = 0; index < writes.length && index < 15; index += 1) { writes[index]!.gate.resolve(); await settle(); }
+    await Promise.all([savingFirst, savingSecond, savingThird]); await local.sync.flush();
+    expect(remote.current.data.pixel_art).toEqual(third); expect(local.sync.hasPendingChanges.value).toBe(false); local.sync.dispose();
+  });
+  it("does not transmit an old account's packet when the account changes during its durable write", async () => {
+    const remote = server(); const disk = memoryStore(); const save = disk.store.write; const gate = deferred<void>(); let currentUser = "user";
+    disk.store.write = vi.fn(async (queue) => { await gate.promise; await save(queue); });
+    const local = client(disk.store, remote.transport, { userId: () => currentUser }); await local.sync.start(remote.current);
+    const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; const saving = local.sync.schedule(red);
+    const flushing = local.sync.flush(); await settle(); currentUser = "different-user"; gate.resolve(); await saving; await flushing;
+    expect(remote.sendOperation).not.toHaveBeenCalled(); expect(local.sync.hasPendingChanges.value).toBe(true);
+    expect(local.sync.errorMessage.value).toMatch(/signed-in account changed/); local.sync.dispose();
+  });
+  it("acknowledges the frozen preview watermark even while document publication is deferred", async () => {
+    const remote = server(); const send = remote.transport.sendOperation; const gate = deferred<void>(); let first = true;
+    remote.transport.sendOperation = async (operation) => { const result = await send(operation); if (first) { first = false; await gate.promise; } return result; };
+    const onAcknowledged = vi.fn(); const disk = memoryStore(); const local = client(disk.store, remote.transport, { onAcknowledged }); await local.sync.start(remote.current);
+    const initialPublications = local.onDocument.mock.calls.length; local.sync.setInteractionActive(true);
+    const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(red, { previewSequence: 1 });
+    const green = clone(red); green.layers[0]!.pixels[1] = "#00FF00"; await local.sync.schedule(green, { previewSequence: 2 });
+    const flushing = local.sync.flush(); await settle();
+    const blue = clone(green); blue.layers[0]!.pixels[2] = "#0000FF"; await local.sync.schedule(blue, { previewSequence: 3 }); gate.resolve(); await flushing;
+    expect(onAcknowledged.mock.calls.map(([acknowledgement]) => acknowledgement.previewSequence)).toEqual([2, 3]);
+    expect(onAcknowledged.mock.calls[0]![0]).toMatchObject({ operationId: remote.sendOperation.mock.calls[0]![0].operation_id, appliedRevision: 1 });
+    expect(local.onDocument).toHaveBeenCalledTimes(initialPublications);
+    expect(remote.sendOperation.mock.calls.every(([operation]) => !("previewSequence" in operation))).toBe(true);
+    expect(disk.saved).not.toHaveProperty("previewSequence"); local.sync.setInteractionActive(false);
+    expect(local.document).toEqual(blue); local.sync.dispose();
+  });
   it("refreshes canonical state after reconnect even with no local pending operations", async () => {
     const remote = server(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);
     const changed = baseDocument(); changed.layers[0]!.pixels[1] = "#00FF00"; remote.replace(resource(changed, 1));
@@ -345,6 +462,26 @@ describe("durable image operation synchronization", () => {
 describe("semantic resize and authoritative shared history", () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it("acknowledges visual barriers for shared history and structure, including recovered Undo, but not normal pixels", async () => {
+    const remote = sharedServer(); const disk = memoryStore(); const onAcknowledged = vi.fn(); const local = client(disk.store, remote.transport, { onAcknowledged }); await local.sync.start(remote.current);
+    const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(red); await local.sync.flush();
+    expect(onAcknowledged).toHaveBeenCalledOnce(); expect(onAcknowledged.mock.calls[0]![0]).not.toHaveProperty("previewBarrier");
+    const send = remote.transport.sendOperation; let lost = true;
+    remote.transport.sendOperation = async (operation) => { const result = await send(operation); if (operation.actions[0]?.type === "undo" && lost) { lost = false; throw new Error("ACK lost"); } return result; };
+    expect(await local.sync.undo()).toBe(false); const undoId = disk.saved!.operations[0]!.operation_id;
+    expect(onAcknowledged).toHaveBeenCalledOnce(); expect(disk.saved!.operations[0]!).not.toHaveProperty("previewBarrier"); local.sync.dispose(); await settle();
+    const recovered = client(disk.store, remote.transport, { onAcknowledged }); await recovered.sync.start(remote.current); await recovered.sync.retry();
+    expect(onAcknowledged.mock.calls[1]![0]).toMatchObject({ operationId: undoId, appliedRevision: 2, previewBarrier: true });
+    expect(remote.sendOperation.mock.calls.filter(([operation]) => operation.actions[0]?.type === "undo").map(([operation]) => operation.operation_id)).toEqual([undoId, undoId]);
+    expect(await recovered.sync.redo()).toBe(true);
+    const imported = createPixelArtDocument(3, 3); await recovered.sync.schedule(imported, { forceReplace: true }); await recovered.sync.flush();
+    const resize = { width: 4, height: 4, anchor: "center" as const }; await recovered.sync.schedule(applyImageActions(recovered.document, [{ type: "resize", ...resize }]), { resize }); await recovered.sync.flush();
+    await recovered.sync.schedule(createPixelArtDocument(5, 5)); await recovered.sync.flush();
+    expect(onAcknowledged).toHaveBeenCalledTimes(6);
+    expect(onAcknowledged.mock.calls.slice(1).every(([acknowledgement]) => acknowledgement.previewBarrier === true)).toBe(true);
+    expect(remote.sendOperation.mock.calls.every(([operation]) => !("previewBarrier" in operation))).toBe(true); recovered.sync.dispose();
+  });
   it("shared Undo undoes another client's latest change and Redo restores it without local snapshots", async () => {
     const remote = sharedServer(); const first = client(memoryStore().store, remote.transport); const second = client(memoryStore().store, remote.transport);
     await first.sync.start(remote.current); await second.sync.start(remote.current);
@@ -488,5 +625,16 @@ describe("semantic resize and authoritative shared history", () => {
     const remote = sharedServer(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current); const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(red); await local.sync.flush();
     const fetch = remote.transport.fetchState!; let calls = 0; remote.transport.fetchState = async (since) => { calls += 1; if (calls > 1) throw new TypeError("Failed to fetch"); return fetch(since); };
     expect(await local.sync.undo()).toBe(false); expect(disk.saved?.operations).toEqual([]); expect(remote.sendOperation).toHaveBeenCalledOnce(); expect(local.sync.isHistoryBusy.value).toBe(false); local.sync.dispose();
+  });
+  it("does not send a history command removed by an offline event during its fresh server barrier", async () => {
+    const surface = new EventTarget(); vi.stubGlobal("window", surface);
+    const remote = sharedServer(); const disk = memoryStore(); let connected = true; const local = client(disk.store, remote.transport, { isOnline: () => connected }); await local.sync.start(remote.current);
+    const red = local.document; red.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedule(red); await local.sync.flush();
+    const fetch = remote.transport.fetchState!; const gate = deferred<void>(); let requests = 0;
+    remote.transport.fetchState = vi.fn(async (since) => { requests += 1; if (requests === 2) await gate.promise; return fetch(since); });
+    const undoing = local.sync.undo(); await settle(); expect(requests).toBe(2);
+    connected = false; surface.dispatchEvent(new Event("offline")); gate.resolve();
+    expect(await undoing).toBe(false); expect(remote.sendOperation).toHaveBeenCalledOnce();
+    expect(disk.saved?.operations).toEqual([]); expect(local.sync.isHistoryBusy.value).toBe(false); local.sync.dispose();
   });
 });

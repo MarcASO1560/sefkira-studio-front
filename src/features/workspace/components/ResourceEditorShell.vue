@@ -177,6 +177,10 @@ import {
 } from "../../pixel-art/lib/importExport";
 import { useImageOperationSync } from "../../pixel-art/composables/useImageOperationSync";
 import { createImageOperationId } from "../../pixel-art/lib/imageOperationStore";
+import {
+  createLivePixelPreviewOverlay,
+  createLivePixelPreviewSender,
+} from "../../pixel-art/lib/livePixelPreview";
 import { rebaseImageHistoryDocument } from "../../pixel-art/lib/collaborativeHistory";
 import {
   normalizeImagePreferences,
@@ -367,7 +371,7 @@ const IMAGE_ZOOM_WHEEL_STEP = 0.0018;
 const IMAGE_TOUCH_COMMIT_THRESHOLD = 8;
 const IMAGE_ROTATION_STEP_RADIANS = Math.PI / 12;
 const IMAGE_ROTATION_MIN_POINTER_RADIUS = 24;
-const IMAGE_AUTOSAVE_MS = 420;
+const IMAGE_AUTOSAVE_MS = 100;
 const IMAGE_COLLABORATION_CURSOR_INTERVAL_MS = 32;
 const IMAGE_COLLABORATION_SELECTION_INTERVAL_MS = 64;
 const IMAGE_COLLABORATOR_STALE_MS = 12000;
@@ -604,6 +608,14 @@ let lastImageCollaborationSelectionAt = 0;
 const lastImageCollaborationSequence = new Map<string, number>();
 const pendingProjectEditorActivities: ProjectEditorActivity[] = [];
 let imageCanonicalRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
+let imageCanonicalRefreshRequiresFresh = false;
+let lastImageLivePreviewDocument: PixelArtDocumentV2 | null = null;
+let imageLivePreviewCanonicalRevision = 0;
+const imageLivePreviews = createLivePixelPreviewOverlay();
+const imageLivePreviewSender = createLivePixelPreviewSender(
+  (payload) => sendImageCollaborationActivity("pixels", payload),
+  { intervalMs: 16 },
+);
 let resourceMutationQueue: Promise<void> = Promise.resolve();
 let personalImagePaletteMutationQueue: Promise<void> = Promise.resolve();
 let pendingPersonalImagePaletteMutations = 0;
@@ -1657,7 +1669,10 @@ const renderImageCanvas = () => {
 
   context.imageSmoothingEnabled = false;
   context.clearRect(0, 0, canvas.width, canvas.height);
-  const visiblePixels = compositeVisibleLayers(buildImageDocument());
+  // Remote ink is a render-only overlay: it never enters saves, exports or Undo.
+  const visiblePixels = compositeVisibleLayers(
+    imageLivePreviews.render(buildImageDocument(), imageLivePreviewCanonicalRevision),
+  );
 
   for (let index = 0; index < visiblePixels.length; index += 1) {
     const column = index % width;
@@ -1747,7 +1762,9 @@ const renderImagePreviewCanvas = () => {
   context.imageSmoothingEnabled = false;
   context.fillStyle = customImageBackground.value;
   context.fillRect(0, 0, width, height);
-  const visiblePixels = compositeVisibleLayers(buildImageDocument());
+  const visiblePixels = compositeVisibleLayers(
+    imageLivePreviews.render(buildImageDocument(), imageLivePreviewCanonicalRevision),
+  );
 
   for (let index = 0; index < visiblePixels.length; index += 1) {
     const color = visiblePixels[index];
@@ -1849,7 +1866,8 @@ const scheduleImageCanvasRender = () => {
   }
 
   if (imageCanvasRenderFrame !== null) {
-    window.cancelAnimationFrame(imageCanvasRenderFrame);
+    // Keep the next paint deadline fixed while pointer/broadcast events arrive.
+    return;
   }
 
   imageCanvasRenderFrame = window.requestAnimationFrame(() => {
@@ -2215,22 +2233,33 @@ const sendImageCollaborationActivity = (
 const broadcastImageDocument = (
   persistedRevision?: number,
   targetClientId?: string,
+  confirmedPreviewSequence?: number,
+  previewBarrier = false,
 ) => {
   // Peers only announce a server-confirmed revision. They never replace a canvas.
   if (persistedRevision === undefined) return;
   sendImageCollaborationActivity("document", {
     operation_protocol: 1,
     persisted_revision: persistedRevision,
+    ...(confirmedPreviewSequence === undefined ? {} : {
+      confirmed_preview_sequence: confirmedPreviewSequence,
+    }),
+    ...(previewBarrier ? { preview_barrier_revision: persistedRevision } : {}),
     ...(targetClientId ? { target_client_id: targetClientId } : {}),
   });
 };
 
-const requestImageCanonicalRefresh = () => {
-  if (imageCanonicalRefreshTimeout !== null || !isImageOperationReady.value) return;
+const requestImageCanonicalRefresh = (requireFresh = false) => {
+  if (!isImageOperationReady.value) return;
+  imageCanonicalRefreshRequiresFresh ||= requireFresh;
+  if (imageCanonicalRefreshTimeout !== null) return;
   imageCanonicalRefreshTimeout = setTimeout(() => {
     imageCanonicalRefreshTimeout = null;
-    void imageAutosave.refresh();
-  }, 80);
+    const fresh = imageCanonicalRefreshRequiresFresh;
+    imageCanonicalRefreshRequiresFresh = false;
+    // An ACK cannot join a read that was started before that server revision.
+    void imageAutosave.refresh(fresh);
+  }, 16);
 };
 
 const flushImageCollaborationCursor = () => {
@@ -2389,6 +2418,8 @@ const handleProjectPresenceSync = (snapshot: ProjectPresenceSnapshot) => {
   projectPresenceMembers.value = snapshot[props.resourceId] || [];
   requestImageCanonicalRefresh();
   if (projectPresenceMembers.value.length === 0) {
+    imageLivePreviews.clear();
+    scheduleImageCanvasRender();
     remoteImageCollaborators.value = {};
     pendingProjectEditorActivities.length = 0;
     return;
@@ -2421,6 +2452,8 @@ const applyRemoteImageDocument = (
     document.width !== imageGridWidth.value || document.height !== imageGridHeight.value;
   const didRemoveActiveLayer = !document.layers.some((layer) => layer.id === currentLayerId);
   if (didResize || didRemoveActiveLayer) {
+    imageLivePreviews.clear(resource.value?.revision ?? 0);
+    imageLivePreviewSender.clear();
     // Gesture coordinates cannot survive a different server canvas frame.
     // Already-painted deltas are in the durable queue; do not emit a preview.
     resetImageTouchPointers();
@@ -2458,8 +2491,9 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
     return;
   }
   const previousSequence = lastImageCollaborationSequence.get(activity.client_id) || 0;
-  if (activity.sequence <= previousSequence) return;
-  lastImageCollaborationSequence.set(activity.client_id, activity.sequence);
+  if (activity.kind !== "pixels" && activity.kind !== "document" && activity.sequence <= previousSequence) return;
+  // Ink chunks and ACKs use per-pixel ordering, independently of cursor updates.
+  lastImageCollaborationSequence.set(activity.client_id, Math.max(previousSequence, activity.sequence));
 
   if (activity.kind === "sync-request") {
     updateRemoteImageCollaborator(activity, {});
@@ -2489,6 +2523,13 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
     return;
   }
 
+  if (activity.kind === "pixels") {
+    if (imageLivePreviews.receive(activity.client_id, activity.payload)) {
+      scheduleImageCanvasRender();
+    }
+    return;
+  }
+
   if (activity.kind !== "document") return;
   const targetClientId = activity.payload.target_client_id;
   if (
@@ -2500,8 +2541,22 @@ const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
   // Even legacy broadcasts are only hints: read the authoritative server state.
   // Ignore unconfirmed previews, avoiding a GET storm from older clients.
   const revision = activity.payload.persisted_revision;
+  const previewBarrierRevision = activity.payload.preview_barrier_revision;
+  const confirmedPreviewSequence = activity.payload.confirmed_preview_sequence;
+  if (typeof revision === "number" && Number.isSafeInteger(revision) && revision > 0 &&
+      previewBarrierRevision === revision && imageLivePreviews.invalidateAt(revision)) {
+    // A history/frame barrier takes effect only after its real server snapshot.
+    scheduleImageCanvasRender();
+  }
+  if (typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0 &&
+      typeof confirmedPreviewSequence === "number" && Number.isSafeInteger(confirmedPreviewSequence) && confirmedPreviewSequence > 0) {
+    // Keep the ink until this device has the matching server revision. An ACK
+    // for an earlier chunk must not remove newer ink from an ongoing stroke.
+    imageLivePreviews.confirm(activity.client_id, confirmedPreviewSequence, revision);
+    scheduleImageCanvasRender();
+  }
   if (typeof revision === "number" && Number.isSafeInteger(revision) && revision > resource.value.revision) {
-    requestImageCanonicalRefresh();
+    requestImageCanonicalRefresh(true);
   }
   updateRemoteImageCollaborator(activity, {});
 };
@@ -2590,10 +2645,30 @@ const imageAutosave = useImageOperationSync({
   debounceMs: IMAGE_AUTOSAVE_MS,
   onDocument(document, context) {
     resource.value = context.resource;
+    imageLivePreviewCanonicalRevision = context.resource.revision;
+    // Inspect only the server snapshot, never the document with pending local ink.
+    const retiredPreviews = imageLivePreviews.observeCanonical(
+      context.resource.data.pixel_art as PixelArtDocumentV2,
+      context.resource.revision,
+    );
+    lastImageLivePreviewDocument = document;
     if (!context.previousDocument || !imageSnapshotDocumentsAreEqual(context.previousDocument, document)) {
       applyRemoteImageDocument(document, context.previousDocument);
+    } else if (retiredPreviews) {
+      scheduleImageCanvasRender();
     }
-    if (context.source === "ack") broadcastImageDocument(context.resource.revision);
+  },
+  onAcknowledged(acknowledgement) {
+    if (acknowledgement.previewBarrier) {
+      imageLivePreviewSender.clear();
+      if (imageLivePreviews.invalidateAt(acknowledgement.appliedRevision)) scheduleImageCanvasRender();
+    }
+    broadcastImageDocument(
+      acknowledgement.appliedRevision,
+      undefined,
+      acknowledgement.previewSequence,
+      acknowledgement.previewBarrier,
+    );
   },
   onConflict() {
     openImageConflict({ kind: "document" }, resource.value?.revision ?? null);
@@ -2754,13 +2829,46 @@ const scheduleImageAutosave = (settings: {
   forceReplace?: boolean;
   historyGroupId?: string;
   resize?: { width: number; height: number; anchor: ImageResizeAnchor };
-} = {}) => {
+} = {}, knownPixelChanges?: ReadonlyArray<Readonly<{ index: number; after: PixelColor }>>) => {
   if (!canEditImage.value) {
     return;
   }
 
-  void imageAutosave.schedule(buildImageDocument(false), {
+  const nextDocument = buildImageDocument(false);
+  const previousDocument = lastImageLivePreviewDocument;
+  lastImageLivePreviewDocument = nextDocument;
+  let previewSequence: number | undefined;
+  if (previousDocument && previousDocument.width === nextDocument.width &&
+      previousDocument.height === nextDocument.height && !settings.forceReplace && !settings.resize) {
+    const layers: Array<{ layerId: string; changes: Array<readonly [number, PixelColor]> }> = [];
+    if (knownPixelChanges?.length) {
+      layers.push({
+        layerId: activeImageLayerId.value,
+        changes: knownPixelChanges.map((change) => [change.index, change.after] as const),
+      });
+    } else {
+      for (const layer of nextDocument.layers) {
+        const previousLayer = previousDocument.layers.find((candidate) => candidate.id === layer.id);
+        if (!previousLayer || previousLayer.pixels === layer.pixels) continue;
+        const changes: Array<readonly [number, PixelColor]> = [];
+        for (let index = 0; index < layer.pixels.length; index += 1) {
+          if (layer.pixels[index] !== previousLayer.pixels[index]) changes.push([index, layer.pixels[index] ?? null]);
+        }
+        if (changes.length) layers.push({ layerId: layer.id, changes });
+      }
+    }
+    if (layers.length) previewSequence = imageLivePreviewSender.enqueue({
+      width: nextDocument.width,
+      height: nextDocument.height,
+      baseRevision: resource.value?.revision ?? 0,
+      layers,
+    });
+  } else {
+    imageLivePreviewSender.clear();
+  }
+  void imageAutosave.schedule(nextDocument, {
     ...settings,
+    ...(previewSequence === undefined ? {} : { previewSequence }),
     ...(!settings.historyGroupId && imageHistoryGroupId ? { historyGroupId: imageHistoryGroupId } : {}),
   });
 };
@@ -4083,7 +4191,7 @@ const paintImagePixels = (indexes: number[], color: PixelColor) => {
 
   imagePixels.value = [...mutation.buffer.pixels];
   scheduleImageCanvasRender();
-  scheduleImageAutosave();
+  scheduleImageAutosave({}, mutation.changes);
 };
 
 const paintImageGraffitiPixels = (indexes: number[]) => {
@@ -4125,11 +4233,13 @@ const paintImageGraffitiPixels = (indexes: number[]) => {
   if (pixelsByIndex.size === 0) return;
 
   const nextPixels = [...imagePixels.value];
+  const changes: Array<{ index: number; after: PixelColor }> = [];
   let didChange = false;
   for (const [index, color] of pixelsByIndex) {
     if (!isImagePixelIndexWithinSelection(index)) continue;
     if (nextPixels[index] === color) continue;
     nextPixels[index] = color;
+    changes.push({ index, after: color });
     didChange = true;
   }
 
@@ -4137,7 +4247,7 @@ const paintImageGraffitiPixels = (indexes: number[]) => {
 
   imagePixels.value = nextPixels;
   scheduleImageCanvasRender();
-  scheduleImageAutosave();
+  scheduleImageAutosave({}, changes);
 };
 
 const fillImagePixelsFrom = (startIndex: number, replacementColor: PixelColor) => {
@@ -6401,6 +6511,8 @@ const revokeResourceProjectAccess = () => {
   pendingProjectEditorActivities.length = 0;
   pendingImageCollaborationCursor = null;
   pendingImageCollaborationSelection = null;
+  imageLivePreviews.clear();
+  imageLivePreviewSender.clear();
   resetImageTouchPointers();
   cancelImageInteraction(undefined, { commitHistory: false });
   if (isImageEditor.value) {
@@ -6463,6 +6575,7 @@ const connectResourcePresence = () => {
 };
 
 const removeStaleImageCollaborators = () => {
+  if (imageLivePreviews.prune()) scheduleImageCanvasRender();
   if (isImageOperationReady.value) void imageAutosave.refresh();
   if (document.visibilityState === "visible" && resource.value) {
     broadcastImageCursor(lastImageCollaborationCursorPosition);
@@ -6649,6 +6762,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   resourceEditorDisposed = true;
+  imageLivePreviewSender.dispose();
+  imageLivePreviews.clear();
   resourceAccessConnection?.close();
   resourceAccessConnection = null;
   broadcastImageCursor(null);

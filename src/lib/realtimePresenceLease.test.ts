@@ -263,7 +263,7 @@ describe("project presence authorization lease", () => {
     expect(clients).toHaveLength(2);
   });
 
-  it("checks periodically before lease expiry, suppresses activity during verification, and clears a stale lease", async () => {
+  it("renews periodically without stalling an authorized live stroke, but still clears an expired lease", async () => {
     const { connection, onSync, onActivity, onDenied } = await openPresence();
     const oldClient = clients[0]!;
     const pending = deferred<Response>();
@@ -272,11 +272,15 @@ describe("project presence authorization lease", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     oldClient.room.broadcast();
     connection.sendEditorActivity("cursor", { x: 7 });
-    expect(onActivity).not.toHaveBeenCalled();
-    expect(oldClient.room.send).toHaveBeenCalledTimes(1);
+    expect(onActivity).toHaveBeenCalledOnce();
+    expect(oldClient.room.send).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(oldClient.disconnect).toHaveBeenCalledOnce();
     expect(onSync).toHaveBeenLastCalledWith({});
+    oldClient.room.broadcast();
+    connection.sendEditorActivity("pixels", { preview_protocol: 1 });
+    expect(onActivity).toHaveBeenCalledOnce();
+    expect(oldClient.room.send).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(3_000);
     expect(onDenied).not.toHaveBeenCalled();
     pending.resolve(response(config("late-expired-verification")));
@@ -284,6 +288,62 @@ describe("project presence authorization lease", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(clients).toHaveLength(2);
     expect(clients[1]!.channel).toHaveBeenCalledWith(config().channel, expect.any(Object));
+  });
+
+  it("retires the active lease as soon as periodic renewal confirms access denial", async () => {
+    const { connection, onActivity, onDenied } = await openPresence();
+    const oldClient = clients[0]!;
+    const pending = deferred<Response>();
+    fetchMock.mockReturnValueOnce(pending.promise);
+    await vi.advanceTimersByTimeAsync(10_000);
+    oldClient.room.broadcast();
+    expect(onActivity).toHaveBeenCalledOnce();
+    pending.resolve(response({}, 404));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onDenied).toHaveBeenCalledExactlyOnceWith(404);
+    expect(oldClient.disconnect).toHaveBeenCalledOnce();
+    oldClient.room.broadcast();
+    connection.sendEditorActivity("pixels", { preview_protocol: 1 });
+    expect(onActivity).toHaveBeenCalledOnce();
+    expect(oldClient.room.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("explicit verification interrupts an active periodic renewal, pauses immediately and rejects its late authorization after denial", async () => {
+    const { connection, onActivity, onDenied } = await openPresence();
+    const oldClient = clients[0]!; const periodic = deferred<Response>(); const explicit = deferred<Response>();
+    fetchMock.mockReturnValueOnce(periodic.promise).mockReturnValueOnce(explicit.promise);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const periodicSignal = fetchMock.mock.calls[1]![1]!.signal as AbortSignal;
+    oldClient.room.broadcast(); connection.sendEditorActivity("pixels", { preview_protocol: 1 });
+    expect(onActivity).toHaveBeenCalledOnce(); expect(oldClient.room.send).toHaveBeenCalledTimes(2);
+    const verifying = connection.refresh();
+    expect(periodicSignal.aborted).toBe(true); expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(connection.refresh()).toBe(verifying); expect(connection.refresh()).toBe(verifying);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    oldClient.room.broadcast(); connection.sendEditorActivity("pixels", { preview_protocol: 1 });
+    expect(onActivity).toHaveBeenCalledOnce(); expect(oldClient.room.send).toHaveBeenCalledTimes(2);
+    explicit.resolve(response({}, 403)); await verifying;
+    expect(onDenied).toHaveBeenCalledExactlyOnceWith(403); expect(oldClient.disconnect).toHaveBeenCalledOnce();
+    periodic.resolve(response(config("stale-periodic-authorization"))); await vi.advanceTimersByTimeAsync(0);
+    expect(clients).toHaveLength(1); oldClient.room.broadcast();
+    expect(onActivity).toHaveBeenCalledOnce(); expect(onDenied).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000); expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("ignores a superseded periodic response while explicit verification is pending and rejoins only its fresh epoch", async () => {
+    const { connection, onActivity, onDenied } = await openPresence();
+    const oldClient = clients[0]!; const periodic = deferred<Response>(); const explicit = deferred<Response>();
+    fetchMock.mockReturnValueOnce(periodic.promise).mockReturnValueOnce(explicit.promise);
+    await vi.advanceTimersByTimeAsync(10_000);
+    browserDocument.dispatchEvent(new Event("visibilitychange"));
+    const verifying = connection.refresh(); expect(fetchMock).toHaveBeenCalledTimes(3);
+    periodic.resolve(response(config("superseded-periodic-epoch"))); await vi.advanceTimersByTimeAsync(0);
+    expect(clients).toHaveLength(1); oldClient.room.broadcast();
+    connection.sendEditorActivity("pixels", { preview_protocol: 1 });
+    expect(onActivity).not.toHaveBeenCalled(); expect(oldClient.room.send).toHaveBeenCalledTimes(1);
+    explicit.resolve(response(config("fresh-explicit-epoch"))); await verifying;
+    expect(clients).toHaveLength(2); expect(clients[1]!.channel).toHaveBeenCalledWith(config("fresh-explicit-epoch").channel, expect.any(Object));
+    clients[1]!.room.broadcast(); expect(onActivity).toHaveBeenCalledOnce(); expect(onDenied).not.toHaveBeenCalled();
   });
 
   it("rejects stale sends/receives after a throttled timer and recovers only from new configuration", async () => {

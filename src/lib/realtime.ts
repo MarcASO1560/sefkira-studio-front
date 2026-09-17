@@ -539,6 +539,7 @@ export const connectProjectPresence = (
   let verifying = false;
   let refreshPromise: Promise<void> | null = null;
   let refreshAbort: AbortController | null = null;
+  let refreshKeepsLeaseActive = false;
   let leaseInterval: ReturnType<typeof setInterval> | null = null;
   let leaseExpiry: ReturnType<typeof setTimeout> | null = null;
 
@@ -728,18 +729,32 @@ export const connectProjectPresence = (
     });
   };
 
-  const refresh = (): Promise<void> => {
+  const refresh = (keepFreshLeaseActive = false): Promise<void> => {
     if (closed || typeof window === "undefined") return Promise.resolve();
     if (!isOnline()) {
       retireRoom();
       return Promise.resolve();
     }
-    if (refreshPromise) return refreshPromise;
+    if (refreshPromise) {
+      if (keepFreshLeaseActive || !refreshKeepsLeaseActive) return refreshPromise;
+      // An explicit access-change check supersedes a background renewal: its
+      // response may have been authorized before the change was announced.
+      verifying = true;
+      validationGeneration += 1;
+      refreshAbort?.abort();
+      refreshAbort = null;
+      refreshPromise = null;
+      refreshKeepsLeaseActive = false;
+    }
     if (activeConfig && !hasFreshLease()) retireRoom();
     const currentValidation = ++validationGeneration;
     const controller = new AbortController();
     refreshAbort = controller;
-    verifying = true;
+    // The periodic renewal must not freeze live ink during a slow HTTP check.
+    // Only an already-authorized, unexpired lease may remain active. Explicit
+    // access-change checks still pause immediately; expiry/errors retire it.
+    refreshKeepsLeaseActive = keepFreshLeaseActive && hasFreshLease();
+    verifying = !refreshKeepsLeaseActive;
     const nextPromise = (async () => {
       let abortListener: (() => void) | undefined;
       const aborted = new Promise<never>((_resolve, reject) => {
@@ -791,18 +806,20 @@ export const connectProjectPresence = (
         }
       }
     })().finally(() => {
-      if (refreshPromise === nextPromise) refreshPromise = null;
+      if (refreshPromise === nextPromise) { refreshPromise = null; refreshKeepsLeaseActive = false; }
     });
     refreshPromise = nextPromise;
     return nextPromise;
   };
 
   const recheckAccess = () => { void refresh(); };
+  const renewActiveLease = () => { void refresh(true); };
   const pauseOffline = () => {
     validationGeneration += 1;
     refreshAbort?.abort();
     refreshAbort = null;
     refreshPromise = null;
+    refreshKeepsLeaseActive = false;
     verifying = false;
     retireRoom();
   };
@@ -823,7 +840,7 @@ export const connectProjectPresence = (
   };
 
   if (typeof window !== "undefined") {
-    leaseInterval = setInterval(recheckAccess, PROJECT_PRESENCE_CHECK_INTERVAL_MS);
+    leaseInterval = setInterval(renewActiveLease, PROJECT_PRESENCE_CHECK_INTERVAL_MS);
     window.addEventListener?.("online", recheckAccess);
     window.addEventListener?.("offline", pauseOffline);
     if (typeof document !== "undefined") document.addEventListener?.("visibilitychange", recheckAccess);

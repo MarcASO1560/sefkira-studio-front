@@ -20,12 +20,13 @@ export type ImageOperationSyncOptions = {
   onDocument: (document: PixelArtDocumentV2, context: ImageOperationDocumentContext) => void;
   onConflict?: (error: Error) => void;
   onAccessDenied?: (status: number) => void;
+  onAcknowledged?: (acknowledgement: { operationId: string; appliedRevision: number; previewSequence?: number; previewBarrier?: boolean }) => void;
   store?: ImageOperationStore;
   transport?: ImageOperationTransport;
   debounceMs?: number;
   isOnline?: () => boolean;
 };
-type PendingEntry = { operation: ImageOperation; durable: boolean; acknowledgedRevision?: number };
+type PendingEntry = { operation: ImageOperation; durable: boolean; acknowledgedRevision?: number; previewSequence?: number };
 const resourceDocument = (resource: ProjectResourceDetail) => resource.data.pixel_art as PixelArtDocumentV2;
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const sameDocumentContent = (left: PixelArtDocumentV2, right: PixelArtDocumentV2) => JSON.stringify({ ...left, palette: [] }) === JSON.stringify({ ...right, palette: [] });
@@ -48,7 +49,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
   const canUndo = computed(() => !accessDenied.value && connectionOnline.value && isReady.value && !isHistoryBusy.value && (sharedHistory.value.can_undo || hasPendingEdits.value));
   const canRedo = computed(() => !accessDenied.value && connectionOnline.value && isReady.value && !isHistoryBusy.value && !hasPendingEdits.value && sharedHistory.value.can_redo);
   const transport = options.transport ?? createImageOperationTransport(options.projectId, options.resourceId);
-  const debounceMs = options.debounceMs ?? 420;
+  const debounceMs = options.debounceMs ?? 100;
   let canonical: ProjectResourceDetail | null = null;
   let observed: PixelArtDocumentV2 | null = null;
   let entries: PendingEntry[] = [];
@@ -74,6 +75,10 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
   let transforms: ImageOperationTransform[] = [];
   let historyRequestActive = false;
   let observedCanonicalRevision = 0;
+  let canonicalRequest: { promise: Promise<void>; since: number } | null = null;
+  let resyncVersion = 0;
+  let synchronizedVersion = 0;
+  const persistenceCheckpoints = new Set<{ ready: () => boolean; resolve: () => void; reject: (error: unknown) => void }>();
 
   const userId = () => typeof options.userId === "function" ? options.userId() : options.userId;
   const verifyScope = () => {
@@ -99,6 +104,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     isHistoryBusy.value = historyRequestActive || entries.some((entry) => entry.operation.actions.some((action) => action.type === "undo" || action.type === "redo"));
   };
   const report = (error: unknown, transportFailure = false) => {
+    if (transportFailure) resyncVersion += 1;
     errorMessage.value = message(error);
     status.value = online() ? "error" : "offline";
     retryableFailure = transportFailure && (error instanceof ImageOperationHttpError
@@ -131,14 +137,36 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         await store!.write({ version: 1, resource: canonical ? copy(canonical) : null, operations: pending, transforms: copy(transforms), history: copy(sharedHistory.value), ...((pending.length || unencodableLocalChanges) && observed ? { localDocument: clonePixelArtDocument(observed), localDocumentUnencodable: unencodableLocalChanges, localDocumentRevision: observedCanonicalRevision } : {}) });
         entries = entries.filter((entry) => !acknowledgedIds.has(entry.operation.operation_id));
         for (const entry of entries) if (savedPayloads.get(entry.operation.operation_id) === JSON.stringify(entry.operation)) entry.durable = true;
+        for (const checkpoint of persistenceCheckpoints) {
+          if (checkpoint.ready()) { persistenceCheckpoints.delete(checkpoint); checkpoint.resolve(); }
+        }
         // Mousemove bursts coalesce while a transaction is in flight, without
         // resolving durability until the newest queued edit has been committed.
       } while (writtenVersion !== persistenceVersion);
+      // Checkpoint continuations may enqueue the next packet before a promise's
+      // .then cleanup runs. Release ownership synchronously with the last write.
+      persistenceActive = null;
+      dirtyWrites = 0;
+      syncPending();
     })();
     persistenceActive = operation;
     persistence = operation;
-    void operation.then(() => { if (persistenceActive === operation) { persistenceActive = null; dirtyWrites = 0; } syncPending(); }, (error) => { if (persistenceActive === operation) { persistenceActive = null; dirtyWrites = 0; } syncPending(); report(error); });
+    void operation.then(() => { if (persistenceActive === operation) { persistenceActive = null; dirtyWrites = 0; } syncPending(); }, (error) => {
+      if (persistenceActive === operation) { persistenceActive = null; dirtyWrites = 0; }
+      for (const checkpoint of persistenceCheckpoints) { persistenceCheckpoints.delete(checkpoint); checkpoint.reject(error); }
+      syncPending(); report(error);
+    });
     return operation;
+  };
+  const persistUntil = (ready: () => boolean) => {
+    if (ready()) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const checkpoint = { ready, resolve, reject };
+      persistenceCheckpoints.add(checkpoint);
+      // The writer rejects only outstanding checkpoints on failure. Do not
+      // retain one promise listener per packet until an endless stroke stops.
+      void persist();
+    });
   };
   const overlay = () => {
     if (!canonical) return null;
@@ -218,6 +246,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
       return;
     }
     entries = (recovered?.operations ?? []).map((operation) => ({ operation: copy(operation), durable: true }));
+    if (entries.length || !online()) resyncVersion += 1;
     transforms = copy(recovered?.transforms ?? []);
     if (recovered?.history) sharedHistory.value = recovered.history;
     canonical = normalized;
@@ -246,48 +275,68 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     if (entries.length && online() && ((status.value as SaveStatus) !== "error" || entries[0]?.operation._client_attempted)) scheduleTimer();
   };
 
-  const fetchCanonical = async () => {
+  const fetchCanonical = async (requireFresh = false): Promise<void> => {
     verifyScope();
-    if (transport.fetchState) {
-      const since = entries.length ? Math.min(...entries.map((entry) => entry.operation.base_revision)) : canonical?.revision ?? 0;
-      const state = validateImageOperationState(await transport.fetchState(since), options.projectId, options.resourceId);
-      if (!disposed && !discarding) {
-        mergeState(state.resource.revision, state.history, state.transforms);
-        accept(state.resource, "remote");
-      }
-    } else {
-      const resource = await transport.fetchResource();
-      if (!disposed && !discarding) accept(resource, "remote");
+    const since = entries.length ? Math.min(...entries.map((entry) => entry.operation.base_revision)) : canonical?.revision ?? 0;
+    if (canonicalRequest && !requireFresh) {
+      // A shared request must include every queued operation's coordinate frame.
+      if (canonicalRequest.since <= since || !transport.fetchState) return canonicalRequest.promise;
+      return canonicalRequest.promise.then(() => fetchCanonical());
     }
+    const requestedResyncVersion = resyncVersion;
+    const promise = (async () => {
+      if (transport.fetchState) {
+        const state = validateImageOperationState(await transport.fetchState(since), options.projectId, options.resourceId);
+        if (!disposed && !discarding) {
+          mergeState(state.resource.revision, state.history, state.transforms);
+          accept(state.resource, "remote");
+        }
+      } else {
+        const resource = await transport.fetchResource();
+        if (!disposed && !discarding) accept(resource, "remote");
+      }
+      synchronizedVersion = Math.max(synchronizedVersion, requestedResyncVersion);
+    })();
+    canonicalRequest = { promise, since };
+    void promise.then(() => { if (canonicalRequest?.promise === promise) canonicalRequest = null; }, () => { if (canonicalRequest?.promise === promise) canonicalRequest = null; });
+    return promise;
   };
   const process = async () => {
     let transportFailure = false;
     try {
-      await persistence;
       if (disposed || discarding || !online() || !entries.length) return;
-      // A new connection/retry starts from current server state, not stale cache.
-      transportFailure = true;
-      await fetchCanonical();
-      transportFailure = false;
+      verifyScope();
       while (!disposed && !discarding && online() && entries.length) {
         status.value = "saving";
         errorMessage.value = "";
-        await persist();
-        if (!entries.length) break;
         const entry = entries[0]!;
-        if (!entry.durable) throw new Error("Changes must be stored on this device before they can be sent.");
         const operation = entry.operation;
+        const normalDelta = operation.actions.every((action) => action.type === "pixels" || action.type === "layer-update");
+        if (!normalDelta || operation._client_attempted || resyncVersion > synchronizedVersion) {
+          // Reconnect/retry and structural/history commands retain a fresh server
+          // barrier. Normal deltas are rebased atomically by the server already.
+          transportFailure = true;
+          await fetchCanonical(!normalDelta || operation._client_attempted === true);
+          transportFailure = false;
+        }
+        if (disposed || discarding || !online() || !entries.includes(entry)) return;
         if (operation.actions[0]?.type === "replace" && !operation._client_attempted) {
           if (!operation._client_expected_document || !sameDocumentContent(resourceDocument(canonical!), operation._client_expected_document)) throw new ImageOperationConflict("The remote image changed before your canvas replacement was confirmed. Export your local copy before resolving this conflict.");
           operation.base_revision = canonical!.revision;
           operation.width = resourceDocument(canonical!).width;
           operation.height = resourceDocument(canonical!).height;
+          entry.durable = false;
         }
         // Persist attempted state before transmission: lost ACKs must retry the
         // identical packet, including when the server has since resized a canvas.
         const alreadyAttempted = operation._client_attempted === true;
         operation._client_attempted = true;
-        try { await persist(); } catch (error) { if (!alreadyAttempted) operation._client_attempted = false; throw error; }
+        if (!alreadyAttempted) entry.durable = false;
+        // Freeze this packet before waiting for its transaction. New pointer
+        // frames use a different entry and cannot postpone this packet's write.
+        try { await persistUntil(() => entry.durable); } catch (error) { if (!alreadyAttempted) operation._client_attempted = false; throw error; }
+        if (disposed || discarding || !online()) return;
+        verifyScope();
         const packet: ImageOperation = { operation_id: operation.operation_id, base_revision: operation.base_revision, width: operation.width, height: operation.height, actions: copy(operation.actions), ...(operation.history_group_id ? { history_group_id: operation.history_group_id } : {}), ...(operation.coordinate_after_operation_id ? { coordinate_after_operation_id: operation.coordinate_after_operation_id } : {}) };
         transportFailure = true;
         const response = await transport.sendOperation(packet);
@@ -298,7 +347,13 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         for (const pending of entries) if (pending.operation.coordinate_after_operation_id === operation.operation_id || pending.operation._client_frame_dependency === operation.operation_id) pending.operation._client_dependency_revision = acknowledgement.applied_revision;
         mergeState(acknowledgement.resource.revision, acknowledgement.history, acknowledgement.transforms);
         accept(acknowledgement.resource, "ack");
-        await persist();
+        options.onAcknowledged?.({
+          operationId: operation.operation_id,
+          appliedRevision: acknowledgement.applied_revision,
+          ...(entry.previewSequence !== undefined ? { previewSequence: entry.previewSequence } : {}),
+          ...(packet.actions.some((action) => action.type === "undo" || action.type === "redo" || action.type === "import" || action.type === "resize" || action.type === "replace") ? { previewBarrier: true } : {}),
+        });
+        await persistUntil(() => !entries.includes(entry));
         lastSavedAt.value = Date.now();
         retryableFailure = false;
         retryFailures = 0;
@@ -333,11 +388,11 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     return operation;
   };
   function scheduleTimer() {
-    clearTimer();
+    if (timer !== null) return;
     timer = setTimeout(() => { timer = null; void run(); }, debounceMs);
   }
 
-  const schedule = async (document: PixelArtDocumentV2, settings: { conditional?: boolean; forceReplace?: boolean; resize?: ImageResizeOperation; historyGroupId?: string } = {}) => {
+  const schedule = async (document: PixelArtDocumentV2, settings: { conditional?: boolean; forceReplace?: boolean; resize?: ImageResizeOperation; historyGroupId?: string; previewSequence?: number } = {}) => {
     if (disposed || !isReady.value || !canonical || !observed) return Promise.resolve();
     let actions;
     try { verifyScope(); actions = diffImageDocuments(observed, document, { conditional: settings.conditional, replace: settings.forceReplace, resize: settings.resize }); }
@@ -349,7 +404,8 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     let batches;
     try { batches = splitImageActionBatches(actions); }
     catch (error) { unencodableLocalChanges = true; syncPending(); report(error); await persist().catch(() => undefined); return; }
-    for (const actions of batches) {
+    for (const [batchIndex, actions] of batches.entries()) {
+      const previewSequence = batchIndex === batches.length - 1 ? settings.previewSequence : undefined;
       const dependency = [...entries].reverse().find((entry) => entry.acknowledgedRevision === undefined && !transforms.some((event) => event.operation_id === entry.operation.operation_id && event.user_id === scopeUserId && event.revision <= observedCanonicalRevision) && (entry.operation.actions[0]?.type === "resize" || entry.operation.actions[0]?.type === "import" || entry.operation.actions[0]?.type === "replace" && entry.operation._client_expected_document && (entry.operation.actions[0].document.width !== entry.operation._client_expected_document.width || entry.operation.actions[0].document.height !== entry.operation._client_expected_document.height)));
       const operation: ImageOperation = { operation_id: createImageOperationId(), base_revision: observedCanonicalRevision, width: before.width, height: before.height, actions, ...(actions[0]?.type === "replace" ? { _client_expected_document: clonePixelArtDocument(before) } : {}), ...(settings.historyGroupId ? { history_group_id: settings.historyGroupId } : {}), ...(dependency ? { coordinate_after_operation_id: dependency.operation.operation_id } : {}) };
       if (!validateImageOperation(operation)) { unencodableLocalChanges = true; syncPending(); report(new Error("The local edit cannot be encoded safely. Keep this tab open and export your local image.")); await persist().catch(() => undefined); return; }
@@ -365,9 +421,9 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         combined.set(action.layer_id, changes);
       }
         const combinedActions = [...combined].map(([layer_id, changes]) => ({ type: "pixels" as const, layer_id, changes: [...changes.values()] }));
-        if (validateImageOperation({ ...last.operation, actions: combinedActions }) && splitImageActionBatches(combinedActions).length === 1) { last.operation.actions = combinedActions; last.durable = false; }
-        else entries.push({ operation, durable: false });
-      } else entries.push({ operation, durable: false });
+        if (validateImageOperation({ ...last.operation, actions: combinedActions }) && splitImageActionBatches(combinedActions).length === 1) { last.operation.actions = combinedActions; last.durable = false; if (previewSequence !== undefined) last.previewSequence = previewSequence; }
+        else entries.push({ operation, durable: false, ...(previewSequence !== undefined ? { previewSequence } : {}) });
+      } else entries.push({ operation, durable: false, ...(previewSequence !== undefined ? { previewSequence } : {}) });
     }
     syncPending();
     status.value = online() ? active ? "saving" : "dirty" : "offline";
@@ -379,18 +435,17 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
   };
   const flush = async () => {
     clearTimer();
-    await persistence.catch(() => undefined);
     if (!disposed && online() && entries.length) await run();
+    else await persistence.catch(() => undefined);
   };
-  const refresh = async () => {
+  const refresh = async (requireFresh = false) => {
     connectionOnline.value = online();
     if (disposed || discarding || !isReady.value) return false;
     const resumeRetry = retryableFailure;
     let transportFailure = false;
     try {
-      await persistence;
       transportFailure = true;
-      await fetchCanonical();
+      await fetchCanonical(requireFresh);
       transportFailure = false;
       if (discarding || disposed) return false;
       await persist();
@@ -406,6 +461,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
   };
   const retry = async () => {
     connectionOnline.value = online();
+    resyncVersion += 1;
     if (disposed || !online()) { status.value = "offline"; return; }
     if (recoveryFailed) { report(new Error("Your previous pending changes could not be recovered. Keep this tab open and export the image before reloading.")); return; }
     errorMessage.value = "";
@@ -453,7 +509,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
       // pending stroke(s). Never initiate a new global history action offline.
       await flush();
       if (entries.length || disposed || !online()) return false;
-      if (!await refresh()) return false;
+      if (!await refresh(true)) return false;
       if (!online() || (kind === "undo" ? !sharedHistory.value.can_undo : !sharedHistory.value.can_redo)) return false;
       verifyScope();
       const operation: ImageOperation = { operation_id: createImageOperationId(), base_revision: canonical.revision, width: resourceDocument(canonical).width, height: resourceDocument(canonical).height, actions: [{ type: kind }] };
@@ -480,6 +536,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
   };
   const handleOnline = () => { connectionOnline.value = true; void retry(); };
   const handleOffline = () => {
+    resyncVersion += 1;
     connectionOnline.value = false;
     clearTimer();
     status.value = "offline";
