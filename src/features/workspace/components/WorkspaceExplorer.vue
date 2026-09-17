@@ -2142,8 +2142,17 @@ onUnmounted(() => {
         @click.stop
       >
         <header>
-          <div>
-            <h2 id="share-project-title">Share project</h2>
+          <div class="share-dialog__heading">
+            <svg class="share-dialog__mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+              <path d="M11 16h6V7h6M17 16v9h6" />
+              <rect x="5" y="13" width="6" height="6" />
+              <rect x="23" y="4" width="6" height="6" />
+              <rect x="23" y="22" width="6" height="6" />
+            </svg>
+            <div>
+              <h2 id="share-project-title">Share project</h2>
+              <p>Invite people into your creative space.</p>
+            </div>
           </div>
           <button
             type="button"
@@ -2158,12 +2167,32 @@ onUnmounted(() => {
 
         <div class="share-dialog__body">
           <div class="share-dialog__summary">
-            <strong>{{ projectPendingShare.name }}</strong>
-            <span :class="{ 'is-expired': shareExpired }" role="status">{{ shareExpirationLabel }}</span>
+            <div class="share-dialog__project" aria-hidden="true">
+              <ProjectPixelArtThumbnail
+                v-if="hasProjectPixelArt(projectPendingShare.projectPixelArt)"
+                :pixels="projectPendingShare.projectPixelArt?.pixels || []"
+                :size="projectPendingShare.projectPixelArt?.size || PROJECT_PIXEL_SIZE"
+              />
+              <svg v-else class="share-dialog__project-fallback" viewBox="0 0 32 32" focusable="false">
+                <path d="M8 4h16v4h4v16h-4v4H8v-4H4V8h4Z" />
+                <path d="M12 12h8v8h-8Z" />
+              </svg>
+            </div>
+            <div class="share-dialog__project-copy">
+              <strong>{{ projectPendingShare.name }}</strong>
+              <span role="status">{{ shareExpirationLabel }}</span>
+            </div>
           </div>
           <p v-if="shareExpired" class="share-dialog__notice">This link has expired. Renew it to create a new link; the previous link will no longer work.</p>
           <fieldset class="share-role-fieldset share-dialog__section">
-            <legend>Permission</legend>
+            <legend>
+              <span class="share-dialog__section-title">
+                <svg class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <circle cx="9" cy="8" r="3" /><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M21 20v-2a6 6 0 0 0-3-5" />
+                </svg>
+                Permission
+              </span>
+            </legend>
             <div
               class="share-role-options"
               role="group"
@@ -2181,17 +2210,35 @@ onUnmounted(() => {
                 :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending"
                 @click="updateShareRole(option.value)"
               >
+                <svg v-if="option.value === 'viewer'" class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" />
+                </svg>
+                <svg v-else class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="m16 3 5 5-12 12-6 1 1-6ZM13 6l5 5" />
+                </svg>
                 <span>{{ option.label }}</span>
               </button>
             </div>
           </fieldset>
 
           <fieldset class="share-role-fieldset share-expiration-fieldset share-dialog__section">
-            <legend>Expiration</legend>
+            <legend>
+              <span class="share-dialog__section-title">
+                <svg class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" />
+                </svg>
+                Expiration
+              </span>
+            </legend>
             <div class="share-expiration-row">
-              <select v-model="shareExpirationPreset" aria-label="Share link expiration" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" @change="shareExpirationDirty = true">
-                <option v-for="option in SHARE_EXPIRATION_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
-              </select>
+              <div class="share-expiration-select" :class="{ 'is-disabled': isSharingProject || !shareLinkLoaded || shareDisablePending }">
+                <select v-model="shareExpirationPreset" aria-label="Share link expiration" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" @change="shareExpirationDirty = true">
+                  <option v-for="option in SHARE_EXPIRATION_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
+                </select>
+                <svg class="share-expiration-select__chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
               <button v-if="projectShareLink && !shareExpired" type="button" class="secondary-action" :disabled="isSharingProject || !shareExpirationDirty || shareDisablePending" @click="updateShareExpiration(false)">Save expiration</button>
             </div>
             <label v-if="shareExpirationPreset === 'custom'">
@@ -2202,7 +2249,14 @@ onUnmounted(() => {
           </fieldset>
 
           <section class="share-dialog__section share-dialog__link-section" aria-labelledby="share-link-title">
-            <h3 id="share-link-title"><label for="project-share-url">Link</label></h3>
+            <h3 id="share-link-title">
+              <label for="project-share-url" class="share-dialog__section-title">
+                <svg class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="m10 13 4-4M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" transform="translate(0 1)" />
+                </svg>
+                Link
+              </label>
+            </h3>
             <div class="share-dialog__link-row">
               <div
                 v-if="isSharingProject"
@@ -3060,6 +3114,49 @@ onUnmounted(() => {
     flex-shrink: 0;
   }
 
+  .share-dialog__heading {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    min-width: 0;
+  }
+
+  .share-dialog__heading > div {
+    min-width: 0;
+  }
+
+  .share-dialog .share-dialog__heading p {
+    margin: 5px 0 0;
+    color: #fff;
+    font-size: 0.8125rem;
+    font-weight: 400;
+    line-height: 1.4;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+
+  .share-dialog__mark {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+  }
+
+  .share-dialog__icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
   .share-dialog .project-modal__close:hover:not(:disabled) {
     background: #242424;
     border-color: var(--line);
@@ -3523,9 +3620,38 @@ onUnmounted(() => {
 
   .share-dialog__summary {
     display: grid;
-    gap: 8px;
+    grid-template-columns: 48px minmax(0, 1fr);
+    gap: 14px;
+    align-items: center;
     padding-bottom: 18px;
     border-bottom: 1px solid var(--line);
+  }
+
+  .share-dialog__project {
+    display: grid;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    padding: 5px;
+    overflow: hidden;
+    background: #191919;
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+  }
+
+  .share-dialog__project-fallback {
+    width: 32px;
+    height: 32px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linejoin: miter;
+  }
+
+  .share-dialog__project-copy {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
   }
 
   .share-dialog__summary strong {
@@ -3534,7 +3660,7 @@ onUnmounted(() => {
     line-height: 1.35;
   }
 
-  .share-dialog__summary span,
+  .share-dialog__project-copy > span,
   .share-dialog__hint {
     margin: 0;
     color: #fff;
@@ -3573,13 +3699,27 @@ onUnmounted(() => {
     line-height: 1.3;
   }
 
+  .share-dialog__section-title,
+  .share-dialog__body label.share-dialog__section-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .share-expiration-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
   }
 
+  .share-expiration-select {
+    position: relative;
+    min-width: 0;
+  }
+
   .share-expiration-row select {
+    appearance: none;
+    -webkit-appearance: none;
     min-width: 0;
     min-height: 44px;
     width: 100%;
@@ -3589,8 +3729,27 @@ onUnmounted(() => {
     background: #191919;
     border: 1px solid var(--line-strong);
     border-radius: 8px;
-    padding: 0 12px;
+    padding: 0 44px 0 14px;
     font: inherit;
+  }
+
+  .share-expiration-select__chevron {
+    position: absolute;
+    top: 50%;
+    right: 16px;
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    pointer-events: none;
+    transform: translateY(-50%);
+  }
+
+  .share-expiration-select.is-disabled .share-expiration-select__chevron {
+    opacity: 0.45;
   }
 
   .share-expiration-row select:focus-visible {
@@ -3674,6 +3833,7 @@ onUnmounted(() => {
 
   .share-role-options button {
     display: inline-flex;
+    gap: 8px;
     align-items: center;
     justify-content: center;
     min-width: 0;
@@ -4025,6 +4185,20 @@ onUnmounted(() => {
       padding: 18px;
     }
 
+    .share-dialog__heading {
+      gap: 10px;
+    }
+
+    .share-dialog__mark {
+      width: 28px;
+      height: 28px;
+    }
+
+    .share-role-options button {
+      gap: 6px;
+      padding: 8px;
+    }
+
     .share-expiration-row,
     .share-dialog__link-row {
       grid-template-columns: minmax(0, 1fr);
@@ -4040,6 +4214,18 @@ onUnmounted(() => {
 
     .share-dialog footer .primary-action {
       width: 100%;
+    }
+  }
+
+  @media (forced-colors: active) {
+    .share-expiration-row select {
+      appearance: auto;
+      -webkit-appearance: auto;
+      padding-right: 14px;
+    }
+
+    .share-expiration-select__chevron {
+      display: none;
     }
   }
 </style>
