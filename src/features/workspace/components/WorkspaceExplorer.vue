@@ -1911,29 +1911,31 @@ onUnmounted(() => {
 
           <ul v-else-if="projectAccessUsers.length" class="access-list">
             <li v-for="user in projectAccessUsers" :key="user.id">
-              <div class="access-user-avatar" aria-hidden="true">
-                <div
-                  v-if="user.avatar_pixel_art?.pixels?.length"
-                  class="access-user-avatar__pixels"
-                >
-                  <span
-                    v-for="(pixel, index) in user.avatar_pixel_art.pixels"
-                    :key="`access-user-pixel-${user.id}-${index}`"
-                    :style="{ backgroundColor: pixel || 'transparent' }"
-                  ></span>
+              <div class="access-user-identity">
+                <div class="access-user-avatar" aria-hidden="true">
+                  <div
+                    v-if="user.avatar_pixel_art?.pixels?.length"
+                    class="access-user-avatar__pixels"
+                  >
+                    <span
+                      v-for="(pixel, index) in user.avatar_pixel_art.pixels"
+                      :key="`access-user-pixel-${user.id}-${index}`"
+                      :style="{ backgroundColor: pixel || 'transparent' }"
+                    ></span>
+                  </div>
+                  <img
+                    v-else-if="user.avatar_url"
+                    :src="user.avatar_url"
+                    alt=""
+                    loading="lazy"
+                  />
+                  <span v-else>{{ accessUserInitials(user) }}</span>
                 </div>
-                <img
-                  v-else-if="user.avatar_url"
-                  :src="user.avatar_url"
-                  alt=""
-                  loading="lazy"
-                />
-                <span v-else>{{ accessUserInitials(user) }}</span>
-              </div>
 
-              <div class="access-user-copy">
-                <strong>{{ accessUserName(user) }}</strong>
-                <span>{{ user.email }}</span>
+                <div class="access-user-copy">
+                  <strong>{{ accessUserName(user) }}</strong>
+                  <span>{{ user.email }}</span>
+                </div>
               </div>
 
               <div class="access-user-controls">
@@ -1962,26 +1964,30 @@ onUnmounted(() => {
                     {{ accessRoleLabel(option.value) }}
                   </button>
                 </div>
-                <button
+                <div
                   v-if="canManageProjectAccess && !user.is_owner && !isCurrentAccessUser(user)"
-                  type="button"
-                  class="access-remove-button"
-                  :aria-label="`Remove ${accessUserName(user)} from project`"
-                  :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
-                  @click="requestRemoveAccessUser(user)"
+                  class="access-user-actions"
                 >
-                  {{ accessRemovingUserId === user.id ? "Removing..." : "Remove" }}
-                </button>
-                <button
-                  v-if="canManageProjectAccess && canBlockProjectMember(user, currentUserEmail)"
-                  type="button"
-                  class="access-remove-button"
-                  :aria-label="`Block ${accessUserName(user)} from project`"
-                  :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
-                  @click="requestBlockAccessUser(user)"
-                >
-                  Block
-                </button>
+                  <button
+                    type="button"
+                    class="access-remove-button"
+                    :aria-label="`Remove ${accessUserName(user)} from project`"
+                    :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
+                    @click="requestRemoveAccessUser(user)"
+                  >
+                    {{ accessRemovingUserId === user.id ? "Removing..." : "Remove" }}
+                  </button>
+                  <button
+                    v-if="canManageProjectAccess && canBlockProjectMember(user, currentUserEmail)"
+                    type="button"
+                    class="access-remove-button"
+                    :aria-label="`Block ${accessUserName(user)} from project`"
+                    :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
+                    @click="requestBlockAccessUser(user)"
+                  >
+                    Block
+                  </button>
+                </div>
               </div>
             </li>
           </ul>
@@ -1996,17 +2002,19 @@ onUnmounted(() => {
             </div>
             <ul v-else-if="projectBlockedUsers.length" class="access-list">
               <li v-for="user in projectBlockedUsers" :key="`blocked-${user.id}`">
-                <div class="access-user-avatar" aria-hidden="true">
-                  <div v-if="user.avatar_pixel_art?.pixels?.length" class="access-user-avatar__pixels">
-                    <span v-for="(pixel, index) in user.avatar_pixel_art.pixels" :key="`blocked-pixel-${user.id}-${index}`" :style="{ backgroundColor: pixel || 'transparent' }"></span>
+                <div class="access-user-identity">
+                  <div class="access-user-avatar" aria-hidden="true">
+                    <div v-if="user.avatar_pixel_art?.pixels?.length" class="access-user-avatar__pixels">
+                      <span v-for="(pixel, index) in user.avatar_pixel_art.pixels" :key="`blocked-pixel-${user.id}-${index}`" :style="{ backgroundColor: pixel || 'transparent' }"></span>
+                    </div>
+                    <img v-else-if="user.avatar_url" :src="user.avatar_url" alt="" loading="lazy" />
+                    <span v-else>{{ accessUserInitials(user) }}</span>
                   </div>
-                  <img v-else-if="user.avatar_url" :src="user.avatar_url" alt="" loading="lazy" />
-                  <span v-else>{{ accessUserInitials(user) }}</span>
-                </div>
-                <div class="access-user-copy">
-                  <strong>{{ accessUserName(user) }}</strong>
-                  <span>{{ user.email }}</span>
-                  <span>Blocked {{ formatDateTime(user.blocked_at) }}</span>
+                  <div class="access-user-copy">
+                    <strong>{{ accessUserName(user) }}</strong>
+                    <span>{{ user.email }}</span>
+                    <span>Blocked {{ formatDateTime(user.blocked_at) }}</span>
+                  </div>
                 </div>
                 <div class="access-user-controls">
                   <button type="button" class="secondary-action access-unblock-button"
@@ -2135,7 +2143,6 @@ onUnmounted(() => {
       >
         <header>
           <div>
-            <p>Project sharing</p>
             <h2 id="share-project-title">Share project</h2>
           </div>
           <button
@@ -2154,8 +2161,8 @@ onUnmounted(() => {
             <strong>{{ projectPendingShare.name }}</strong>
             <span :class="{ 'is-expired': shareExpired }" role="status">{{ shareExpirationLabel }}</span>
           </div>
-          <p v-if="shareExpired" class="share-dialog__hint">This link has expired and cannot be used to join. Renew it to create a new link; the previous link will no longer work.</p>
-          <fieldset class="share-role-fieldset">
+          <p v-if="shareExpired" class="share-dialog__notice">This link has expired. Renew it to create a new link; the previous link will no longer work.</p>
+          <fieldset class="share-role-fieldset share-dialog__section">
             <legend>Permission</legend>
             <div
               class="share-role-options"
@@ -2179,7 +2186,7 @@ onUnmounted(() => {
             </div>
           </fieldset>
 
-          <fieldset class="share-role-fieldset share-expiration-fieldset">
+          <fieldset class="share-role-fieldset share-expiration-fieldset share-dialog__section">
             <legend>Expiration</legend>
             <div class="share-expiration-row">
               <select v-model="shareExpirationPreset" aria-label="Share link expiration" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" @change="shareExpirationDirty = true">
@@ -2191,20 +2198,21 @@ onUnmounted(() => {
               <span class="share-dialog__label">Date and time</span>
               <input v-model="shareCustomExpiration" type="datetime-local" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" aria-label="Share link expiration date and time" @input="shareExpirationDirty = true" />
             </label>
-            <p class="share-dialog__hint">Dates and times use your device’s local timezone. Changing expiration does not remove people who already have access.</p>
+            <p class="share-dialog__hint">Dates use your device’s local timezone. Existing members keep their access when the link expires.</p>
           </fieldset>
 
-          <label>
-            <span class="share-dialog__label">Link</span>
+          <section class="share-dialog__section share-dialog__link-section" aria-labelledby="share-link-title">
+            <h3 id="share-link-title"><label for="project-share-url">Link</label></h3>
             <div class="share-dialog__link-row">
               <div
                 v-if="isSharingProject"
-                class="share-link-skeleton"
+                class="share-dialog__loading"
                 role="status"
                 aria-label="Updating project share link"
-              ></div>
+              >Updating link…</div>
               <input
                 v-else
+                id="project-share-url"
                 :value="shareProjectUrl"
                 type="text"
                 readonly
@@ -2224,37 +2232,36 @@ onUnmounted(() => {
                 <span>Copy</span>
               </button>
             </div>
-          </label>
-
-          <div v-if="!shareDisablePending" class="share-dialog__actions">
-            <button v-if="!shareLinkLoaded" type="button" class="secondary-action" :disabled="isSharingProject" @click="openShareDialog(projectPendingShare)">Retry loading</button>
-            <button v-else-if="!projectShareLink" type="button" class="primary-action" :disabled="isSharingProject" @click="updateShareExpiration(false)">Create link</button>
-            <template v-else>
-              <button type="button" class="secondary-action" :disabled="isSharingProject" @click="updateShareExpiration(true)">Renew link</button>
-              <button type="button" class="access-remove-button" :disabled="isSharingProject" @click="shareDisablePending = true">Disable link</button>
-            </template>
-          </div>
-          <div v-else class="share-disable-confirmation">
-            <p>Disable this link for <strong>{{ projectPendingShare.name }}</strong>? It will stop working. Existing members keep their access.</p>
-            <div class="share-dialog__actions">
-              <button type="button" class="secondary-action" :disabled="isSharingProject" @click="shareDisablePending = false">Cancel</button>
-              <button type="button" class="danger-action" :disabled="isSharingProject" @click="disableShareLink">Disable link</button>
+            <div v-if="!shareDisablePending" class="share-dialog__actions">
+              <button v-if="!shareLinkLoaded" type="button" class="secondary-action" :disabled="isSharingProject" @click="openShareDialog(projectPendingShare)">Retry loading</button>
+              <button v-else-if="!projectShareLink" type="button" class="primary-action" :disabled="isSharingProject" @click="updateShareExpiration(false)">Create link</button>
+              <template v-else>
+                <button type="button" class="secondary-action" :disabled="isSharingProject" @click="updateShareExpiration(true)">Renew link</button>
+                <button type="button" class="secondary-action" :disabled="isSharingProject" @click="shareDisablePending = true">Disable link</button>
+              </template>
             </div>
-          </div>
-          <p v-if="projectShareLink && !shareDisablePending" class="share-dialog__hint">Renewing creates a new token and invalidates the previous link. Without a new expiration choice, dated links renew for 7 days.</p>
+            <div v-else class="share-disable-confirmation">
+              <h4>Disable this link?</h4>
+              <p>People with this link will no longer be able to join <strong>{{ projectPendingShare.name }}</strong>. Existing members keep their access.</p>
+              <div class="share-dialog__actions">
+                <button type="button" class="secondary-action" :disabled="isSharingProject" @click="shareDisablePending = false">Cancel</button>
+                <button type="button" class="secondary-action" :disabled="isSharingProject" @click="disableShareLink">Disable link</button>
+              </div>
+            </div>
+            <p v-if="projectShareLink && !shareDisablePending" class="share-dialog__hint">Renewing replaces the current link. Unless you choose another expiration, dated links renew for 7 days.</p>
+          </section>
           <p v-if="shareMessage" class="share-dialog__message" role="status">{{ shareMessage }}</p>
-
-          <footer>
-            <button
-              type="button"
-              class="primary-action"
-              :disabled="isSharingProject"
-              @click="closeShareDialog"
-            >
-              Done
-            </button>
-          </footer>
         </div>
+        <footer>
+          <button
+            type="button"
+            class="primary-action"
+            :disabled="isSharingProject"
+            @click="closeShareDialog"
+          >
+            Done
+          </button>
+        </footer>
       </section>
     </div>
 
@@ -3024,7 +3031,14 @@ onUnmounted(() => {
   }
 
   .share-dialog {
-    width: min(460px, 100%);
+    --text: #fff;
+    --line: rgba(255, 255, 255, 0.14);
+    --line-strong: rgba(255, 255, 255, 0.26);
+    width: min(560px, 100%);
+    color: #fff;
+    background: #111;
+    border-color: var(--line-strong);
+    box-shadow: none;
   }
 
   .access-dialog,
@@ -3038,6 +3052,65 @@ onUnmounted(() => {
   .access-dialog > footer,
   .share-dialog > header {
     flex-shrink: 0;
+  }
+
+  .share-dialog .project-modal__close {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+  }
+
+  .share-dialog .project-modal__close:hover:not(:disabled) {
+    background: #242424;
+    border-color: var(--line);
+  }
+
+  .share-dialog .project-modal__close span::before,
+  .share-dialog .project-modal__close span::after {
+    background: #fff;
+  }
+
+  .share-dialog .primary-action,
+  .share-dialog .secondary-action {
+    min-width: 0;
+    min-height: 44px;
+    padding: 10px 14px;
+    color: #fff;
+    font-size: 0.875rem;
+    font-weight: 600;
+    line-height: 1.3;
+    background: #191919;
+    border: 1px solid var(--line-strong);
+    box-shadow: none;
+    transition: background 150ms ease, border-color 150ms ease;
+  }
+
+  .share-dialog .primary-action {
+    background: #292929;
+    border-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .share-dialog .primary-action:hover:not(:disabled),
+  .share-dialog .secondary-action:hover:not(:disabled) {
+    background: #303030;
+    border-color: rgba(255, 255, 255, 0.65);
+    box-shadow: none;
+    transform: none;
+  }
+
+  .share-dialog .primary-action:disabled,
+  .share-dialog .secondary-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+    filter: none;
+    box-shadow: none;
+    transform: none;
+  }
+
+  .share-dialog button:focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: 2px;
+    box-shadow: none;
   }
 
   .access-dialog__body,
@@ -3064,6 +3137,11 @@ onUnmounted(() => {
     justify-content: space-between;
     padding: 20px 20px 18px;
     border-bottom: 1px solid var(--line);
+  }
+
+  .share-dialog > header {
+    align-items: center;
+    padding: 16px 24px;
   }
 
   .access-dialog header p,
@@ -3145,7 +3223,7 @@ onUnmounted(() => {
 
   .access-list {
     display: grid;
-    gap: 10px;
+    gap: 12px;
     padding: 0;
     margin: 0;
     list-style: none;
@@ -3153,27 +3231,36 @@ onUnmounted(() => {
 
   .access-list li {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    gap: 12px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
     align-items: center;
     min-height: 0;
-    padding: 12px;
-    background: rgba(255, 252, 244, 0.025);
-    border: 1px solid rgba(255, 252, 244, 0.08);
+    padding: 10px;
+    color: #fff;
+    background: #161717;
+    border: 1px solid #303232;
     border-radius: 8px;
+  }
+
+  .access-user-identity {
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr);
+    gap: 12px;
+    align-items: center;
+    min-width: 0;
   }
 
   .access-user-avatar {
     display: grid;
     place-items: center;
-    width: 34px;
-    height: 34px;
+    width: 38px;
+    height: 38px;
     overflow: hidden;
-    color: #171614;
+    color: #fff;
     font-size: 0.72rem;
     font-weight: 900;
-    background: #f7f1e7;
-    border: 1px solid rgba(255, 252, 244, 0.22);
+    background: #282a2a;
+    border: 1px solid #505252;
     border-radius: 999px;
   }
 
@@ -3200,27 +3287,26 @@ onUnmounted(() => {
 
   .access-user-copy {
     display: grid;
-    gap: 2px;
+    gap: 4px;
     min-width: 0;
   }
 
   .access-user-copy strong,
   .access-user-copy span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
 
   .access-user-copy strong {
-    color: var(--text);
+    color: #fff;
     font-size: 0.9rem;
-    line-height: 1.2;
+    line-height: 1.4;
   }
 
   .access-user-copy span {
-    color: rgba(247, 241, 231, 0.48);
+    color: #fff;
     font-size: 0.78rem;
-    font-weight: 700;
+    font-weight: 400;
+    line-height: 1.45;
   }
 
   .access-role {
@@ -3229,22 +3315,28 @@ onUnmounted(() => {
     justify-content: center;
     min-height: 26px;
     padding: 0 9px;
-    color: rgba(247, 241, 231, 0.78);
+    color: #fff;
     font-size: 0.72rem;
     font-weight: 800;
-    background: rgba(255, 252, 244, 0.075);
-    border: 1px solid rgba(255, 252, 244, 0.12);
-    border-radius: 999px;
+    background: #242626;
+    border: 1px solid #404242;
+    border-radius: 6px;
   }
 
   .access-user-controls {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 8px 12px;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: flex-start;
     min-width: 0;
-    max-width: 245px;
+  }
+
+  .access-user-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-width: 0;
   }
 
   .access-user-controls .access-role {
@@ -3252,45 +3344,47 @@ onUnmounted(() => {
   }
 
   .access-role-options {
-    display: inline-flex;
-    flex-wrap: nowrap;
-    gap: 3px;
-    padding: 3px;
-    background: rgba(255, 252, 244, 0.045);
-    border: 1px solid rgba(255, 252, 244, 0.12);
-    border-radius: 999px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    flex: 0 1 224px;
+    gap: 4px;
+    min-width: 0;
+    padding: 2px;
+    background: #101111;
+    border: 1px solid #3c3e3e;
+    border-radius: 8px;
   }
 
   .access-role-option {
-    min-height: 28px;
-    padding: 0 10px;
-    color: rgba(247, 241, 231, 0.66);
+    min-width: 0;
+    min-height: 32px;
+    padding: 6px 8px;
+    color: #fff;
     font: inherit;
     font-size: 0.76rem;
     font-weight: 750;
     background: transparent;
-    border: 0;
-    border-radius: 999px;
+    border: 1px solid transparent;
+    border-radius: 6px;
     cursor: pointer;
-    outline: 0;
     transition:
-      color 160ms ease,
       background 160ms ease,
-      box-shadow 160ms ease;
+      border-color 160ms ease;
   }
 
   .access-role-option:hover:not(:disabled) {
-    color: var(--text);
-    background: rgba(255, 252, 244, 0.08);
+    background: #282a2a;
   }
 
   .access-role-option:focus-visible {
-    box-shadow: 0 0 0 3px rgba(247, 241, 231, 0.16);
+    outline: 2px solid #fff;
+    outline-offset: 2px;
   }
 
   .access-role-option.is-active {
-    color: #151411;
-    background: #f7f1e7;
+    color: #fff;
+    background: #303232;
+    border-color: #747676;
   }
 
   .access-role-option:disabled {
@@ -3334,8 +3428,38 @@ onUnmounted(() => {
   }
 
   .access-unblock-button {
-    min-height: 36px;
-    padding: 8px 12px;
+    min-height: 44px;
+    padding: 8px 14px;
+  }
+
+  .access-list .access-remove-button,
+  .access-list .access-unblock-button {
+    min-width: 0;
+    min-height: 32px;
+    padding: 6px 12px;
+    color: #fff;
+    background: #1b1d1d;
+    border: 1px solid #505252;
+    border-radius: 7px;
+    box-shadow: none;
+    font-size: 0.8rem;
+    font-weight: 550;
+    line-height: 1.3;
+  }
+
+  .access-list .access-remove-button:hover:not(:disabled),
+  .access-list .access-unblock-button:hover:not(:disabled) {
+    color: #fff;
+    background: #2b2d2d;
+    border-color: #7c7e7e;
+    box-shadow: none;
+    transform: none;
+  }
+
+  .access-list .access-remove-button:focus-visible,
+  .access-list .access-unblock-button:focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: 2px;
   }
 
   .blocked-people-section {
@@ -3362,63 +3486,115 @@ onUnmounted(() => {
     }
 
     .access-list li {
-      grid-template-columns: auto minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
+      padding: 12px;
     }
 
     .access-user-controls {
-      grid-column: 2;
-      justify-content: flex-start;
+      gap: 10px;
+    }
+
+    .access-role-options,
+    .access-user-actions {
+      flex: 1 1 100%;
+    }
+
+    .access-user-actions > button {
+      flex: 1 1 0;
+    }
+
+    .access-role-option,
+    .access-list .access-remove-button,
+    .access-list .access-unblock-button {
+      min-height: 44px;
+    }
+
+    .access-unblock-button {
+      width: 100%;
     }
   }
 
   .share-dialog__body {
     display: grid;
-    gap: 16px;
-    padding: 20px 20px 18px;
+    gap: 20px;
+    padding: 20px 24px;
+    scrollbar-gutter: stable;
   }
 
   .share-dialog__summary {
     display: grid;
-    gap: 6px;
+    gap: 8px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line);
   }
 
   .share-dialog__summary strong {
     overflow-wrap: anywhere;
-    font-size: 1.1rem;
+    font-size: 1.125rem;
+    line-height: 1.35;
   }
 
   .share-dialog__summary span,
   .share-dialog__hint {
     margin: 0;
-    color: rgba(247, 241, 231, 0.62);
-    font-size: 0.8rem;
+    color: #fff;
+    font-size: 0.8125rem;
     line-height: 1.5;
   }
 
-  .share-dialog__summary .is-expired {
-    color: #ffb09f;
+  .share-dialog__notice {
+    margin: 0;
+    padding: 12px;
+    color: #fff;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+
+  .share-dialog__section,
+  .share-role-fieldset.share-dialog__section {
+    min-width: 0;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .share-dialog__link-section {
+    display: grid;
+    gap: 12px;
+    padding-bottom: 0;
+    border: 0;
+  }
+
+  .share-dialog__link-section h3 {
+    margin: 0;
+    font-size: 0.875rem;
+    font-weight: 700;
+    line-height: 1.3;
   }
 
   .share-expiration-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
-    flex-wrap: wrap;
   }
 
   .share-expiration-row select {
-    flex: 1;
-    min-width: 170px;
+    min-width: 0;
     min-height: 44px;
-    color: var(--text);
-    background: #191a1a;
-    border: 1px solid rgba(255, 252, 244, 0.2);
+    width: 100%;
+    box-sizing: border-box;
+    color-scheme: dark;
+    color: #fff;
+    background: #191919;
+    border: 1px solid var(--line-strong);
     border-radius: 8px;
     padding: 0 12px;
     font: inherit;
   }
 
   .share-expiration-row select:focus-visible {
-    outline: 2px solid rgba(247, 241, 231, 0.5);
+    outline: 2px solid #fff;
     outline-offset: 2px;
   }
 
@@ -3430,15 +3606,13 @@ onUnmounted(() => {
   }
 
   .share-dialog__actions {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
-    align-items: center;
   }
 
-  .share-dialog__actions .access-remove-button {
-    min-height: 44px;
-    padding: 0 12px;
+  .share-dialog__actions > button:only-child {
+    grid-column: 1 / -1;
   }
 
   .share-disable-confirmation {
@@ -3455,14 +3629,20 @@ onUnmounted(() => {
     line-height: 1.5;
   }
 
+  .share-disable-confirmation h4 {
+    margin: 0;
+    font-size: 0.9375rem;
+    line-height: 1.3;
+  }
+
   .share-dialog__body label {
     display: grid;
     gap: 9px;
   }
 
   .share-dialog__label {
-    color: rgba(247, 241, 231, 0.58);
-    font-size: 0.78rem;
+    color: #fff;
+    font-size: 0.8125rem;
     font-weight: 700;
   }
 
@@ -3476,8 +3656,9 @@ onUnmounted(() => {
 
   .share-role-fieldset legend {
     padding: 0;
-    color: rgba(247, 241, 231, 0.58);
-    font-size: 0.78rem;
+    margin-bottom: 10px;
+    color: #fff;
+    font-size: 0.875rem;
     font-weight: 700;
   }
 
@@ -3486,8 +3667,8 @@ onUnmounted(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 4px;
     padding: 4px;
-    background: rgba(255, 252, 244, 0.055);
-    border: 1px solid rgba(255, 252, 244, 0.14);
+    background: #191919;
+    border: 1px solid var(--line-strong);
     border-radius: 8px;
   }
 
@@ -3496,9 +3677,9 @@ onUnmounted(() => {
     align-items: center;
     justify-content: center;
     min-width: 0;
-    min-height: 38px;
+    min-height: 44px;
     padding: 8px 12px;
-    color: rgba(247, 241, 231, 0.62);
+    color: #fff;
     text-align: center;
     background: transparent;
     border: 1px solid transparent;
@@ -3507,32 +3688,29 @@ onUnmounted(() => {
   }
 
   .share-role-options button:hover:not(:disabled) {
-    color: rgba(247, 241, 231, 0.86);
-    background: rgba(255, 252, 244, 0.055);
+    background: #242424;
   }
 
   .share-role-options button:focus-visible {
-    outline: 2px solid rgba(247, 241, 231, 0.38);
+    outline: 2px solid #fff;
     outline-offset: 2px;
   }
 
   .share-role-options button.is-active {
-    color: var(--text);
-    background: rgba(247, 241, 231, 0.14);
-    border-color: rgba(247, 241, 231, 0.28);
-    box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
+    background: #303030;
+    border-color: rgba(255, 255, 255, 0.65);
   }
 
   .share-role-options button:disabled {
-    cursor: wait;
-    opacity: 0.7;
+    cursor: not-allowed;
+    opacity: 0.45;
   }
 
   .share-role-options span {
     min-width: 0;
     overflow-wrap: anywhere;
-    font-size: 0.82rem;
-    font-weight: 800;
+    font-size: 0.875rem;
+    font-weight: 600;
     line-height: 1.15;
   }
 
@@ -3545,12 +3723,19 @@ onUnmounted(() => {
   .share-dialog__body input {
     width: 100%;
     height: 44px;
+    min-width: 0;
+    box-sizing: border-box;
     padding: 0 14px;
-    color: var(--text);
-    background: rgba(255, 252, 244, 0.045);
-    border: 1px solid rgba(255, 252, 244, 0.18);
+    color: #fff;
+    background: #191919;
+    border: 1px solid var(--line-strong);
     border-radius: 8px;
     outline: 0;
+  }
+
+  .share-dialog__body input::placeholder {
+    color: #fff;
+    opacity: 0.65;
   }
 
   .share-copy-button {
@@ -3571,44 +3756,34 @@ onUnmounted(() => {
     stroke-width: 1.8;
   }
 
-  .share-link-skeleton {
-    position: relative;
+  .share-dialog__loading {
+    display: flex;
+    align-items: center;
     height: 44px;
-    overflow: hidden;
-    background: rgba(255, 252, 244, 0.055);
+    box-sizing: border-box;
+    padding: 0 14px;
+    color: #fff;
+    font-size: 0.875rem;
+    background: #191919;
     border: 1px solid var(--line-strong);
     border-radius: 8px;
   }
 
-  .share-link-skeleton::after {
-    position: absolute;
-    inset: 0;
-    content: "";
-    background: linear-gradient(
-      90deg,
-      transparent,
-      rgba(247, 241, 231, 0.12),
-      transparent
-    );
-    animation: share-skeleton-pass 1200ms ease-in-out infinite;
-    transform: translateX(-100%);
-  }
-
-  @keyframes share-skeleton-pass {
-    to {
-      transform: translateX(100%);
-    }
-  }
-
   .share-dialog__body input:focus {
-    border-color: rgba(247, 241, 231, 0.72);
-    box-shadow: 0 0 0 3px rgba(247, 241, 231, 0.1);
+    border-color: #fff;
+    outline: 2px solid #fff;
+    outline-offset: 2px;
+    box-shadow: none;
   }
 
   .share-dialog__message {
     margin: 0;
-    color: rgba(247, 241, 231, 0.68);
-    font-size: 0.86rem;
+    padding: 12px;
+    color: #fff;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
   }
 
   .leave-confirm-dialog__body p,
@@ -3643,8 +3818,14 @@ onUnmounted(() => {
 
   .share-dialog footer {
     display: flex;
+    flex-shrink: 0;
     justify-content: flex-end;
-    padding: 0;
+    padding: 16px 24px;
+    border-top: 1px solid var(--line);
+  }
+
+  .share-dialog footer .primary-action {
+    min-width: 100px;
   }
 
   .sr-only {
@@ -3828,5 +4009,37 @@ onUnmounted(() => {
       grid-template-columns: 1fr;
     }
 
+  }
+
+  @media (max-width: 560px) {
+    .share-dialog {
+      width: 100%;
+      max-height: calc(100dvh - 32px);
+    }
+
+    .share-dialog > header {
+      padding: 12px 18px;
+    }
+
+    .share-dialog__body {
+      padding: 18px;
+    }
+
+    .share-expiration-row,
+    .share-dialog__link-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .share-copy-button {
+      width: 100%;
+    }
+
+    .share-dialog footer {
+      padding: 12px 18px;
+    }
+
+    .share-dialog footer .primary-action {
+      width: 100%;
+    }
   }
 </style>
