@@ -1,6 +1,6 @@
 import type { PixelArtDocumentV2, PixelColor } from "../types";
+import { isValidImageDimensions } from "./document";
 
-const MAX_DIMENSION = 256;
 const MAX_PACKET_CHANGES = 1024;
 const MAX_LAYER_PIXELS = 65_536;
 const MAX_LAYERS = 128;
@@ -37,8 +37,6 @@ type ClientPreview = {
 
 const safeInteger = (value: unknown, minimum = 0): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
-const dimension = (value: unknown): value is number =>
-  safeInteger(value, 1) && value <= MAX_DIMENSION;
 const identifier = (value: unknown): value is string =>
   typeof value === "string" && value.length <= MAX_ID_LENGTH && value.trim().length > 0;
 const pixelColor = (value: unknown): value is PixelColor =>
@@ -103,7 +101,7 @@ export const createLivePixelPreviewSender = (
   const enqueue = (input: PreviewInput): number => {
     if (
       disposed || sequence === Number.MAX_SAFE_INTEGER || !ownRecord(input) ||
-      !dimension(input.width) || !dimension(input.height) ||
+      !isValidImageDimensions(input.width, input.height) ||
       !safeInteger(input.baseRevision) || !Array.isArray(input.layers) ||
       input.layers.length > MAX_LAYERS
     ) return sequence;
@@ -298,7 +296,7 @@ export const createLivePixelPreviewOverlay = () => {
     if (!identifier(clientId) || !ownRecord(payload)) return false;
     const keys = ["preview_protocol", "width", "height", "base_revision", "layer_id", "changes", "preview_sequence"];
     if (keys.some((key) => !Object.hasOwn(payload, key)) || payload.preview_protocol !== 1 ||
-      !dimension(payload.width) || !dimension(payload.height) ||
+      typeof payload.width !== "number" || typeof payload.height !== "number" || !isValidImageDimensions(payload.width, payload.height) ||
       !safeInteger(payload.base_revision) || payload.base_revision < minimumBaseRevision ||
       !identifier(payload.layer_id) || !safeInteger(payload.preview_sequence, 1) ||
       !Array.isArray(payload.changes) || !payload.changes.length ||

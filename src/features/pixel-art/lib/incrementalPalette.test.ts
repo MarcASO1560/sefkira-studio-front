@@ -9,6 +9,35 @@ const layer = (id: string, pixels: PixelColor[]): PixelLayer => ({
 });
 
 describe("createIncrementalUsedPaletteColors", () => {
+  it("indexes a dense 1024 × 1024 layer without a Set entry for each pixel", () => {
+    const pixels = Array<PixelColor>(1024 * 1024).fill("#112233");
+    const palette = createIncrementalUsedPaletteColors();
+    expect(palette.derive([layer("a", pixels)])).toEqual(["#112233"]);
+    const next = pixels.slice(); next[0] = "#FFFFFF";
+    palette.registerMutation({ layerId: "a", previousPixels: pixels, nextPixels: next,
+      changes: [{ index: 0, before: "#112233", after: "#FFFFFF" }] });
+    expect(palette.derive([layer("a", next)])).toEqual(["#FFFFFF", "#112233"]);
+  });
+
+  it("handles simultaneous removals, swaps and additions of first occurrences", () => {
+    const palette = createIncrementalUsedPaletteColors();
+    const colors: PixelColor[] = [null, "#FFFFFF", "#000000", "#12345680"];
+    let pixels = Array.from({ length: 256 }, (_, index) => colors[index % colors.length]!);
+    palette.derive([layer("a", pixels)]);
+    for (let step = 0; step < 1000; step += 1) {
+      const next = pixels.slice();
+      const changes = Array.from({ length: 8 }, (_, offset) => {
+        const index = (step * 17 + offset * 31) % pixels.length;
+        const after = colors[(step + offset + Math.floor(step / 256)) % colors.length]!;
+        next[index] = after;
+        return { index, before: pixels[index]!, after };
+      });
+      expect(palette.registerMutation({ layerId: "a", previousPixels: pixels, nextPixels: next, changes })).toBe(true);
+      pixels = next;
+      expect(palette.derive([layer("a", pixels)])).toEqual(deriveUsedPaletteColors([layer("a", pixels)]));
+    }
+  });
+
   it("derives every stored color with the same normalization and stable order", () => {
     const layers = [layer("a", [null, "#aabbcc", "invalid", "#AABBCC", "#AABBCCFF"]),
       layer("b", ["#12345680", "#aabbcc", "#abcdef"])];

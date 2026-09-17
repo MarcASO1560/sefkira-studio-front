@@ -1,7 +1,17 @@
 import type { PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
+import { hasNormalizedPixelArray, registerNormalizedPixelArray } from "./pixelBufferTrust";
 
 export const MIN_IMAGE_DIMENSION = 1;
-export const MAX_IMAGE_DIMENSION = 256;
+export const MAX_IMAGE_DIMENSION = 4096;
+export const MAX_IMAGE_PIXEL_COUNT = 4_194_304;
+export const MAX_IMAGE_DOCUMENT_PIXELS = 16_777_216;
+
+export const isValidImageDimensions = (width: unknown, height: unknown): boolean =>
+  typeof width === "number" && typeof height === "number" &&
+  Number.isInteger(width) && Number.isInteger(height) &&
+  width >= MIN_IMAGE_DIMENSION && width <= MAX_IMAGE_DIMENSION &&
+  height >= MIN_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION &&
+  width * height <= MAX_IMAGE_PIXEL_COUNT;
 
 export const clampImageDimension = (value: unknown, fallback = 32) => {
   const numericValue = typeof value === "number" ? value : Number(value);
@@ -51,8 +61,17 @@ export const normalizePalette = (value: unknown) => {
 };
 
 export const normalizePixels = (value: unknown, width: number, height: number) => {
+  if (width * height > MAX_IMAGE_PIXEL_COUNT) throw new RangeError(`Images may contain at most ${MAX_IMAGE_PIXEL_COUNT} pixels.`);
   const source = Array.isArray(value) ? value : [];
-  return Array.from({ length: width * height }, (_, index) => normalizePixelColor(source[index]));
+  const count = width * height;
+  if (source.length === count && hasNormalizedPixelArray(source)) return registerNormalizedPixelArray(source.slice());
+  const colors = new Map<unknown, PixelColor>();
+  return registerNormalizedPixelArray(Array.from({ length: count }, (_, index) => {
+    const value = source[index];
+    if (value === null || value === undefined) return null;
+    if (colors.has(value)) return colors.get(value)!;
+    const color = normalizePixelColor(value); colors.set(value, color); return color;
+  }));
 };
 
 export const createLayerId = () => {
@@ -83,6 +102,8 @@ export const createPixelArtDocument = (
 ): PixelArtDocumentV2 => {
   const normalizedWidth = clampImageDimension(width);
   const normalizedHeight = clampImageDimension(height);
+  if (!isValidImageDimensions(normalizedWidth, normalizedHeight)) throw new RangeError(`Images may contain at most ${MAX_IMAGE_PIXEL_COUNT} pixels.`);
+  if (Array.isArray(options.layers) && normalizedWidth * normalizedHeight * options.layers.length > MAX_IMAGE_DOCUMENT_PIXELS) throw new RangeError(`Images may contain at most ${MAX_IMAGE_DOCUMENT_PIXELS} layer pixels.`);
   const layers = Array.isArray(options.layers)
     ? options.layers
         .map((layer, index) =>
@@ -123,7 +144,7 @@ export const clonePixelArtDocument = (document: PixelArtDocumentV2): PixelArtDoc
   width: document.width,
   height: document.height,
   palette: [...document.palette],
-  layers: document.layers.map((layer) => ({ ...layer, pixels: [...layer.pixels] })),
+  layers: document.layers.map((layer) => ({ ...layer, pixels: hasNormalizedPixelArray(layer.pixels) ? registerNormalizedPixelArray(layer.pixels.slice()) : [...layer.pixels] })),
 });
 
 type RgbaColor = { red: number; green: number; blue: number; alpha: number };

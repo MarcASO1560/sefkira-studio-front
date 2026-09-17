@@ -1,6 +1,7 @@
 import { reactive } from "vue";
 
 import type { ImageResizeAnchor } from "../types";
+import { MIN_IMAGE_ZOOM, MAX_IMAGE_ZOOM } from "../lib/zoomLimits";
 import {
   IMAGE_GRID_LINE_STYLES,
   type ImageGridLineStyle,
@@ -54,8 +55,8 @@ export const DEFAULT_IMAGE_PREFERENCES: Readonly<ImagePreferences> = Object.free
   resizeAnchor: "center",
 });
 
-const MIN_ZOOM = 0.25;
-const MAX_ZOOM = 64;
+const MIN_ZOOM = MIN_IMAGE_ZOOM;
+const MAX_ZOOM = MAX_IMAGE_ZOOM;
 const MIN_SUBDIVISION = 1;
 const MAX_SUBDIVISION = 64;
 const IMAGE_GRID_LINE_STYLE_SET: ReadonlySet<string> = new Set(IMAGE_GRID_LINE_STYLES);

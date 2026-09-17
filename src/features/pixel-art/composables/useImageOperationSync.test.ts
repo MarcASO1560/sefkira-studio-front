@@ -4,8 +4,10 @@ import { clonePixelArtDocument, createPixelArtDocument, createPixelLayer } from 
 import { applyImageActions, rebaseImageOperationActions, type ImageOperation, type ImageOperationTransform } from "../lib/imageOperations";
 import type { ImageOperationStore, StoredImageOperationQueue } from "../lib/imageOperationStore";
 import { ImageOperationHttpError, type ImageOperationTransport } from "../lib/imageOperationsApi";
+import { compactPixelArtDocument } from "../lib/compactPixels";
+import { parsePixelArtResourceData } from "../lib/migrations";
 import type { PixelArtDocumentV2 } from "../types";
-import { useImageOperationSync } from "./useImageOperationSync";
+import { useImageOperationSync, type ImageOperationDocumentContext } from "./useImageOperationSync";
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const deferred = <T>() => {
@@ -83,7 +85,7 @@ const sharedServer = () => {
 };
 const client = (store: ImageOperationStore, transport: ImageOperationTransport, extra: Partial<Parameters<typeof useImageOperationSync>[0]> = {}) => {
   let document = baseDocument();
-  const onDocument = vi.fn((value: PixelArtDocumentV2) => { document = clonePixelArtDocument(value); });
+  const onDocument = vi.fn((value: PixelArtDocumentV2, _context: ImageOperationDocumentContext) => { document = clonePixelArtDocument(value); });
   const sync = useImageOperationSync({ projectId: "project", resourceId: "resource", userId: "user", store, transport, onDocument, ...extra });
   return { sync, onDocument, get document() { return clonePixelArtDocument(document); } };
 };
@@ -92,13 +94,48 @@ describe("durable image operation synchronization", () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
+  it("persists a compact 1024-square draft and recovers only its pending sparse delta over newer remote pixels", async () => {
+    const initial = createPixelArtDocument(1024, 1024, { layers: [createPixelLayer(1024, 1024, { id: "large" })] });
+    const remote = server(); remote.replace(resource(initial)); const disk = memoryStore();
+    const local = client(disk.store, remote.transport, { isOnline: () => false });
+    await local.sync.start({ ...remote.current, data: { pixel_art: compactPixelArtDocument(initial) } });
+    const changes = Object.freeze([Object.freeze({ index: 1_048_575, before: null, after: "#12345680" })]);
+    await local.sync.schedulePixels(1024, 1024, "large", changes, { historyGroupId: "large-stroke" });
+    expect(disk.saved?.operations[0]?.actions).toEqual([{ type: "pixels", layer_id: "large", changes: [[1_048_575, "#12345680"]] }]);
+    expect(Array.isArray(disk.saved?.localDocument?.layers[0]?.pixels)).toBe(false);
+    expect(Array.isArray((disk.saved?.resource?.data.pixel_art as ReturnType<typeof compactPixelArtDocument>).layers[0]!.pixels)).toBe(false);
+    expect(JSON.stringify(disk.saved).length).toBeLessThan(40_000);
+    expect(parsePixelArtResourceData({ pixel_art: disk.saved!.localDocument }).document.layers[0]!.pixels[1_048_575]).toBe("#12345680");
+    const originalPacket = clone(disk.saved!.operations[0]); local.sync.dispose();
+    const updated = clonePixelArtDocument(initial); updated.layers[0]!.pixels[1_000_000] = "#00FF00"; remote.replace(resource(updated, 1));
+    const send = remote.transport.sendOperation;
+    remote.transport.sendOperation = async (operation) => {
+      const acknowledgement = await send(operation) as { operation_id: string; applied_revision: number; resource: ProjectResourceDetail };
+      return { ...acknowledgement, resource: { ...acknowledgement.resource, data: { pixel_art: compactPixelArtDocument(acknowledgement.resource.data.pixel_art as PixelArtDocumentV2) } } };
+    };
+    const recovered = client(disk.store, remote.transport); await recovered.sync.start(remote.current); await recovered.sync.flush();
+    expect(recovered.document.layers[0]!.pixels[1_048_575]).toBe("#12345680"); expect(recovered.document.layers[0]!.pixels[1_000_000]).toBe("#00FF00");
+    expect(remote.sendOperation.mock.calls[0]![0].actions).toEqual(originalPacket!.actions);
+    expect(recovered.sync.status.value).toBe("saved"); expect(disk.saved?.operations).toEqual([]); recovered.sync.dispose();
+  });
+
+  it("splits sparse brush/fill deltas above one action's quota without truncating high pixel indexes", async () => {
+    const initial = createPixelArtDocument(1024, 1024, { layers: [createPixelLayer(1024, 1024, { id: "large" })] });
+    const remote = server(); remote.replace(resource(initial)); const disk = memoryStore(); const local = client(disk.store, remote.transport, { isOnline: () => false }); await local.sync.start(remote.current);
+    await local.sync.schedulePixels(1024, 1024, "large", Array.from({ length: 70_000 }, (_, index) => ({ index: index + 100_000, before: null, after: "#FF0000" })));
+    const actions = disk.saved!.operations.flatMap((operation) => operation.actions); const edits = actions.flatMap((action) => action.type === "pixels" ? action.changes : []);
+    expect(actions).toHaveLength(2); expect(edits).toHaveLength(70_000); expect(edits[0]![0]).toBe(100_000); expect(edits.at(-1)![0]).toBe(169_999);
+    expect(local.sync.status.value).toBe("offline"); expect(local.sync.errorMessage.value).toBe(""); local.sync.dispose();
+  });
+
   it("queues normalized sparse brush deltas on a 256-square canvas without changing caller data", async () => {
     const initial = createPixelArtDocument(256, 256, { layers: [createPixelLayer(256, 256, { id: "large" }), createPixelLayer(256, 256, { id: "untouched" })] });
     const remote = server(); remote.replace(resource(initial)); const disk = memoryStore(); const local = client(disk.store, remote.transport, { isOnline: () => false }); await local.sync.start(remote.current);
     const changes = Object.freeze([Object.freeze({ index: 65535, before: null, after: "#ff0000" }), Object.freeze({ index: 0, after: "#00ff00" })]);
     await local.sync.schedulePixels(256, 256, "large", changes, { historyGroupId: "brush", previewSequence: 2 });
     expect(disk.saved?.operations).toHaveLength(1); expect(disk.saved?.operations[0]).toMatchObject({ base_revision: 0, width: 256, height: 256, history_group_id: "brush", actions: [{ type: "pixels", layer_id: "large", changes: [[0, "#00FF00"], [65535, "#FF0000"]] }] });
-    expect(disk.saved?.localDocument?.layers[0]?.pixels[0]).toBe("#00FF00"); expect(disk.saved?.localDocument?.layers[0]?.pixels[65535]).toBe("#FF0000"); expect(disk.saved?.localDocument?.layers[1]?.pixels.every((pixel) => pixel === null)).toBe(true);
+    const draft = parsePixelArtResourceData({ pixel_art: disk.saved!.localDocument }).document;
+    expect(draft.layers[0]?.pixels[0]).toBe("#00FF00"); expect(draft.layers[0]?.pixels[65535]).toBe("#FF0000"); expect(draft.layers[1]?.pixels.every((pixel) => pixel === null)).toBe(true);
     expect(initial.layers[0]?.pixels[0]).toBeNull(); expect(changes[0]?.after).toBe("#ff0000"); expect(remote.sendOperation).not.toHaveBeenCalled(); local.sync.dispose();
   });
 
@@ -543,6 +580,41 @@ describe("durable image operation synchronization", () => {
 describe("semantic resize and authoritative shared history", () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it("retains an increased 256-square resolution while a preceding sparse stroke POST is in flight", async () => {
+    const remote = sharedServer(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current);
+    const send = remote.transport.sendOperation; const gate = deferred<void>(); remote.transport.sendOperation = async (operation) => { if (operation.actions[0]?.type === "pixels") await gate.promise; return send(operation); };
+    const painted = clone(local.document); painted.layers[0]!.pixels[0] = "#FF0000"; await local.sync.schedulePixels(2, 2, "layer", [{ index: 0, before: null, after: "#FF0000" }]); const flushing = local.sync.flush(); await settle();
+    const resize = { width: 256, height: 256, anchor: "bottom-right" as const }; const resized = applyImageActions(painted, [{ type: "resize", ...resize }]); await local.sync.schedule(resized, { resize });
+    expect(disk.saved?.operations).toHaveLength(2); expect(disk.saved?.localDocument?.width).toBe(256); gate.resolve(); await flushing;
+    expect(local.sync.status.value).toBe("saved"); expect(local.document.width).toBe(256); expect(local.document.height).toBe(256); expect(local.document.layers[0]?.pixels).toHaveLength(65536); expect(local.document.layers[0]?.pixels[254 * 256 + 254]).toBe("#FF0000"); expect(remote.current.data.pixel_art).toEqual(resized); local.sync.dispose();
+  });
+
+  it("keeps the last of consecutive resolution increases queued during a pending journal transaction", async () => {
+    const remote = sharedServer(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current);
+    const write = disk.store.write; const gate = deferred<void>(); let held = false; disk.store.write = async (queue) => { if (!held) { held = true; await gate.promise; } await write(queue); };
+    let desired = clone(local.document); const firstResize = { width: 3, height: 3, anchor: "top-left" as const }; desired = applyImageActions(desired, [{ type: "resize", ...firstResize }]); const first = local.sync.schedule(desired, { resize: firstResize }); await settle();
+    const nextResize = { width: 32, height: 32, anchor: "top-left" as const }; desired = applyImageActions(desired, [{ type: "resize", ...nextResize }]); const next = local.sync.schedule(desired, { resize: nextResize });
+    const lastResize = { width: 256, height: 256, anchor: "top-left" as const }; desired = applyImageActions(desired, [{ type: "resize", ...lastResize }]); const last = local.sync.schedule(desired, { resize: lastResize });
+    expect(local.sync.pendingCount.value).toBe(3); gate.resolve(); await Promise.all([first, next, last]); await local.sync.flush();
+    expect(remote.sendOperation.mock.calls.map(([operation]) => operation.actions)).toEqual([[{ type: "resize", ...firstResize }], [{ type: "resize", ...nextResize }], [{ type: "resize", ...lastResize }]]); expect(local.sync.status.value).toBe("saved"); expect(local.document.width).toBe(256); expect(remote.current.data.pixel_art).toEqual(desired); local.sync.dispose();
+  });
+
+  it("updates only width while height remains unchanged and permits a subsequent sparse stroke", async () => {
+    const remote = sharedServer(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current);
+    const resize = { width: 256, height: 2, anchor: "center" as const }; const resized = applyImageActions(local.document, [{ type: "resize", ...resize }]); await local.sync.schedule(resized, { resize }); await local.sync.flush();
+    await local.sync.schedulePixels(256, 2, "layer", [{ index: 511, before: null, after: "#00FF00" }]); await local.sync.flush();
+    expect(local.sync.status.value).toBe("saved"); expect(local.document.width).toBe(256); expect(local.document.height).toBe(2); expect(local.document.layers[0]?.pixels[511]).toBe("#00FF00"); local.sync.dispose();
+  });
+
+  it("publishes an unchanged-size own sparse stroke ACK when the server adds its color to the palette", async () => {
+    const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);
+    const send = remote.transport.sendOperation; remote.transport.sendOperation = async (operation) => { const acknowledgement = await send(operation) as { resource: ProjectResourceDetail }; (acknowledgement.resource.data.pixel_art as PixelArtDocumentV2).palette = ["#FF0000"]; return acknowledgement; };
+    await local.sync.schedulePixels(2, 2, "layer", [{ index: 0, before: null, after: "#FF0000" }]); await local.sync.flush();
+    const [document, context] = local.onDocument.mock.calls.at(-1)!;
+    expect(document.width).toBe(2); expect(document.height).toBe(2); expect(document.palette).toEqual(["#FF0000"]); expect(context.previousDocument?.palette).toEqual([]);
+    expect(document.layers[0]?.pixels).toEqual(context.previousDocument?.layers[0]?.pixels); expect(context.source).toBe("ack"); local.sync.dispose();
+  });
 
   it("uses one POST and zero state GETs per healthy shared Undo or Redo", async () => {
     const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);

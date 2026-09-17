@@ -23,6 +23,7 @@ import {
   type PixelColor,
   type Point,
 } from "./drawing";
+import { hasNormalizedPixelArray, registerNormalizedPixelArray } from "./pixelBufferTrust";
 
 const makeBuffer = (
   width: number,
@@ -172,6 +173,34 @@ describe("pixel mutations", () => {
       mutation = paintPixels(mutation.buffer, [{ x: 1, y: 0 }], "#111111"); followingCopies = from.mock.calls.length;
     } finally { from.mockRestore(); }
     expect(firstCopies).toBe(1); expect(followingCopies).toBe(0); expect(mutation.buffer.pixels.slice(0, 3)).toEqual(["#ffffff", "#111111", null]); expect(mutation.changes).toHaveLength(1);
+  });
+
+  it("uses the native-copy path immediately for a validated canonical 1024 × 1024 buffer", () => {
+    const pixels = Array<PixelColor>(1024 * 1024).fill(null);
+    expect(registerNormalizedPixelArray(pixels)).toBe(pixels);
+    const source = makeBuffer(1024, 1024, pixels);
+    const from = vi.spyOn(Array, "from");
+    let mutation!: ReturnType<typeof paintPixels>;
+    let normalizingCopies = -1;
+    try {
+      mutation = paintPixels(source, [{ x: 1023, y: 1023 }], "#AABBCC");
+      normalizingCopies = from.mock.calls.length;
+    } finally {
+      from.mockRestore();
+    }
+    expect(normalizingCopies).toBe(0);
+    expect(hasNormalizedPixelArray(mutation.buffer.pixels)).toBe(true);
+    expect(mutation.buffer.pixels).not.toBe(pixels);
+    expect(mutation.buffer.pixels[1024 * 1024 - 1]).toBe("#AABBCC");
+    expect(pixels[1024 * 1024 - 1]).toBeNull();
+    expect(mutation.changes).toEqual([{ index: 1024 * 1024 - 1, point: { x: 1023, y: 1023 }, before: null, after: "#AABBCC" }]);
+  });
+
+  it("still normalizes mismatched legacy dimensions even when an array producer is registered", () => {
+    const source = makeBuffer(2, 2, registerNormalizedPixelArray(["A"]));
+    const mutation = paintPixels(source, [{ x: 1, y: 1 }], "B");
+    expect(mutation.buffer.pixels).toEqual(["A", null, null, "B"]);
+    expect(source.pixels).toEqual(["A"]);
   });
 
   it("does not copy the canvas pixel array for an unchanged or entirely clipped brush stamp", () => {

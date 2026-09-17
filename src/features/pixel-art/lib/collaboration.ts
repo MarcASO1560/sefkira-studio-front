@@ -9,6 +9,7 @@ import type {
 } from "../types";
 import { parsePixelArtResourceData, PixelArtMigrationError } from "./migrations";
 import { PIXEL_ART_PASTEL_PALETTE } from "./palette";
+import { isValidImageDimensions, MAX_IMAGE_DIMENSION } from "./document";
 
 /** Background documents still synchronize; only an active cursor needs focus. */
 export const canSendCollaborativeActivity = (
@@ -98,7 +99,9 @@ const COLLABORATIVE_SELECTION_MODES = new Set<CollaborativeSelectionMode>([
   "subtract",
   "intersect",
 ]);
-const MAX_CANVAS_DIMENSION = 256;
+// Leave room for editor-activity metadata beneath the smallest Broadcast limit.
+// Oversized masks are only simplified on the wire, never in the local editor.
+export const MAX_COLLABORATIVE_SELECTION_MASK_BYTES = 200 * 1024;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -108,7 +111,7 @@ const isDimension = (value: unknown): value is number =>
   typeof value === "number" &&
   Number.isInteger(value) &&
   value >= 1 &&
-  value <= MAX_CANVAS_DIMENSION;
+  value <= MAX_IMAGE_DIMENSION;
 
 const isPixelColor = (value: unknown): value is PixelColor =>
   value === null || (typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value));
@@ -122,7 +125,8 @@ const isSelectionMode = (value: unknown): value is CollaborativeSelectionMode =>
   COLLABORATIVE_SELECTION_MODES.has(value as CollaborativeSelectionMode);
 
 const isSelectionBounds = (value: unknown): value is CollaborativeSelectionBounds => {
-  if (!isRecord(value) || !isDimension(value.width) || !isDimension(value.height)) {
+  if (!isRecord(value) || !isDimension(value.width) || !isDimension(value.height) ||
+    !isValidImageDimensions(value.width, value.height)) {
     return false;
   }
   if (
@@ -135,12 +139,12 @@ const isSelectionBounds = (value: unknown): value is CollaborativeSelectionBound
   }
 
   // Rectangle selections may temporarily straddle a canvas edge while they
-  // are moved. They must still overlap some possible 256 x 256 canvas.
+  // are moved. They must still overlap some supported canvas.
   return (
     value.x > -value.width &&
-    value.x < MAX_CANVAS_DIMENSION &&
+    value.x < MAX_IMAGE_DIMENSION &&
     value.y > -value.height &&
-    value.y < MAX_CANVAS_DIMENSION
+    value.y < MAX_IMAGE_DIMENSION
   );
 };
 
@@ -157,6 +161,7 @@ const selectedMaskBounds = (
   data: ArrayLike<number>,
   width: number,
   height: number,
+  validateValues = false,
 ): CollaborativeSelectionBounds | null => {
   let minX = width;
   let minY = height;
@@ -164,6 +169,9 @@ const selectedMaskBounds = (
   let maxY = -1;
 
   for (let index = 0; index < data.length; index += 1) {
+    if (validateValues && data[index] !== 0 && data[index] !== 1) {
+      throw new TypeError("Selection mask values must be either 0 or 1.");
+    }
     if (data[index] !== 1) continue;
     const x = index % width;
     const y = Math.floor(index / width);
@@ -205,8 +213,8 @@ const decodeBase64 = (encoded: string, expectedBytes: number): Uint8Array | null
 const encodeSelectionMask = (
   mask: NonNullable<CollaborativeSelectionInput["mask"]>,
 ): SerializedCollaborativeSelection["mask"] => {
-  if (!isDimension(mask.width) || !isDimension(mask.height)) {
-    throw new RangeError("Selection mask dimensions must be between 1 and 256 pixels.");
+  if (!isDimension(mask.width) || !isDimension(mask.height) || !isValidImageDimensions(mask.width, mask.height)) {
+    throw new RangeError("Selection mask dimensions exceed the supported canvas limits.");
   }
 
   const pixelCount = mask.width * mask.height;
@@ -237,7 +245,9 @@ const readSelectionMask = (value: unknown): CollaborativeSelectionMask | null =>
     value.encoding !== "bitset-v1" ||
     !isDimension(value.width) ||
     !isDimension(value.height) ||
-    typeof value.data !== "string"
+    !isValidImageDimensions(value.width, value.height) ||
+    typeof value.data !== "string" ||
+    value.data.length > MAX_COLLABORATIVE_SELECTION_MASK_BYTES
   ) {
     return null;
   }
@@ -270,7 +280,7 @@ export const serializeCollaborativeSelection = (
 ): SerializedCollaborativeSelection | null => {
   if (selection === null) return null;
   if (!isSelectionBounds(selection)) {
-    throw new RangeError("Selection bounds must overlap a canvas up to 256 x 256 pixels.");
+    throw new RangeError("Selection bounds must overlap a supported canvas.");
   }
 
   const kind = selection.kind ?? "rectangle";
@@ -293,11 +303,21 @@ export const serializeCollaborativeSelection = (
     return serialized;
   }
 
-  const mask = encodeSelectionMask(selection.mask);
+  const pixelCount = selection.mask.width * selection.mask.height;
+  if (!isValidImageDimensions(selection.mask.width, selection.mask.height)) {
+    throw new RangeError("Selection mask dimensions exceed the supported canvas limits.");
+  }
+  if (selection.mask.data.length !== pixelCount) {
+    throw new RangeError("Selection mask data must contain one value per canvas pixel.");
+  }
+  const encodedByteLength = Math.ceil(Math.ceil(pixelCount / 8) / 3) * 4;
+  const useBoundsOnly = encodedByteLength > MAX_COLLABORATIVE_SELECTION_MASK_BYTES;
+  const mask = useBoundsOnly ? undefined : encodeSelectionMask(selection.mask);
   const bounds = selectedMaskBounds(
     selection.mask.data,
     selection.mask.width,
     selection.mask.height,
+    useBoundsOnly,
   );
   if (!bounds || !sameSelectionBounds(bounds, selection)) {
     throw new RangeError("Selection bounds must match the selected pixels in its mask.");
@@ -309,7 +329,7 @@ export const serializeCollaborativeSelection = (
     throw new RangeError("Selection mask bounds must match its selected pixels.");
   }
 
-  return { ...serialized, mask };
+  return useBoundsOnly ? { ...serialized, kind: "rectangle" } : { ...serialized, mask };
 };
 
 export const readCollaborativeCursor = (
@@ -320,6 +340,7 @@ export const readCollaborativeCursor = (
     activity.kind !== "cursor" ||
     !isDimension(payload.width) ||
     !isDimension(payload.height) ||
+    !isValidImageDimensions(payload.width, payload.height) ||
     typeof payload.visible !== "boolean" ||
     typeof payload.tool !== "string"
   ) {
@@ -368,6 +389,7 @@ export const readCollaborativePixelPatch = (
     !payload.layer_id ||
     !isDimension(payload.width) ||
     !isDimension(payload.height) ||
+    !isValidImageDimensions(payload.width, payload.height) ||
     !Array.isArray(payload.changes)
   ) {
     return null;

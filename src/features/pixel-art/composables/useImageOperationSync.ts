@@ -1,7 +1,9 @@
 import { computed, ref } from "vue";
 import type { ProjectResourceDetail } from "../../../lib/api";
 import type { PixelArtDocumentV2, PixelColor, SaveStatus } from "../types";
-import { clonePixelArtDocument, normalizePixelColor } from "../lib/document";
+import { clonePixelArtDocument, isValidImageDimensions, normalizePixelColor, MAX_IMAGE_PIXEL_COUNT } from "../lib/document";
+import { compactPixelArtDocument } from "../lib/compactPixels";
+import { registerNormalizedPixelArray } from "../lib/pixelBufferTrust";
 import { parsePixelArtResourceData } from "../lib/migrations";
 import { applyImageActions, diffImageDocuments, ImageOperationConflict, rebaseImageOperationActions, splitImageActionBatches, validateImageOperation, type ImageOperation, type ImageOperationTransform, type ImageResizeOperation, type SharedImageHistory } from "../lib/imageOperations";
 import { claimImageOperationSession, createImageOperationId, createIndexedDbImageOperationStore, type ImageOperationStore, type StoredImageOperationQueue } from "../lib/imageOperationStore";
@@ -128,7 +130,11 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     // The canonical resource is replaced, never edited by this synchronizer.
     // Keep a private snapshot detached from the resource exposed to UI callbacks
     // and copy it once per accepted snapshot, not once per pointer frame.
-    if (journalCanonical?.source !== canonical) journalCanonical = { source: canonical, snapshot: copy(canonical) };
+    if (journalCanonical?.source !== canonical) {
+      const snapshot = copy({ ...canonical, data: { ...canonical.data, pixel_art: null } }) as ProjectResourceDetail;
+      snapshot.data.pixel_art = compactPixelArtDocument(resourceDocument(canonical));
+      journalCanonical = { source: canonical, snapshot };
+    }
     return journalCanonical.snapshot;
   };
   const persist = () => {
@@ -150,7 +156,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         // observed is private and updated by copy-on-write. A store's asynchronous
         // transaction may safely retain this exact frame while later pointers
         // create another one; it still stores the complete recoverable local copy.
-        await store!.write({ version: 1, resource: canonicalForJournal(), operations: pending, transforms: copy(transforms), history: copy(sharedHistory.value), ...((pending.length || unencodableLocalChanges) && observed ? { localDocument: observed, localDocumentUnencodable: unencodableLocalChanges, localDocumentRevision: observedCanonicalRevision } : {}) });
+        await store!.write({ version: 1, resource: canonicalForJournal(), operations: pending, transforms: copy(transforms), history: copy(sharedHistory.value), ...((pending.length || unencodableLocalChanges) && observed ? { localDocument: compactPixelArtDocument(observed), localDocumentUnencodable: unencodableLocalChanges, localDocumentRevision: observedCanonicalRevision } : {}) });
         entries = entries.filter((entry) => !acknowledgedIds.has(entry.operation.operation_id));
         for (const entry of entries) if (savedPayloads.get(entry.operation.operation_id) === JSON.stringify(entry.operation)) entry.durable = true;
         for (const checkpoint of persistenceCheckpoints) {
@@ -246,10 +252,11 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     await initializeStore();
     verifyScope();
     let recovered: StoredImageOperationQueue | null;
+    let recoveredDocument: PixelArtDocumentV2 | null = null;
     try {
       recovered = await store!.read();
       if (recovered && (recovered.version !== 1 || !Array.isArray(recovered.operations) || !recovered.operations.every(validateImageOperation))) throw new Error("Your saved pending-change queue is invalid. It has been preserved for recovery.");
-      if (recovered?.localDocument) parsePixelArtResourceData({ pixel_art: recovered.localDocument });
+      if (recovered?.localDocument) recoveredDocument = parsePixelArtResourceData({ pixel_art: recovered.localDocument }).document;
       if (recovered?.transforms) validateImageOperationTransforms(recovered.transforms);
       if (recovered?.history) validateSharedImageHistory(recovered.history);
     } catch (error) {
@@ -275,7 +282,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     isReady.value = true;
     if (recovered?.localDocument) {
       unencodableLocalChanges = recovered.localDocumentUnencodable === true || recovered.localDocumentUnencodable === undefined && !entries.length;
-      observed = clonePixelArtDocument(recovered.localDocument);
+      observed = clonePixelArtDocument(recoveredDocument!);
       observedCanonicalRevision = recovered.localDocumentRevision ?? (entries.length ? Math.min(...entries.map((entry) => entry.operation.base_revision)) : canonical.revision);
       options.onDocument(clonePixelArtDocument(observed), { resource: canonical, previousDocument: null, source: "recovery", pendingCount: entries.length });
       syncPending();
@@ -462,10 +469,10 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     if (disposed || !isReady.value || !canonical || !observed) return;
     try {
       verifyScope();
-      if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || width > 256 || height < 1 || height > 256 || width !== observed.width || height !== observed.height) throw new Error("The pixel changes do not match this tab's observed canvas dimensions.");
+      if (!isValidImageDimensions(width, height) || width !== observed.width || height !== observed.height) throw new Error("The pixel changes do not match this tab's observed canvas dimensions.");
       const layerIndex = observed.layers.findIndex((layer) => layer.id === layerId);
       if (typeof layerId !== "string" || !layerId.trim() || layerIndex < 0) throw new Error("The pixel changes do not match an observed image layer.");
-      if (!Array.isArray(changes) || changes.length > 65536) throw new Error("The local pixel changes are invalid.");
+      if (!Array.isArray(changes) || changes.length > MAX_IMAGE_PIXEL_COUNT) throw new Error("The local pixel changes are invalid.");
       const layer = observed.layers[layerIndex]!;
       const desired = new Map<number, PixelColor>();
       for (const change of changes) {
@@ -488,7 +495,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
       if (!tuples.length) return;
       tuples.sort((left, right) => left[0] - right[0]);
       const before = observed;
-      const pixels = layer.pixels.slice();
+      const pixels = registerNormalizedPixelArray(layer.pixels.slice());
       for (const [index, after] of tuples) pixels[index] = after;
       const layers = observed.layers.slice();
       layers[layerIndex] = { ...layer, pixels };

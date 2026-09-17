@@ -1,6 +1,7 @@
 import { apiUrl, type ProjectResourceDetail } from "../../../lib/api";
 import { parsePixelArtResourceData } from "./migrations";
-import type { ImageOperation, ImageOperationTransform, SharedImageHistory } from "./imageOperations";
+import { toImageOperationPacket, type ImageOperation, type ImageOperationTransform, type SharedImageHistory } from "./imageOperations";
+import { isValidImageDimensions } from "./document";
 
 export type ImageOperationAcknowledgement = {
   operation_id: string;
@@ -23,7 +24,7 @@ export const validateSharedImageHistory = (value: unknown): SharedImageHistory =
 export const validateImageOperationTransforms = (value: unknown): ImageOperationTransform[] => {
   if (!Array.isArray(value)) throw new Error("The server returned invalid shared coordinate history.");
   for (const event of value as ImageOperationTransform[]) {
-    if (!event || !Number.isSafeInteger(event.revision) || event.revision < 0 || ![event.from_width, event.from_height, event.to_width, event.to_height].every((dimension) => Number.isInteger(dimension) && dimension >= 1 && dimension <= 256) || !Number.isInteger(event.offset_x) || !Number.isInteger(event.offset_y) || event.operation_id !== undefined && typeof event.operation_id !== "string" || event.user_id !== undefined && event.user_id !== null && typeof event.user_id !== "string") throw new Error("The server returned malformed shared coordinate history.");
+    if (!event || !Number.isSafeInteger(event.revision) || event.revision < 0 || !isValidImageDimensions(event.from_width, event.from_height) || !isValidImageDimensions(event.to_width, event.to_height) || !Number.isInteger(event.offset_x) || !Number.isInteger(event.offset_y) || event.operation_id !== undefined && typeof event.operation_id !== "string" || event.user_id !== undefined && event.user_id !== null && typeof event.user_id !== "string") throw new Error("The server returned malformed shared coordinate history.");
   }
   if (new Set(value.map((event) => event.revision)).size !== value.length) throw new Error("The server returned duplicate shared coordinate revisions.");
   return value as ImageOperationTransform[];
@@ -101,8 +102,7 @@ export const createImageOperationTransport = (projectId: string, resourceId: str
     async fetchResource() { return normalizeImageOperationResource(await request("", { cache: "no-store" }), projectId, resourceId); },
     async fetchState(sinceRevision) { return validateImageOperationState(await request(`/image-operations?since_revision=${encodeURIComponent(sinceRevision)}`, { cache: "no-store" }), projectId, resourceId); },
     sendOperation(operation) {
-      const { operation_id, base_revision, width, height, actions, history_group_id, coordinate_after_operation_id } = operation;
-      return request("/image-operations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation_id, base_revision, width, height, actions, ...(history_group_id ? { history_group_id } : {}), ...(coordinate_after_operation_id ? { coordinate_after_operation_id } : {}) }) });
+      return request("/image-operations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(toImageOperationPacket(operation)) });
     },
   };
 };

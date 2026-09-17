@@ -6,6 +6,7 @@ import {
   createPixelArtDocument,
   normalizePalette,
   normalizePixelColor,
+  isValidImageDimensions,
 } from "./document";
 import type { PixelArtDocumentV2, PixelColor } from "../types";
 
@@ -21,6 +22,14 @@ const referenceComposite = (document: PixelArtDocumentV2) => {
 };
 
 describe("pixel-art document", () => {
+  it("supports 1024-square documents, bounded 2048-square/4096-wide canvases and rejects excess area before allocation", () => {
+    expect(createPixelArtDocument(1024, 1024).layers[0]!.pixels).toHaveLength(1_048_576);
+    expect(isValidImageDimensions(2048, 2048)).toBe(true); expect(isValidImageDimensions(4096, 1024)).toBe(true);
+    expect(isValidImageDimensions(4096, 4096)).toBe(false); expect(isValidImageDimensions(4097, 1)).toBe(false);
+    expect(() => createPixelArtDocument(4096, 4096)).toThrow("at most 4194304 pixels");
+    const layers = Array.from({ length: 17 }, (_, index) => ({ id: `layer-${index}`, name: "Layer", visible: true, locked: false, opacity: 1, pixels: [null] }));
+    expect(() => createPixelArtDocument(1024, 1024, { layers })).toThrow("at most 16777216 layer pixels");
+  });
   it("creates a valid document with one transparent layer", () => {
     const document = createPixelArtDocument(4, 3);
 

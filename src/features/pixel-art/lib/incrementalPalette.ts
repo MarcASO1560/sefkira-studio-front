@@ -3,78 +3,33 @@ import { normalizePixelColor } from "./document";
 
 type PaletteLayer = Readonly<Pick<PixelLayer, "id" | "pixels">>;
 type PalettePixelChange = Readonly<{ index: number; before?: PixelColor; after: PixelColor }>;
-type ColorUsage = { indexes: Set<number>; heap: number[] };
+type ColorUsage = { count: number; firstIndex: number };
 type LayerIndex = {
   pixels: readonly PixelColor[];
   colors: Map<string, ColorUsage>;
-  heapEntries: number;
   orderedColors: string[];
   dirty: boolean;
 };
 
-const siftDown = (heap: number[], start: number) => {
-  let index = start;
-  while (index * 2 + 1 < heap.length) {
-    const left = index * 2 + 1;
-    const right = left + 1;
-    const smallest = right < heap.length && heap[right]! < heap[left]! ? right : left;
-    if (heap[index]! <= heap[smallest]!) break;
-    [heap[index], heap[smallest]] = [heap[smallest]!, heap[index]!];
-    index = smallest;
-  }
-};
-
-const heapPush = (heap: number[], value: number) => {
-  heap.push(value);
-  let index = heap.length - 1;
-  while (index > 0) {
-    const parent = Math.floor((index - 1) / 2);
-    if (heap[parent]! <= heap[index]!) break;
-    [heap[parent], heap[index]] = [heap[index]!, heap[parent]!];
-    index = parent;
-  }
-};
-
-const minimumIndex = (layer: LayerIndex, usage: ColorUsage) => {
-  while (usage.heap.length && !usage.indexes.has(usage.heap[0]!)) {
-    const last = usage.heap.pop()!;
-    layer.heapEntries -= 1;
-    if (usage.heap.length) {
-      usage.heap[0] = last;
-      siftDown(usage.heap, 0);
-    }
-  }
-  return usage.heap[0]!;
-};
-
-const compactHeaps = (layer: LayerIndex) => {
-  // Lazy deletions (including remove/re-add of the same index) cannot grow
-  // indefinitely over long strokes. Rebuilds are amortized across N updates.
-  if (layer.heapEntries <= layer.pixels.length * 2 + 64) return;
-  layer.heapEntries = 0;
-  for (const usage of layer.colors.values()) {
-    usage.heap = [...usage.indexes];
-    for (let index = Math.floor(usage.heap.length / 2) - 1; index >= 0; index -= 1) {
-      siftDown(usage.heap, index);
-    }
-    layer.heapEntries += usage.heap.length;
-  }
+const cachedNormalizer = () => {
+  const cache = new Map<PixelColor | undefined, PixelColor>();
+  return (raw: PixelColor | undefined) => {
+    if (!cache.has(raw)) cache.set(raw, normalizePixelColor(raw));
+    return cache.get(raw)!;
+  };
 };
 
 const createLayerIndex = (pixels: readonly PixelColor[]): LayerIndex => {
   const colors = new Map<string, ColorUsage>();
-  let heapEntries = 0;
+  const normalize = cachedNormalizer();
   for (let index = 0; index < pixels.length; index += 1) {
-    const color = normalizePixelColor(pixels[index]);
+    const color = normalize(pixels[index]);
     if (!color) continue;
     let usage = colors.get(color);
-    if (!usage) colors.set(color, usage = { indexes: new Set(), heap: [] });
-    usage.indexes.add(index);
-    // Initial pixel order is increasing, so this is already a valid min-heap.
-    usage.heap.push(index);
-    heapEntries += 1;
+    if (!usage) colors.set(color, usage = { count: 0, firstIndex: index });
+    usage.count += 1;
   }
-  return { pixels, colors, heapEntries, orderedColors: [...colors.keys()], dirty: false };
+  return { pixels, colors, orderedColors: [...colors.keys()], dirty: false };
 };
 
 /**
@@ -104,7 +59,7 @@ export const createIncrementalUsedPaletteColors = () => {
       }
       if (indexed.dirty) {
         indexed.orderedColors = [...indexed.colors]
-          .map(([color, usage]) => ({ color, firstIndex: minimumIndex(indexed!, usage) }))
+          .map(([color, usage]) => ({ color, firstIndex: usage.firstIndex }))
           .sort((left, right) => left.firstIndex - right.firstIndex)
           .map(({ color }) => color);
         indexed.dirty = false;
@@ -146,6 +101,7 @@ export const createIncrementalUsedPaletteColors = () => {
       if (!existing && change.before !== undefined && normalizePixelColor(change.before) !== actualBefore) return false;
       unique.set(change.index, { before: existing?.before ?? actualBefore, after: normalizePixelColor(change.after) });
     }
+    const refreshFirstOccurrence = new Set<string>();
     for (const [index, change] of unique) {
       if (normalizePixelColor(nextPixels[index]) !== change.after) return false;
     }
@@ -154,23 +110,33 @@ export const createIncrementalUsedPaletteColors = () => {
       if (change.before === change.after) continue;
       if (change.before) {
         const usage = indexed.colors.get(change.before)!;
-        usage.indexes.delete(index);
-        if (!usage.indexes.size) {
-          indexed.heapEntries -= usage.heap.length;
-          indexed.colors.delete(change.before);
-        }
+        usage.count -= 1;
+        if (usage.firstIndex === index) refreshFirstOccurrence.add(change.before);
+        if (!usage.count) indexed.colors.delete(change.before);
       }
       if (change.after) {
         let usage = indexed.colors.get(change.after);
-        if (!usage) indexed.colors.set(change.after, usage = { indexes: new Set(), heap: [] });
-        usage.indexes.add(index);
-        heapPush(usage.heap, index);
-        indexed.heapEntries += 1;
+        if (!usage) indexed.colors.set(change.after, usage = { count: 0, firstIndex: index });
+        usage.count += 1;
+        usage.firstIndex = Math.min(usage.firstIndex, index);
       }
       indexed.dirty = true;
     }
+    // Keep O(colors), not one Set entry plus heap entry per painted pixel.
+    // Only erasing a color's first occurrence needs a forward scan. Common
+    // dense colors find their next pixel immediately; deleting the last
+    // occurrence needs no scan, and normal brush updates remain O(changes).
+    const normalize = cachedNormalizer();
+    for (const color of refreshFirstOccurrence) {
+      const usage = indexed.colors.get(color);
+      if (!usage || normalize(nextPixels[usage.firstIndex]) === color) continue;
+      for (let index = usage.firstIndex + 1; index < nextPixels.length; index += 1) {
+        if (normalize(nextPixels[index]) !== color) continue;
+        usage.firstIndex = index;
+        break;
+      }
+    }
     indexed.pixels = nextPixels;
-    compactHeaps(indexed);
     return true;
   };
 

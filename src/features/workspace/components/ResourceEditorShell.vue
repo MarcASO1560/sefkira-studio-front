@@ -49,17 +49,23 @@ import ResourceDocumentInfoDialog from "./ResourceDocumentInfoDialog.vue";
 import { buildDocumentInfoDetails } from "../lib/documentInfo";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import {
+  MIN_IMAGE_DIMENSION,
+  MAX_IMAGE_DIMENSION,
+  MAX_IMAGE_PIXEL_COUNT,
   clonePixelArtDocument,
   compositeVisibleLayers,
   createPixelArtDocument,
   createPixelLayer,
   normalizePixelColor,
 } from "../../pixel-art/lib/document";
+import { validateImageDimensionDrafts } from "../lib/imageDimensionDrafts";
 import {
   isCompleteImageColor,
   normalizeImageColorDraft,
 } from "../../pixel-art/lib/color";
-import { createImageCanvasRenderPlan, writeImageCanvasBitmapPixels } from "../../pixel-art/lib/canvasRendering";
+import { createImageCanvasRenderPlan } from "../../pixel-art/lib/canvasRendering";
+import { createIncrementalImageCanvasBitmap } from "../../pixel-art/lib/incrementalCanvasBitmap";
+import { MIN_IMAGE_ZOOM, MAX_IMAGE_ZOOM } from "../../pixel-art/lib/zoomLimits";
 import {
   clampCanvasMirrorAxis,
   expandCanvasMirrorPoints,
@@ -364,10 +370,6 @@ const fallbackEditorMeta: EditorMeta = {
 
 const DEFAULT_IMAGE_WIDTH = 32;
 const DEFAULT_IMAGE_HEIGHT = 32;
-const MIN_IMAGE_DIMENSION = 1;
-const MAX_IMAGE_DIMENSION = 256;
-const MIN_IMAGE_ZOOM = 0.25;
-const MAX_IMAGE_ZOOM = 64;
 const IMAGE_ZOOM_WHEEL_STEP = 0.0018;
 const IMAGE_TOUCH_COMMIT_THRESHOLD = 8;
 const IMAGE_ROTATION_STEP_RADIANS = Math.PI / 12;
@@ -421,6 +423,7 @@ const imageHorizontalMirrorAxisY = ref(DEFAULT_IMAGE_HEIGHT / 2);
 const imageVerticalMirrorAxisX = ref(DEFAULT_IMAGE_WIDTH / 2);
 const imageGridWidthDraft = ref(String(DEFAULT_IMAGE_WIDTH));
 const imageGridHeightDraft = ref(String(DEFAULT_IMAGE_HEIGHT));
+const areImageDimensionDraftsDirty = ref(false);
 const initialImageDocument = createPixelArtDocument(DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT);
 const imageLayers = shallowRef<PixelLayer[]>(initialImageDocument.layers);
 const activeImageLayerId = ref(initialImageDocument.layers[0]?.id || "");
@@ -1821,6 +1824,7 @@ const renderImageColorTriangleCanvas = () => {
 
 let imageCanvasRenderFrame: number | null = null;
 let imageCanvasBitmap: ImageData | null = null;
+const imageCanvasBitmapWriter = createIncrementalImageCanvasBitmap();
 const scheduleImageCanvasRender = () => {
   if (typeof window === "undefined") {
     return;
@@ -1842,10 +1846,11 @@ const scheduleImageCanvasRender = () => {
     }
     // Compose the display-only remote overlay once; both canvases share the
     // same logical-resolution bitmap. Neither ink nor background enters saves.
-    const visiblePixels = compositeVisibleLayers(
+    imageCanvasBitmapWriter.write(
       imageLivePreviews.render(buildImageDocument(true, false), imageLivePreviewCanonicalRevision),
+      customImageBackground.value,
+      imageCanvasBitmap.data,
     );
-    writeImageCanvasBitmapPixels(visiblePixels, customImageBackground.value, imageCanvasBitmap.data);
     renderImageCanvas(imageCanvasBitmap);
     renderImagePreviewCanvas(imageCanvasBitmap);
   });
@@ -1922,19 +1927,6 @@ const imagePixelsAreEqual = (
   right: ReadonlyArray<PixelColor>,
 ) =>
   left.length === right.length && left.every((pixel, index) => pixel === right[index]);
-
-const normalizeImageDimension = (value: unknown, fallback: number) => {
-  const dimension = Number(value);
-
-  if (!Number.isFinite(dimension)) {
-    return fallback;
-  }
-
-  return Math.min(
-    MAX_IMAGE_DIMENSION,
-    Math.max(MIN_IMAGE_DIMENSION, Math.round(dimension)),
-  );
-};
 
 const normalizeImageResizeAnchor = (value: unknown): ImageResizeAnchor =>
   IMAGE_RESIZE_ANCHORS.some((anchor) => anchor.value === value)
@@ -2442,7 +2434,9 @@ const applyRemoteImageDocument = (
   }
   imageGridWidth.value = document.width;
   imageGridHeight.value = document.height;
-  imageLayers.value = document.layers.map((layer) => ({ ...layer, pixels: [...layer.pixels] }));
+  // Sync publishes a detached immutable document; edits replace arrays rather
+  // than mutating them. Avoid another million-pixel copy after every ACK.
+  imageLayers.value = document.layers;
   activeImageLayerId.value =
     document.layers.some((layer) => layer.id === currentLayerId)
       ? currentLayerId
@@ -2451,7 +2445,8 @@ const applyRemoteImageDocument = (
     imageSelection.value = null;
     broadcastImageSelection();
   }
-  syncImageDimensionDrafts();
+  // Canonical ink/palette ACKs must not erase a size being typed.
+  if (didResize || !areImageDimensionDraftsDirty.value) syncImageDimensionDrafts();
   scheduleImageCanvasRender();
   void nextTick(scheduleImagePreviewViewportUpdate);
 };
@@ -4171,6 +4166,8 @@ const paintImagePixels = (indexes: number[], color: PixelColor) => {
 
   imageUsedPalette.registerMutation({ layerId: activeImageLayerId.value,
     previousPixels: imagePixels.value, nextPixels: mutation.buffer.pixels, changes: mutation.changes });
+  imageCanvasBitmapWriter.registerMutation({ layerId: activeImageLayerId.value,
+    previousPixels: imagePixels.value, nextPixels: mutation.buffer.pixels, changes: mutation.changes });
   imagePixels.value = mutation.buffer.pixels;
   scheduleImageCanvasRender();
   scheduleImageAutosave({}, mutation.changes);
@@ -4228,6 +4225,8 @@ const paintImageGraffitiPixels = (indexes: number[]) => {
   if (!didChange) return;
 
   imageUsedPalette.registerMutation({ layerId: activeImageLayerId.value,
+    previousPixels: imagePixels.value, nextPixels, changes });
+  imageCanvasBitmapWriter.registerMutation({ layerId: activeImageLayerId.value,
     previousPixels: imagePixels.value, nextPixels, changes });
   imagePixels.value = nextPixels;
   scheduleImageCanvasRender();
@@ -4909,8 +4908,13 @@ const resizeImageWorkspace = (nextWidth: number, nextHeight: number) => {
     return;
   }
 
-  const width = normalizeImageDimension(nextWidth, imageGridWidth.value);
-  const height = normalizeImageDimension(nextHeight, imageGridHeight.value);
+  const dimensionError = validateImageDimensionDrafts(nextWidth, nextHeight, imageLayers.value.length);
+  if (dimensionError) {
+    showImageNotice(dimensionError, "error");
+    return;
+  }
+  const width = nextWidth;
+  const height = nextHeight;
 
   if (width === imageGridWidth.value && height === imageGridHeight.value) {
     return;
@@ -4940,6 +4944,7 @@ const resizeImageWorkspace = (nextWidth: number, nextHeight: number) => {
 };
 
 const syncImageDimensionDrafts = () => {
+  areImageDimensionDraftsDirty.value = false;
   imageGridWidthDraft.value = String(imageGridWidth.value);
   imageGridHeightDraft.value = String(imageGridHeight.value);
 };
@@ -4947,15 +4952,13 @@ const syncImageDimensionDrafts = () => {
 const updateImageWidthDraft = (event: Event) => {
   const value = (event.currentTarget as HTMLInputElement).value;
   imageGridWidthDraft.value = value;
+  areImageDimensionDraftsDirty.value = true;
 
   if (areImageDimensionsLinked.value) {
     const width = Number(value);
     if (Number.isFinite(width) && width > 0) {
       imageGridHeightDraft.value = String(
-        normalizeImageDimension(
-          (width * imageGridHeight.value) / imageGridWidth.value,
-          imageGridHeight.value,
-        ),
+        Math.max(1, Math.round((width * imageGridHeight.value) / imageGridWidth.value)),
       );
     }
   }
@@ -4964,15 +4967,13 @@ const updateImageWidthDraft = (event: Event) => {
 const updateImageHeightDraft = (event: Event) => {
   const value = (event.currentTarget as HTMLInputElement).value;
   imageGridHeightDraft.value = value;
+  areImageDimensionDraftsDirty.value = true;
 
   if (areImageDimensionsLinked.value) {
     const height = Number(value);
     if (Number.isFinite(height) && height > 0) {
       imageGridWidthDraft.value = String(
-        normalizeImageDimension(
-          (height * imageGridWidth.value) / imageGridHeight.value,
-          imageGridWidth.value,
-        ),
+        Math.max(1, Math.round((height * imageGridWidth.value) / imageGridHeight.value)),
       );
     }
   }
@@ -4984,13 +4985,10 @@ const applyImageWidthDraft = () => {
     return;
   }
 
-  const nextWidth = normalizeImageDimension(Number(imageGridWidthDraft.value), imageGridWidth.value);
+  const nextWidth = Number(imageGridWidthDraft.value);
 
   if (areImageDimensionsLinked.value) {
-    const nextHeight = normalizeImageDimension(
-      Number(imageGridHeightDraft.value),
-      imageGridHeight.value,
-    );
+    const nextHeight = Number(imageGridHeightDraft.value);
     resizeImageWorkspace(nextWidth, nextHeight);
   } else {
     resizeImageWorkspace(nextWidth, imageGridHeight.value);
@@ -5005,13 +5003,10 @@ const applyImageHeightDraft = () => {
     return;
   }
 
-  const nextHeight = normalizeImageDimension(Number(imageGridHeightDraft.value), imageGridHeight.value);
+  const nextHeight = Number(imageGridHeightDraft.value);
 
   if (areImageDimensionsLinked.value) {
-    const nextWidth = normalizeImageDimension(
-      Number(imageGridWidthDraft.value),
-      imageGridWidth.value,
-    );
+    const nextWidth = Number(imageGridWidthDraft.value);
     resizeImageWorkspace(nextWidth, nextHeight);
   } else {
     resizeImageWorkspace(imageGridWidth.value, nextHeight);
@@ -5061,6 +5056,8 @@ const selectImageLayer = (layerId: string) => {
 
 const addImageLayer = () => {
   if (!canEditImage.value) return;
+  const dimensionError = validateImageDimensionDrafts(imageGridWidth.value, imageGridHeight.value, imageLayers.value.length + 1);
+  if (dimensionError) { showImageNotice(dimensionError, "error"); return; }
   cancelImageInteractionBeforeLayerChange();
   const layer = createPixelLayer(imageGridWidth.value, imageGridHeight.value, {
     name: `Layer ${imageLayers.value.length + 1}`,
@@ -5072,6 +5069,8 @@ const addImageLayer = () => {
 
 const duplicateImageLayer = (layerId: string) => {
   if (!canEditImage.value) return;
+  const dimensionError = validateImageDimensionDrafts(imageGridWidth.value, imageGridHeight.value, imageLayers.value.length + 1);
+  if (dimensionError) { showImageNotice(dimensionError, "error"); return; }
   const index = imageLayers.value.findIndex((layer) => layer.id === layerId);
   if (index < 0) return;
   cancelImageInteractionBeforeLayerChange();
@@ -5621,7 +5620,7 @@ const importImageFile = async (file: File) => {
       } catch (error) {
         if (!(error instanceof RasterImageTooLargeError)) throw error;
         const shouldReduce = window.confirm(
-          `${error.width} × ${error.height} exceeds the 256 × 256 limit. Reduce it proportionally with pixel-perfect nearest-neighbor scaling?`,
+          `${error.width} × ${error.height} exceeds the supported canvas capacity (${MAX_IMAGE_DIMENSION} px per side, ${(MAX_IMAGE_PIXEL_COUNT / 1_000_000).toFixed(1)} million pixels). Reduce it proportionally with pixel-perfect nearest-neighbor scaling?`,
         );
         if (!shouldReduce) return;
         importedDocument = await importRasterImageReduced(file, rasterOptions);
@@ -6747,6 +6746,7 @@ onMounted(() => {
 onUnmounted(() => {
   resourceEditorDisposed = true;
   imageUsedPalette.clear();
+  imageCanvasBitmapWriter.clear();
   imageCanvasBitmap = null;
   imageLivePreviewSender.dispose();
   imageLivePreviews.clear();
@@ -7132,6 +7132,7 @@ onUnmounted(() => {
             >
               <div class="image-editor-dimensions">
                 <div class="image-editor-control-heading">Size</div>
+                <p class="image-editor-size-help">Up to {{ MAX_IMAGE_DIMENSION }} px per side · {{ (MAX_IMAGE_PIXEL_COUNT / 1_000_000).toFixed(1) }} MP per canvas</p>
                 <div class="image-editor-size-row">
                   <label class="image-editor-size-field" for="image-editor-width-input">Width:</label>
                   <input
@@ -9226,6 +9227,13 @@ onUnmounted(() => {
   .image-editor-control-heading::after {
     display: none;
     content: none;
+  }
+
+  .image-editor-size-help {
+    margin: 0;
+    color: var(--editor-muted);
+    font-size: 11px;
+    line-height: 1.5;
   }
 
   .image-editor-grid-subheading {

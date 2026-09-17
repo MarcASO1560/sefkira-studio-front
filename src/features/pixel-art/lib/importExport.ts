@@ -1,6 +1,8 @@
 import type { PixelArtDocumentV2, PixelColor } from "../types";
 import {
   MAX_IMAGE_DIMENSION,
+  MAX_IMAGE_PIXEL_COUNT,
+  isValidImageDimensions,
   compositeVisibleLayers,
   createPixelArtDocument,
   createPixelLayer,
@@ -8,12 +10,17 @@ import {
 } from "./document";
 import {
   parsePixelArtResourceData,
+  PixelArtMigrationError,
   serializePixelArtResourceData,
 } from "./migrations";
 
 export const PIXEL_ART_JSON_MIME_TYPE = "application/json";
 export const PIXEL_ART_PNG_MIME_TYPE = "image/png";
 export const PNG_EXPORT_SCALES = [1, 2, 4, 8, 16] as const;
+// Preserve the largest formerly supported export (256 px × 16) while avoiding
+// a 1 GB canvas when a larger document is exported at an unsuitable scale.
+export const MAX_PNG_EXPORT_PIXEL_COUNT = 16_777_216;
+export const MAX_PNG_EXPORT_DIMENSION = 8192;
 
 export type PngExportScale = (typeof PNG_EXPORT_SCALES)[number];
 export type RasterImageMimeType = "image/jpeg" | "image/png" | "image/webp";
@@ -44,7 +51,7 @@ export class RasterImageTooLargeError extends PixelArtImportError {
   constructor(width: number, height: number, maxDimension = MAX_IMAGE_DIMENSION) {
     super(
       "image-too-large",
-      `Image dimensions ${width}x${height} exceed the ${maxDimension}x${maxDimension} limit.`,
+      `Image dimensions ${width}x${height} exceed ${maxDimension} pixels per axis or ${MAX_IMAGE_PIXEL_COUNT} total pixels.`,
     );
     this.name = "RasterImageTooLargeError";
     this.width = width;
@@ -174,6 +181,9 @@ const assertPixels = (value: unknown, width: number, height: number, location: s
 const readLegacyDimensions = (payload: Record<string, unknown>) => {
   const width = assertDimension(payload.width ?? payload.size, "Pixel-art width");
   const height = assertDimension(payload.height ?? payload.size, "Pixel-art height");
+  if (!isValidImageDimensions(width, height)) {
+    throw new PixelArtImportError("invalid-document", `Pixel art may contain at most ${MAX_IMAGE_PIXEL_COUNT} pixels.`);
+  }
   return { height, width };
 };
 
@@ -186,68 +196,6 @@ const assertLegacyDocument = (payload: Record<string, unknown>) => {
     height,
     width,
   };
-};
-
-const assertV2Document = (payload: Record<string, unknown>) => {
-  const width = assertDimension(payload.width, "Pixel-art width");
-  const height = assertDimension(payload.height, "Pixel-art height");
-  assertPalette(payload.palette, true);
-
-  if (
-    !Array.isArray(payload.layers) ||
-    payload.layers.length < 1
-  ) {
-    throw new PixelArtImportError(
-      "invalid-document",
-      "Pixel art must contain at least 1 layer.",
-    );
-  }
-
-  const layerIds = new Set<string>();
-  payload.layers.forEach((layer, layerIndex) => {
-    if (!isRecord(layer)) {
-      throw new PixelArtImportError(
-        "invalid-document",
-        `Pixel-art layer ${layerIndex} must be an object.`,
-      );
-    }
-
-    if (typeof layer.id !== "string" || !layer.id.trim() || layerIds.has(layer.id)) {
-      throw new PixelArtImportError(
-        "invalid-document",
-        `Pixel-art layer ${layerIndex} must have a unique non-empty id.`,
-      );
-    }
-    layerIds.add(layer.id);
-
-    if (typeof layer.name !== "string" || !layer.name.trim()) {
-      throw new PixelArtImportError(
-        "invalid-document",
-        `Pixel-art layer ${layerIndex} must have a non-empty name.`,
-      );
-    }
-    if (typeof layer.visible !== "boolean" || typeof layer.locked !== "boolean") {
-      throw new PixelArtImportError(
-        "invalid-document",
-        `Pixel-art layer ${layerIndex} visibility and lock state must be booleans.`,
-      );
-    }
-    if (
-      typeof layer.opacity !== "number" ||
-      !Number.isFinite(layer.opacity) ||
-      layer.opacity < 0 ||
-      layer.opacity > 1
-    ) {
-      throw new PixelArtImportError(
-        "invalid-document",
-        `Pixel-art layer ${layerIndex} opacity must be between 0 and 1.`,
-      );
-    }
-
-    assertPixels(layer.pixels, width, height, `Pixel-art layer ${layerIndex} pixels`);
-  });
-
-  return payload;
 };
 
 const extractPixelArtPayload = (value: unknown) => {
@@ -283,7 +231,10 @@ export const parsePixelArtJsonValue = (value: unknown): PixelArtDocumentV2 => {
   if (payload.version === 1) {
     migrationPayload = assertLegacyDocument(payload);
   } else if (payload.version === 2) {
-    migrationPayload = assertV2Document(payload);
+    // The strict canonical parser validates dimensions, metadata and every
+    // pixel once, including supported compact encodings. Do not bypass that
+    // validation or redundantly scan million-pixel dense imports beforehand.
+    migrationPayload = payload;
   } else {
     throw new PixelArtImportError(
       "unsupported-json",
@@ -291,7 +242,14 @@ export const parsePixelArtJsonValue = (value: unknown): PixelArtDocumentV2 => {
     );
   }
 
-  return parsePixelArtResourceData({ pixel_art: migrationPayload }).document;
+  try {
+    return parsePixelArtResourceData({ pixel_art: migrationPayload }).document;
+  } catch (error) {
+    if (error instanceof PixelArtMigrationError || error instanceof RangeError) {
+      throw new PixelArtImportError("invalid-document", error.message);
+    }
+    throw error;
+  }
 };
 
 export const parsePixelArtJson = (source: string): PixelArtDocumentV2 => {
@@ -336,6 +294,7 @@ export const rgbaBytesToPixelColors = (
   width: number,
   height: number,
 ): PixelColor[] => {
+  assertRasterDimensions(width, height);
   const expectedLength = width * height * 4;
   if (data.length !== expectedLength) {
     throw new PixelArtImportError(
@@ -362,14 +321,14 @@ export const rgbaBytesToPixelColors = (
 };
 
 const assertPositiveRasterDimensions = (width: number, height: number) => {
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
     throw new PixelArtImportError("decode-failed", "The raster image has invalid dimensions.");
   }
 };
 
 const assertRasterDimensions = (width: number, height: number) => {
   assertPositiveRasterDimensions(width, height);
-  if (width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION) {
+  if (!isValidImageDimensions(width, height)) {
     throw new RasterImageTooLargeError(width, height);
   }
 };
@@ -380,14 +339,21 @@ export const calculateRasterFitDimensions = (
   maxDimension = MAX_IMAGE_DIMENSION,
 ): RasterFitDimensions => {
   assertPositiveRasterDimensions(width, height);
-  if (!Number.isInteger(maxDimension) || maxDimension < 1) {
-    throw new RangeError("Maximum raster dimension must be a positive integer.");
+  if (!Number.isInteger(maxDimension) || maxDimension < 1 || maxDimension > MAX_IMAGE_DIMENSION) {
+    throw new RangeError(`Maximum raster dimension must be an integer between 1 and ${MAX_IMAGE_DIMENSION}.`);
   }
 
-  const scale = Math.min(1, maxDimension / width, maxDimension / height);
+  const scale = Math.min(1, maxDimension / width, maxDimension / height, Math.sqrt(MAX_IMAGE_PIXEL_COUNT / (width * height)));
+  let fitWidth = Math.max(1, Math.min(maxDimension, Math.round(width * scale)));
+  let fitHeight = Math.max(1, Math.min(maxDimension, Math.round(height * scale)));
+  // Rounding both axes upward can exceed the area budget by a few pixels.
+  if (fitWidth * fitHeight > MAX_IMAGE_PIXEL_COUNT) {
+    if (fitWidth >= fitHeight) fitWidth = Math.floor(MAX_IMAGE_PIXEL_COUNT / fitHeight);
+    else fitHeight = Math.floor(MAX_IMAGE_PIXEL_COUNT / fitWidth);
+  }
   return {
-    width: Math.max(1, Math.min(maxDimension, Math.round(width * scale))),
-    height: Math.max(1, Math.min(maxDimension, Math.round(height * scale))),
+    width: fitWidth,
+    height: fitHeight,
     scale,
   };
 };
@@ -651,9 +617,15 @@ export const exportPixelArtPng = async (
 
   const validatedDocument = parsePixelArtJsonValue(document);
   const backgroundColor = normalizePngBackground(options.backgroundColor);
+  const exportWidth = validatedDocument.width * scale;
+  const exportHeight = validatedDocument.height * scale;
+  if (exportWidth > MAX_PNG_EXPORT_DIMENSION || exportHeight > MAX_PNG_EXPORT_DIMENSION ||
+    exportWidth * exportHeight > MAX_PNG_EXPORT_PIXEL_COUNT) {
+    throw new RangeError("This PNG export is too large. Choose a smaller export scale.");
+  }
   const canvas = createBrowserCanvas(
-    validatedDocument.width * scale,
-    validatedDocument.height * scale,
+    exportWidth,
+    exportHeight,
   );
   const context = canvas.getContext("2d");
   if (!context) {

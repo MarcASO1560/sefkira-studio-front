@@ -1,5 +1,6 @@
-import { clampImageDimension, clonePixelArtDocument } from "./document";
+import { clampImageDimension, clonePixelArtDocument, isValidImageDimensions, MAX_IMAGE_PIXEL_COUNT, MAX_IMAGE_DOCUMENT_PIXELS } from "./document";
 import type { ImageResizeAnchor, PixelArtDocumentV2, PixelColor } from "../types";
+import { hasNormalizedPixelArray, registerNormalizedPixelArray } from "./pixelBufferTrust";
 
 const anchorAlignment = (anchor: ImageResizeAnchor) => {
   const [vertical, horizontal] = anchor.includes("-") ? anchor.split("-") : [anchor, anchor];
@@ -29,6 +30,7 @@ export const resizePixelArray = (
   nextHeight: number,
   anchor: ImageResizeAnchor,
 ) => {
+  if (!isValidImageDimensions(nextWidth, nextHeight)) throw new RangeError(`Images may contain at most ${MAX_IMAGE_PIXEL_COUNT} pixels.`);
   const nextPixels: PixelColor[] = Array(nextWidth * nextHeight).fill(null);
   const alignment = anchorAlignment(anchor);
   const rowOffset = resizeOffset(previousHeight, nextHeight, alignment.row);
@@ -46,7 +48,7 @@ export const resizePixelArray = (
     }
   }
 
-  return nextPixels;
+  return hasNormalizedPixelArray(pixels) ? registerNormalizedPixelArray(nextPixels) : nextPixels;
 };
 
 export const resizePixelArtDocument = (
@@ -57,12 +59,15 @@ export const resizePixelArtDocument = (
 ) => {
   const nextWidth = clampImageDimension(width, source.width);
   const nextHeight = clampImageDimension(height, source.height);
+  if (!isValidImageDimensions(nextWidth, nextHeight)) throw new RangeError(`Images may contain at most ${MAX_IMAGE_PIXEL_COUNT} pixels.`);
+  if (nextWidth * nextHeight * source.layers.length > MAX_IMAGE_DOCUMENT_PIXELS) throw new RangeError(`Images may contain at most ${MAX_IMAGE_DOCUMENT_PIXELS} layer pixels.`);
   if (nextWidth === source.width && nextHeight === source.height) {
     return clonePixelArtDocument(source);
   }
 
   return {
-    ...clonePixelArtDocument(source),
+    ...source,
+    palette: [...source.palette],
     width: nextWidth,
     height: nextHeight,
     layers: source.layers.map((layer) => ({

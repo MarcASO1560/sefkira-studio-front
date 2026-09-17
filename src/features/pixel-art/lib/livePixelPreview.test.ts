@@ -25,6 +25,15 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(0); });
 afterEach(() => { vi.useRealTimers(); });
 
 describe("live pixel preview sender", () => {
+  it("sends and overlays high indexes on a 1024-square frame, rejecting excess area", () => {
+    const send = vi.fn(); const sender = createLivePixelPreviewSender(send);
+    expect(sender.enqueue({ width: 1024, height: 1024, baseRevision: 10, layers: [{ layerId: "large", changes: [[1_048_575, "#12345680"]] }] })).toBe(1);
+    const overlay = createLivePixelPreviewOverlay(); expect(overlay.receive("remote", send.mock.calls[0]![0])).toBe(true);
+    const source = createPixelArtDocument(1024, 1024, { layers: [createPixelLayer(1024, 1024, { id: "large" })] });
+    expect(overlay.render(source, 10).layers[0]!.pixels[1_048_575]).toBe("#12345680");
+    expect(overlay.receive("bad", { ...send.mock.calls[0]![0], width: 4096, height: 4096 })).toBe(false);
+    const invalid = createLivePixelPreviewSender(vi.fn()); expect(invalid.enqueue({ width: 4096, height: 4096, baseRevision: 10, layers: [{ layerId: "large", changes: [[0, null]] }] })).toBe(0);
+  });
   it("sends the first pixel immediately and subsequent changes at the fixed 16 ms deadline", () => {
     const send = vi.fn();
     const sender = createLivePixelPreviewSender(send);
@@ -149,7 +158,7 @@ describe("live pixel preview sender", () => {
   });
 
   it.each([
-    { ...input([[0, null]]), width: 257 },
+    { ...input([[0, null]]), width: 4097 },
     { ...input([[0, null]]), height: 0 },
     { ...input([[0, null]]), baseRevision: -1 },
     input([[16, null]]), input([[1.5, null]]), input([[0, "red"]]),
@@ -608,7 +617,7 @@ describe("live pixel preview visual overlay", () => {
   });
 
   it.each([
-    { preview_protocol: 2 }, { preview_protocol: "1" }, { width: 257 }, { height: 0 },
+    { preview_protocol: 2 }, { preview_protocol: "1" }, { width: 4097 }, { height: 0 },
     { base_revision: -1 }, { base_revision: Number.MAX_SAFE_INTEGER + 1 },
     { layer_id: " " }, { layer_id: "x".repeat(201) }, { preview_sequence: 0 },
     { changes: [] }, { changes: [[16, null, 1]] }, { changes: [[0.5, null, 1]] },

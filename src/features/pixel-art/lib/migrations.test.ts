@@ -43,10 +43,10 @@ describe("pixel-art migrations", () => {
   });
 
   it.each([
-    { width: 0, height: 1 }, { width: 257, height: 1 }, { width: 1.5, height: 1 }, { width: "1", height: 1 },
-    { width: 1, height: 0 }, { width: 1, height: 257 }, { width: 1, height: 1.5 }, { width: 1, height: Infinity },
+    { width: 0, height: 1 }, { width: 4097, height: 1 }, { width: 1.5, height: 1 }, { width: "1", height: 1 },
+    { width: 1, height: 0 }, { width: 1, height: 4097 }, { width: 1, height: 1.5 }, { width: 1, height: Infinity },
   ])("preserves dimension validation for width=$width and height=$height", ({ width, height }) => {
-    expect(() => parsePixelArtResourceData(v2([null], { width, height }))).toThrow("Stored pixel-art v2 dimensions must be integers between 1 and 256.");
+    expect(() => parsePixelArtResourceData(v2([null], { width, height }))).toThrow("Stored pixel-art v2 dimensions must be integers between 1 and 4096.");
   });
 
   it.each([null, [null], ["invalid"], [42], "#FFFFFF"])("preserves invalid palette rejection for %j", (palette) => {

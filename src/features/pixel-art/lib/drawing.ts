@@ -1,3 +1,5 @@
+import { hasNormalizedPixelArray, registerNormalizedPixelArray } from "./pixelBufferTrust";
+
 export type PixelColor = string | null;
 
 export type Point = Readonly<{
@@ -171,17 +173,14 @@ const pixelAt = (pixels: ReadonlyArray<PixelColor>, index: number): PixelColor =
 // Buffers are immutable. Remember arrays normalized by this module so ordinary
 // brush frames can use one native copy; legacy short/sparse arrays still pass
 // through the null-normalizing fallback when first encountered.
-const normalizedPixelArrays = new WeakSet<ReadonlyArray<PixelColor>>();
-
 const normalizedPixels = (buffer: PixelBuffer) => {
   const width = dimension(buffer.width);
   const height = dimension(buffer.height);
   const length = width * height;
-  const pixels = normalizedPixelArrays.has(buffer.pixels) && buffer.pixels.length === length
+  const pixels = hasNormalizedPixelArray(buffer.pixels) && buffer.pixels.length === length
     ? buffer.pixels.slice()
     : Array.from({ length }, (_, index) => pixelAt(buffer.pixels, index));
-  normalizedPixelArrays.add(pixels);
-  return pixels;
+  return registerNormalizedPixelArray(pixels);
 };
 
 const mutationFromPixels = (
@@ -191,7 +190,11 @@ const mutationFromPixels = (
   const width = dimension(buffer.width);
   const height = dimension(buffer.height);
   const length = width * height;
-  const nextPixels = Array.from({ length }, (_, index) => pixelAt(candidatePixels, index));
+  const nextPixels = registerNormalizedPixelArray(
+    hasNormalizedPixelArray(candidatePixels) && candidatePixels.length === length
+      ? candidatePixels.slice()
+      : Array.from({ length }, (_, index) => pixelAt(candidatePixels, index)),
+  );
   const changes: PixelChange[] = [];
   let minX = width;
   let minY = height;

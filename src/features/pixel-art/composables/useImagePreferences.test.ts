@@ -84,13 +84,15 @@ describe("useImagePreferences", () => {
     });
   });
 
-  it("preserves the editor's quarter-scale minimum zoom", () => {
+  it("preserves zoom-out for large canvases and clamps below the supported minimum", () => {
     const storage = new MemoryStorage();
     const state = useImagePreferences(options(storage));
 
     state.save({ zoom: 0.1 });
 
-    expect(state.preferences.zoom).toBe(0.25);
+    expect(state.preferences.zoom).toBe(0.1);
+    state.save({ zoom: 0.001 });
+    expect(state.preferences.zoom).toBe(1 / 32);
   });
 
   it.each(IMAGE_GRID_LINE_STYLES)("persists the %s grid treatment exactly", (lineStyle) => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProjectEditorActivity } from "../../../lib/realtime";
-import { createPixelLayer } from "./document";
+import { createPixelLayer, MAX_IMAGE_DIMENSION } from "./document";
 import { PIXEL_ART_PASTEL_PALETTE } from "./palette";
 import {
   applyCollaborativePixelPatch,
@@ -191,8 +191,8 @@ describe("pixel-art collaboration", () => {
   });
 
   it.each([
-    { height: 1, width: 257, x: 0, y: 0 },
-    { height: 1, width: 1, x: 256, y: 0 },
+    { height: 1, width: MAX_IMAGE_DIMENSION + 1, x: 0, y: 0 },
+    { height: 1, width: 1, x: MAX_IMAGE_DIMENSION, y: 0 },
     { height: 1, kind: "ellipse", width: 1, x: 0, y: 0 },
     { height: 1, mode: "toggle", width: 1, x: 0, y: 0 },
     { height: 1, kind: "lasso", width: 1, x: 0, y: 0 },
@@ -299,5 +299,60 @@ describe("pixel-art collaboration", () => {
     expect(collaboratorColor("user-2")).toBe(collaboratorColor("user-2"));
     expect(PIXEL_ART_PASTEL_PALETTE).toHaveLength(16);
     expect(PIXEL_ART_PASTEL_PALETTE).toContain(collaboratorColor("user-2"));
+  });
+
+  it("accepts 1024 and bounded rectangular canvases but rejects excessive canvas area", () => {
+    expect(readCollaborativeCursor(activity("cursor", {
+      width: 1024, height: 1024, tool: "pencil", visible: true, x: 1023, y: 1023,
+    }))).toMatchObject({ width: 1024, height: 1024 });
+    expect(readCollaborativeCursor(activity("cursor", {
+      width: 4096, height: 1024, tool: "pencil", visible: false,
+    }))).not.toBeNull();
+    expect(readCollaborativeCursor(activity("cursor", {
+      width: 4096, height: 4096, tool: "pencil", visible: false,
+    }))).toBeNull();
+    expect(readCollaborativePixelPatch(activity("pixels", {
+      width: 1024, height: 1024, layer_id: "layer", changes: [[1024 * 1024 - 1, "#FFFFFF"]],
+    }))).not.toBeNull();
+    expect(readCollaborativePixelPatch(activity("pixels", {
+      width: 4096, height: 4096, layer_id: "layer", changes: [[0, "#FFFFFF"]],
+    }))).toBeNull();
+  });
+
+  it("round trips a complete 1024 × 1024 selection mask under the safe broadcast budget", () => {
+    const data = new Uint8Array(1024 * 1024);
+    data[0] = 1;
+    data[data.length - 1] = 1;
+    const serialized = serializeCollaborativeSelection({
+      width: 1024, height: 1024, x: 0, y: 0, kind: "wand",
+      mask: { width: 1024, height: 1024, data },
+    });
+    expect(serialized?.mask?.data).toHaveLength(174764);
+    const restored = readCollaborativeSelection(activity("selection", { selection: serialized }));
+    expect(restored?.mask?.data[0]).toBe(1);
+    expect(restored?.mask?.data.at(-1)).toBe(1);
+  });
+
+  it("simplifies only oversized remote masks to bounds while keeping the full local mask intact", () => {
+    const data = new Uint8Array(2048 * 2048);
+    data[0] = 1;
+    data[data.length - 1] = 1;
+    const selection = { width: 2048, height: 2048, x: 0, y: 0, kind: "wand" as const,
+      mode: "subtract" as const, mask: { width: 2048, height: 2048, data } };
+    const serialized = serializeCollaborativeSelection(selection);
+    expect(serialized).toEqual({ width: 2048, height: 2048, x: 0, y: 0, kind: "rectangle", mode: "subtract" });
+    expect(selection.kind).toBe("wand");
+    expect(selection.mask.data).toBe(data);
+    expect(selection.mask.data.at(-1)).toBe(1);
+    expect(readCollaborativeSelection(activity("selection", { selection: serialized }))).toEqual(serialized);
+    data[100] = 2;
+    expect(() => serializeCollaborativeSelection(selection)).toThrow(/either 0 or 1/i);
+  });
+
+  it("rejects over-budget mask dimensions before allocating a canvas-sized bitmap", () => {
+    expect(() => serializeCollaborativeSelection({
+      width: 1, height: 1, x: 0, y: 0, kind: "wand",
+      mask: { width: 4096, height: 4096, data: new Uint8Array(0) },
+    })).toThrow(/canvas limits/i);
   });
 });

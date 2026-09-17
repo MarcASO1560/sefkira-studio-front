@@ -1,11 +1,47 @@
 import { describe, expect, it } from "vitest";
 import { createPixelArtDocument, createPixelLayer } from "./document";
-import { applyImageActions, diffImageDocuments, ImageOperationConflict, rebaseImageOperationActions, splitImageActionBatches, validateImageOperation, type ImageOperation, type ImageOperationTransform } from "./imageOperations";
+import { applyImageActions, diffImageDocuments, ImageOperationConflict, rebaseImageOperationActions, splitImageActionBatches, toImageOperationPacket, validateImageOperation, type ImageOperation, type ImageOperationTransform } from "./imageOperations";
 import { resizePixelArtDocument } from "./resize";
 
 const document = () => createPixelArtDocument(2, 2, { layers: [createPixelLayer(2, 2, { id: "a" })] });
 
 describe("image operation deltas", () => {
+  it("validates indexes beyond 65535 while enforcing canvas area and packet-count bounds", () => {
+    const packet: ImageOperation = { operation_id: "large", base_revision: 0, width: 1024, height: 1024, actions: [{ type: "pixels", layer_id: "a", changes: [[1_048_575, "#12345680"]] }] };
+    expect(validateImageOperation(packet)).toBe(true);
+    expect(validateImageOperation({ ...packet, width: 4096, height: 4096 })).toBe(false);
+    expect(validateImageOperation({ ...packet, actions: [{ type: "pixels", layer_id: "a", changes: [[1_048_576, null]] }] })).toBe(false);
+    expect(validateImageOperation({ ...packet, actions: [{ type: "resize", width: 2048, height: 2048, anchor: "center" }] })).toBe(true);
+    expect(validateImageOperation({ ...packet, actions: [{ type: "resize", width: 2049, height: 2048, anchor: "center" }] })).toBe(false);
+  });
+  it("splits one 1024-square fill into ordered valid bounded actions and packets", () => {
+    const changes = Array.from({ length: 1_048_576 }, (_, index) => [index, "#123456"] as [number, string]);
+    const actions = [{ type: "pixels" as const, layer_id: "a", changes }]; const batches = splitImageActionBatches(actions);
+    expect(batches.flat().flatMap((action) => action.type === "pixels" ? action.changes : [])).toEqual(changes);
+    expect(batches.flat().every((action) => action.type === "pixels" && action.changes.length <= 65_536)).toBe(true);
+    expect(batches.every((actions) => validateImageOperation({ operation_id: "fill", base_revision: 0, width: 1024, height: 1024, actions }))).toBe(true);
+    expect(actions[0]!.changes).toBe(changes);
+  });
+  it("compacts structural snapshots before packet-size checks without altering attempted packets", () => {
+    const large = createPixelArtDocument(1024, 1024);
+    const operation: ImageOperation = { operation_id: "import", base_revision: 0, width: 2, height: 2, actions: [{ type: "import", document: large }], _client_attempted: true, _client_expected_document: document() };
+    const batch = splitImageActionBatches(operation.actions); expect(batch).toEqual([operation.actions]);
+    const wire = toImageOperationPacket(operation);
+    expect(wire).not.toHaveProperty("_client_attempted"); expect(wire).not.toHaveProperty("_client_expected_document");
+    expect(validateImageOperation(wire)).toBe(true); expect(JSON.stringify(wire).length).toBeLessThan(20_000);
+    expect(Array.isArray(large.layers[0]!.pixels)).toBe(true); expect(operation.actions[0]).toEqual({ type: "import", document: large });
+    const layerPacket = toImageOperationPacket({ ...operation, width: 1024, height: 1024, actions: [{ type: "layer-add", layer: large.layers[0]!, after_id: null }, { type: "layer-remove", layer_id: "old", expected_layer: large.layers[0]! }] });
+    expect(validateImageOperation(layerPacket)).toBe(true); expect(JSON.stringify(layerPacket).length).toBeLessThan(40_000);
+  });
+  it("rejects aggregate resize/layer-add allocations before cloning source buffers", () => {
+    const layer = { id: "base", name: "Base", visible: true, locked: false, opacity: 1, pixels: [null] };
+    const source = { version: 2 as const, width: 2048, height: 2048, palette: [], layers: Array.from({ length: 4 }, (_, index) => ({ ...layer, id: `layer-${index}` })) };
+    const read = Object.getOwnPropertyDescriptor(source.layers[0]!, "pixels")!;
+    Object.defineProperty(source.layers[0]!, "pixels", { get() { throw new Error("must not clone"); } });
+    expect(() => applyImageActions(source, [{ type: "layer-add", layer: { ...layer, id: "extra" }, after_id: null }])).toThrow("total layer-pixel limit");
+    Object.defineProperty(source.layers[0]!, "pixels", read);
+    expect(() => resizePixelArtDocument({ ...source, width: 1024, height: 1024, layers: [...source.layers, { ...layer, id: "five" }] }, 2048, 2048, "center")).toThrow("layer pixels");
+  });
   it("encodes only changed pixels and merges disjoint users", () => {
     const base = document();
     const left = document(); left.layers[0]!.pixels[0] = "#FF0000";

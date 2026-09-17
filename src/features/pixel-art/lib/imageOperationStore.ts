@@ -1,13 +1,14 @@
 import type { ProjectResourceDetail } from "../../../lib/api";
 import { validateImageOperation, type ImageOperation, type ImageOperationTransform, type SharedImageHistory } from "./imageOperations";
 import type { PixelArtDocumentV2 } from "../types";
+import type { CompactPixelArtDocument } from "./compactPixels";
 
 export type StoredImageOperationQueue = {
   version: 1;
   resource: ProjectResourceDetail | null;
   operations: ImageOperation[];
   /** Exceptional oversized local copy retained for explicit export/recovery. */
-  localDocument?: PixelArtDocumentV2;
+  localDocument?: PixelArtDocumentV2 | CompactPixelArtDocument;
   localDocumentUnencodable?: boolean;
   localDocumentRevision?: number;
   transforms?: ImageOperationTransform[];

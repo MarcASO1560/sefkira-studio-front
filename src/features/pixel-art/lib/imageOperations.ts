@@ -1,7 +1,8 @@
 import type { ImageResizeAnchor, PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
-import { clonePixelArtDocument, normalizePixelColor } from "./document";
+import { clonePixelArtDocument, isValidImageDimensions, MAX_IMAGE_DOCUMENT_PIXELS, normalizePixelColor } from "./document";
 import { parsePixelArtResourceData } from "./migrations";
 import { resizePixelArtDocument } from "./resize";
+import { compactPixelArtDocument, compactPixelLayer, type CompactPixelArtDocument, type CompactPixelLayer } from "./compactPixels";
 
 export type ImageResizeOperation = { width: number; height: number; anchor: ImageResizeAnchor };
 export type ImageOperationTransform = {
@@ -45,6 +46,24 @@ export type ImageOperation = {
   _client_frame_dependency?: string;
   _client_dependency_revision?: number;
 };
+
+export type ImageOperationWireAction = Exclude<ImageOperationAction, { type: "layer-add" | "layer-remove" | "import" | "replace" }>
+  | { type: "layer-add"; layer: CompactPixelLayer; after_id: string | null }
+  | { type: "layer-remove"; layer_id: string; expected_layer?: CompactPixelLayer }
+  | { type: "import" | "replace"; document: CompactPixelArtDocument };
+const toWireAction = (action: ImageOperationAction): ImageOperationWireAction => {
+  if (action.type === "import" || action.type === "replace") return { ...action, document: compactPixelArtDocument(action.document) };
+  if (action.type === "layer-add") return { ...action, layer: compactPixelLayer(action.layer, action.layer.pixels.length, 1) };
+  if (action.type === "layer-remove" && action.expected_layer) return { ...action, expected_layer: compactPixelLayer(action.expected_layer, action.expected_layer.pixels.length, 1) };
+  return action;
+};
+/** Client journal/dependency metadata never leaves this boundary. */
+export const toImageOperationPacket = (operation: ImageOperation) => ({
+  operation_id: operation.operation_id, base_revision: operation.base_revision,
+  width: operation.width, height: operation.height, actions: operation.actions.map(toWireAction),
+  ...(operation.history_group_id ? { history_group_id: operation.history_group_id } : {}),
+  ...(operation.coordinate_after_operation_id ? { coordinate_after_operation_id: operation.coordinate_after_operation_id } : {}),
+});
 
 export class ImageOperationConflict extends Error {
   constructor(message: string) {
@@ -118,12 +137,18 @@ export const applyImageActions = (
   actions: readonly ImageOperationAction[],
   dimensions: { width: number; height: number } = source,
 ): PixelArtDocumentV2 => {
-  let document = clonePixelArtDocument(source);
   if (actions.length === 1 && actions[0]?.type === "resize") return resizePixelArtDocument(source, actions[0].width, actions[0].height, actions[0].anchor);
-  if (actions.length === 1 && (actions[0]?.type === "undo" || actions[0]?.type === "redo")) return document;
+  if (actions.length === 1 && (actions[0]?.type === "undo" || actions[0]?.type === "redo")) return clonePixelArtDocument(source);
   if (actions.length === 1 && (actions[0]?.type === "replace" || actions[0]?.type === "import")) {
     return clonePixelArtDocument(parsePixelArtResourceData({ pixel_art: actions[0].document }).document);
   }
+  const ids = new Set(source.layers.map((layer) => layer.id));
+  for (const action of actions) {
+    if (action.type === "layer-add") ids.add(action.layer.id);
+    if (action.type === "layer-remove" && !action.expected_layer && ids.size > 1) ids.delete(action.layer_id);
+    if (source.width * source.height * ids.size > MAX_IMAGE_DOCUMENT_PIXELS) throw new ImageOperationConflict("The image exceeds the total layer-pixel limit. Your changes have been preserved.");
+  }
+  let document = clonePixelArtDocument(source);
   if (source.width !== dimensions.width || source.height !== dimensions.height) {
     throw new ImageOperationConflict("The canvas dimensions changed. Your pending changes have been preserved.");
   }
@@ -178,14 +203,14 @@ export const applyImageActions = (
 export const validateImageOperation = (value: unknown): value is ImageOperation => {
   if (!value || typeof value !== "object") return false;
   const operation = value as ImageOperation;
-  if (typeof operation.operation_id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(operation.operation_id) || !Number.isSafeInteger(operation.base_revision) || operation.base_revision < 0 || !Number.isInteger(operation.width) || operation.width < 1 || operation.width > 256 || !Number.isInteger(operation.height) || operation.height < 1 || operation.height > 256 || !Array.isArray(operation.actions) || !operation.actions.length || operation.actions.length > 256 || operation.actions.reduce((count, action) => count + (action?.type === "pixels" && Array.isArray(action.changes) ? action.changes.length : 0), 0) > 262144) return false;
+  if (typeof operation.operation_id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(operation.operation_id) || !Number.isSafeInteger(operation.base_revision) || operation.base_revision < 0 || !isValidImageDimensions(operation.width, operation.height) || !Array.isArray(operation.actions) || !operation.actions.length || operation.actions.length > 256 || operation.actions.reduce((count, action) => count + (action?.type === "pixels" && Array.isArray(action.changes) ? action.changes.length : 0), 0) > 262144) return false;
   try {
     if (operation.history_group_id !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(operation.history_group_id)) return false;
     if (operation.coordinate_after_operation_id !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(operation.coordinate_after_operation_id)) return false;
     for (const action of operation.actions) {
       if (!action || typeof action !== "object") return false;
       if (action.type === "resize") {
-        if (operation.actions.length !== 1 || !Number.isInteger(action.width) || action.width < 1 || action.width > 256 || !Number.isInteger(action.height) || action.height < 1 || action.height > 256 || !anchors.has(action.anchor)) return false;
+        if (operation.actions.length !== 1 || !isValidImageDimensions(action.width, action.height) || !anchors.has(action.anchor)) return false;
       } else if (action.type === "undo" || action.type === "redo") {
         if (operation.actions.length !== 1) return false;
       } else if (action.type === "replace" || action.type === "import") {
@@ -272,8 +297,10 @@ export const splitImageActionBatches = (actions: ImageOperationAction[]): ImageO
   let batch: ImageOperationAction[] = [];
   let changes = 0;
   let bytes = 0;
-  for (const action of actions) {
-    const actionBytes = new TextEncoder().encode(JSON.stringify(action)).byteLength;
+  const boundedActions = actions.flatMap((action) => action.type === "pixels" && action.changes.length > 65_536
+    ? Array.from({ length: Math.ceil(action.changes.length / 65_536) }, (_, index): ImageOperationAction => ({ ...action, changes: action.changes.slice(index * 65_536, (index + 1) * 65_536) })) : [action]);
+  for (const action of boundedActions) {
+    const actionBytes = new TextEncoder().encode(JSON.stringify(toWireAction(action))).byteLength;
     const pixelChanges = action.type === "pixels" ? action.changes.length : 0;
     // The public proxy's request-body ceiling is lower than the backend's 8MiB
     // bound. Leave ample headroom for UTF-8 identifiers and packet metadata.

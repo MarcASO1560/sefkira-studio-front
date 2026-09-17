@@ -3,10 +3,14 @@ import {
   createPixelLayer,
   MAX_IMAGE_DIMENSION,
   MIN_IMAGE_DIMENSION,
+  MAX_IMAGE_PIXEL_COUNT,
+  MAX_IMAGE_DOCUMENT_PIXELS,
   normalizePixelColor,
   normalizePalette,
 } from "./document";
 import type { PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
+import { decodeCompactPixels } from "./compactPixels";
+import { registerNormalizedPixelArray } from "./pixelBufferTrust";
 
 export type PixelArtParseResult = {
   document: PixelArtDocumentV2;
@@ -37,6 +41,7 @@ export class PixelArtMigrationError extends Error {
     this.code = code;
     this.version = options.version;
   }
+
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -80,6 +85,10 @@ const parseV2Document = (payload: Record<string, unknown>): PixelArtDocumentV2 =
     );
   }
 
+  if (payload.width * payload.height > MAX_IMAGE_PIXEL_COUNT) {
+    throw new PixelArtMigrationError("invalid-document", `Stored pixel-art v2 canvas may contain at most ${MAX_IMAGE_PIXEL_COUNT} pixels.`, { version: 2 });
+  }
+
   const normalizedColors = new Map<string, string>();
   const normalizeCachedColor = (value: string): PixelColor => {
     const cached = normalizedColors.get(value);
@@ -120,6 +129,7 @@ const parseV2Document = (payload: Record<string, unknown>): PixelArtDocumentV2 =
   }
 
   const expectedPixelCount = payload.width * payload.height;
+  if (expectedPixelCount * payload.layers.length > MAX_IMAGE_DOCUMENT_PIXELS) throw new PixelArtMigrationError("invalid-document", `Stored pixel-art v2 document may contain at most ${MAX_IMAGE_DOCUMENT_PIXELS} layer pixels.`, { version: 2 });
   const layerIds = new Set<string>();
   const layers: PixelLayer[] = [];
   for (const [index, layer] of payload.layers.entries()) {
@@ -143,8 +153,8 @@ const parseV2Document = (payload: Record<string, unknown>): PixelArtDocumentV2 =
       !Number.isFinite(layer.opacity) ||
       layer.opacity < 0 ||
       layer.opacity > 1 ||
-      !Array.isArray(layer.pixels) ||
-      layer.pixels.length !== expectedPixelCount
+      !Array.isArray(layer.pixels) && !isRecord(layer.pixels) ||
+      Array.isArray(layer.pixels) && layer.pixels.length !== expectedPixelCount
     ) {
       throw new PixelArtMigrationError(
         "invalid-document",
@@ -153,7 +163,12 @@ const parseV2Document = (payload: Record<string, unknown>): PixelArtDocumentV2 =
       );
     }
 
-    const pixels: PixelColor[] = Array(expectedPixelCount);
+    let pixels: PixelColor[];
+    if (!Array.isArray(layer.pixels)) {
+      try { pixels = decodeCompactPixels(layer.pixels, expectedPixelCount); }
+      catch { throw new PixelArtMigrationError("invalid-document", `Stored pixel-art v2 layer ${index + 1} is invalid.`, { version: 2 }); }
+    } else {
+    pixels = Array(expectedPixelCount);
     for (let pixel = 0; pixel < expectedPixelCount; pixel += 1) {
       if (!(pixel in layer.pixels)) { pixels[pixel] = null; continue; }
       const value = layer.pixels[pixel];
@@ -166,6 +181,8 @@ const parseV2Document = (payload: Record<string, unknown>): PixelArtDocumentV2 =
         );
       }
       pixels[pixel] = normalized;
+    }
+    registerNormalizedPixelArray(pixels);
     }
     layerIds.add(layer.id);
     layers.push({ id: layer.id, name: layer.name.trim(), visible: layer.visible, locked: layer.locked, opacity: Math.max(0, layer.opacity), pixels });
