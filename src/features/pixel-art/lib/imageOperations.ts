@@ -1,5 +1,5 @@
 import type { ImageResizeAnchor, PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
-import { clonePixelArtDocument, isValidImageDimensions, MAX_IMAGE_DOCUMENT_PIXELS, normalizePixelColor } from "./document";
+import { clonePixelArtDocument, isValidImageDimensions, MAX_IMAGE_DOCUMENT_PIXELS, MAX_IMAGE_PIXEL_COUNT, normalizePixelColor } from "./document";
 import { parsePixelArtResourceData } from "./migrations";
 import { resizePixelArtDocument } from "./resize";
 import { compactPixelArtDocument, compactPixelLayer, type CompactPixelArtDocument, type CompactPixelLayer } from "./compactPixels";
@@ -19,9 +19,11 @@ export type ImageOperationTransform = {
 export type SharedImageHistory = { can_undo: boolean; can_redo: boolean };
 
 export type ImagePixelChange = [number, PixelColor] | [number, PixelColor, PixelColor];
+export type ImagePixelRun = [number, number];
 export type ImageLayerFields = Partial<Pick<PixelLayer, "name" | "visible" | "locked" | "opacity">>;
 export type ImageOperationAction =
   | { type: "pixels"; layer_id: string; changes: ImagePixelChange[] }
+  | { type: "pixel-runs"; layer_id: string; color: PixelColor; runs: ImagePixelRun[] }
   | { type: "layer-add"; layer: PixelLayer; after_id: string | null }
   | { type: "layer-remove"; layer_id: string; expected_layer?: PixelLayer }
   | { type: "layer-update"; layer_id: string; fields: ImageLayerFields; expected?: ImageLayerFields }
@@ -77,6 +79,22 @@ const equal = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.s
 const color = (value: PixelColor) => value === null ? null : normalizePixelColor(value);
 const anchors = new Set<ImageResizeAnchor>(["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"]);
 
+/** External spans are sorted, disjoint and bounded without enumerating pixels. */
+export const validateImagePixelRuns = (value: unknown, pixelCount: number): value is ImagePixelRun[] => {
+  if (!Number.isSafeInteger(pixelCount) || pixelCount < 1 || pixelCount > MAX_IMAGE_PIXEL_COUNT || !Array.isArray(value) || !value.length || value.length > 65_536) return false;
+  let end = 0;
+  for (const run of value) {
+    if (!Array.isArray(run) || run.length !== 2 || !Number.isSafeInteger(run[0]) || !Number.isSafeInteger(run[1]) || run[0] < end || run[1] < 1 || run[0] + run[1] > pixelCount) return false;
+    end = run[0] + run[1];
+  }
+  return true;
+};
+const appendRun = (runs: ImagePixelRun[], start: number, length: number) => {
+  const last = runs.at(-1);
+  if (last && last[0] + last[1] === start) last[1] += length;
+  else runs.push([start, length]);
+};
+
 /** Only the local change is encoded; unchanged remote pixels never enter a save. */
 export const diffImageDocuments = (
   before: PixelArtDocumentV2,
@@ -113,13 +131,34 @@ export const diffImageDocuments = (
       actions.push({ type: "layer-update", layer_id: layer.id, fields: changedFields, ...(options.conditional ? { expected } : {}) });
     }
     const changes: ImagePixelChange[] = [];
+    const runs: ImagePixelRun[] = [];
+    let uniformColor: PixelColor | undefined;
+    let uniform = !options.conditional;
+    let changedCount = 0;
+    const normalizedColors = new Map<PixelColor, PixelColor>();
+    const cachedColor = (raw: PixelColor) => {
+      if (!normalizedColors.has(raw)) normalizedColors.set(raw, color(raw));
+      return normalizedColors.get(raw)!;
+    };
     for (let pixel = 0; pixel < layer.pixels.length; pixel += 1) {
-      if (color(old.pixels[pixel]!) === color(layer.pixels[pixel]!)) continue;
-      changes.push(options.conditional
-        ? [pixel, color(layer.pixels[pixel]!), color(old.pixels[pixel]!)]
-        : [pixel, color(layer.pixels[pixel]!)]);
+      const previousColor = cachedColor(old.pixels[pixel]!);
+      const nextColor = cachedColor(layer.pixels[pixel]!);
+      if (previousColor === nextColor) continue;
+      changedCount += 1;
+      if (uniformColor === undefined) uniformColor = nextColor;
+      if (uniform && nextColor !== uniformColor) {
+        uniform = false;
+        for (const [start, length] of runs) for (let index = start; index < start + length; index += 1) changes.push([index, uniformColor!]);
+        runs.length = 0;
+      }
+      if (uniform) appendRun(runs, pixel, 1);
+      else changes.push(options.conditional ? [pixel, nextColor, previousColor] : [pixel, nextColor]);
     }
-    if (changes.length) actions.push({ type: "pixels", layer_id: layer.id, changes });
+    if (uniform && changedCount >= 4096 && runs.length <= 65_536) actions.push({ type: "pixel-runs", layer_id: layer.id, color: uniformColor!, runs });
+    else {
+      if (uniform) for (const [start, length] of runs) for (let index = start; index < start + length; index += 1) changes.push([index, uniformColor!]);
+      if (changes.length) actions.push({ type: "pixels", layer_id: layer.id, changes });
+    }
   }
   // Add replacements first, so even a one-layer swap never removes the last layer.
   for (const layer of before.layers) {
@@ -191,6 +230,11 @@ export const applyImageActions = (
       }
       continue;
     }
+    if (action.type === "pixel-runs") {
+      const nextColor = color(action.color);
+      for (const [start, length] of action.runs) layer.pixels.fill(nextColor, start, start + length);
+      continue;
+    }
     for (const change of action.changes) {
       if (change.length === 3 && color(layer.pixels[change[0]]!) !== color(change[2])) continue;
       layer.pixels[change[0]] = color(change[1]);
@@ -205,6 +249,7 @@ export const validateImageOperation = (value: unknown): value is ImageOperation 
   const operation = value as ImageOperation;
   if (typeof operation.operation_id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(operation.operation_id) || !Number.isSafeInteger(operation.base_revision) || operation.base_revision < 0 || !isValidImageDimensions(operation.width, operation.height) || !Array.isArray(operation.actions) || !operation.actions.length || operation.actions.length > 256 || operation.actions.reduce((count, action) => count + (action?.type === "pixels" && Array.isArray(action.changes) ? action.changes.length : 0), 0) > 262144) return false;
   try {
+    let coverage = operation.actions.reduce((count, action) => count + (action?.type === "pixels" && Array.isArray(action.changes) ? action.changes.length : 0), 0);
     if (operation.history_group_id !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(operation.history_group_id)) return false;
     if (operation.coordinate_after_operation_id !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(operation.coordinate_after_operation_id)) return false;
     for (const action of operation.actions) {
@@ -219,6 +264,10 @@ export const validateImageOperation = (value: unknown): value is ImageOperation 
         if (action.document.layers.length > 128) return false;
       } else if (action.type === "pixels") {
         if (!action.layer_id || !Array.isArray(action.changes) || !action.changes.length || action.changes.length > 65536 || !action.changes.every((change) => Array.isArray(change) && (change.length === 2 || change.length === 3) && Number.isInteger(change[0]) && change[0] >= 0 && change[0] < operation.width * operation.height && change.slice(1).every((entry) => entry === null || typeof entry === "string" && normalizePixelColor(entry) !== null))) return false;
+      } else if (action.type === "pixel-runs") {
+        if (typeof action.layer_id !== "string" || !action.layer_id.trim() || action.color !== null && (typeof action.color !== "string" || normalizePixelColor(action.color) === null) || !validateImagePixelRuns(action.runs, operation.width * operation.height)) return false;
+        coverage += action.runs.reduce((count, run) => count + run[1], 0);
+        if (coverage > MAX_IMAGE_PIXEL_COUNT) return false;
       } else if (action.type === "layer-add") {
         parsePixelArtResourceData({ pixel_art: { version: 2, width: operation.width, height: operation.height, palette: [], layers: [action.layer] } });
         if (action.after_id !== null && typeof action.after_id !== "string") return false;
@@ -283,6 +332,28 @@ export const rebaseImageOperationActions = (
       for (const change of action.changes) { const mapped = mapIndex(change[0]); if (mapped !== null) changes.push(change.length === 3 ? [mapped, change[1], change[2]] : [mapped, change[1]]); }
       return { ...action, changes };
     }
+    if (action.type === "pixel-runs") {
+      let runs = action.runs.map(([start, length]): ImagePixelRun => [start, length]);
+      let currentWidth = operation.width;
+      for (const event of applicable) {
+        const mapped: ImagePixelRun[] = [];
+        for (const [start, length] of runs) {
+          const end = start + length;
+          for (let cursor = start; cursor < end;) {
+            const x = cursor % currentWidth;
+            const rowLength = Math.min(end - cursor, currentWidth - x);
+            const y = Math.floor(cursor / currentWidth) + event.offset_y;
+            const left = Math.max(0, x + event.offset_x);
+            const right = Math.min(event.to_width, x + rowLength + event.offset_x);
+            if (y >= 0 && y < event.to_height && right > left) appendRun(mapped, y * event.to_width + left, right - left);
+            cursor += rowLength;
+          }
+        }
+        runs = mapped;
+        currentWidth = event.to_width;
+      }
+      return { ...action, runs };
+    }
     if (action.type === "layer-add") return { ...action, layer: mapLayer(action.layer) };
     if (action.type === "layer-remove" && action.expected_layer) return { ...action, expected_layer: mapLayer(action.expected_layer) };
     return action;
@@ -296,19 +367,21 @@ export const splitImageActionBatches = (actions: ImageOperationAction[]): ImageO
   const batches: ImageOperationAction[][] = [];
   let batch: ImageOperationAction[] = [];
   let changes = 0;
+  let coverage = 0;
   let bytes = 0;
   const boundedActions = actions.flatMap((action) => action.type === "pixels" && action.changes.length > 65_536
     ? Array.from({ length: Math.ceil(action.changes.length / 65_536) }, (_, index): ImageOperationAction => ({ ...action, changes: action.changes.slice(index * 65_536, (index + 1) * 65_536) })) : [action]);
   for (const action of boundedActions) {
     const actionBytes = new TextEncoder().encode(JSON.stringify(toWireAction(action))).byteLength;
     const pixelChanges = action.type === "pixels" ? action.changes.length : 0;
+    const actionCoverage = action.type === "pixel-runs" ? action.runs.reduce((count, run) => count + run[1], 0) : pixelChanges;
     // The public proxy's request-body ceiling is lower than the backend's 8MiB
     // bound. Leave ample headroom for UTF-8 identifiers and packet metadata.
     if (actionBytes > 3 * 1024 * 1024 - 1024) throw new ImageOperationConflict("This image replacement is too large to synchronize safely. Keep the tab open and export your local copy.");
-    if (batch.length && (batch.length >= 256 || changes + pixelChanges > 262144 || bytes + actionBytes > 3 * 1024 * 1024 - 1024)) {
-      batches.push(batch); batch = []; changes = 0; bytes = 0;
+    if (batch.length && (batch.length >= 256 || changes + pixelChanges > 262144 || coverage + actionCoverage > MAX_IMAGE_PIXEL_COUNT || bytes + actionBytes > 3 * 1024 * 1024 - 1024)) {
+      batches.push(batch); batch = []; changes = 0; bytes = 0; coverage = 0;
     }
-    batch.push(action); changes += pixelChanges; bytes += actionBytes;
+    batch.push(action); changes += pixelChanges; bytes += actionBytes; coverage += actionCoverage;
   }
   if (batch.length) batches.push(batch);
   return batches;

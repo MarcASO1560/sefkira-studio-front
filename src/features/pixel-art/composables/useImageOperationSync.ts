@@ -5,7 +5,7 @@ import { clonePixelArtDocument, isValidImageDimensions, normalizePixelColor, MAX
 import { compactPixelArtDocument } from "../lib/compactPixels";
 import { registerNormalizedPixelArray } from "../lib/pixelBufferTrust";
 import { parsePixelArtResourceData } from "../lib/migrations";
-import { applyImageActions, diffImageDocuments, ImageOperationConflict, rebaseImageOperationActions, splitImageActionBatches, validateImageOperation, type ImageOperation, type ImageOperationTransform, type ImageResizeOperation, type SharedImageHistory } from "../lib/imageOperations";
+import { applyImageActions, diffImageDocuments, ImageOperationConflict, rebaseImageOperationActions, splitImageActionBatches, validateImageOperation, validateImagePixelRuns, type ImageOperation, type ImageOperationTransform, type ImageResizeOperation, type SharedImageHistory, type ImagePixelRun } from "../lib/imageOperations";
 import { claimImageOperationSession, createImageOperationId, createIndexedDbImageOperationStore, type ImageOperationStore, type StoredImageOperationQueue } from "../lib/imageOperationStore";
 import { createImageOperationTransport, ImageOperationHttpError, normalizeImageOperationResource, validateImageOperationAcknowledgement, validateImageOperationState, validateImageOperationTransforms, validateSharedImageHistory, type ImageOperationTransport } from "../lib/imageOperationsApi";
 
@@ -335,7 +335,7 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
         errorMessage.value = "";
         const entry = entries[0]!;
         const operation = entry.operation;
-        const normalDelta = operation.actions.every((action) => action.type === "pixels" || action.type === "layer-update");
+        const normalDelta = operation.actions.every((action) => action.type === "pixels" || action.type === "pixel-runs" || action.type === "layer-update");
         const sharedHistoryCommand = isSharedHistoryOperation(operation);
         if (!normalDelta && !sharedHistoryCommand || operation._client_attempted || resyncVersion > synchronizedVersion) {
           // Reconnect/retry and structural edits retain a fresh server barrier.
@@ -503,6 +503,34 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
       return queueActions(before, [{ type: "pixels", layer_id: layerId, changes: tuples }], settings);
     } catch (error) { report(error); }
   };
+  /** Atomic uniform fill: durable spans, never a million per-pixel tuples. */
+  const schedulePixelRuns = async (width: number, height: number, layerId: string, runs: readonly (readonly [number, number])[], nextColor: PixelColor, settings: ImageOperationPixelScheduleSettings = {}) => {
+    if (disposed || !isReady.value || !canonical || !observed) return;
+    try {
+      verifyScope();
+      if (!isValidImageDimensions(width, height) || width !== observed.width || height !== observed.height) throw new Error("The pixel runs do not match this tab's observed canvas dimensions.");
+      const layerIndex = observed.layers.findIndex((layer) => layer.id === layerId);
+      if (typeof layerId !== "string" || !layerId.trim() || layerIndex < 0) throw new Error("The pixel runs do not match an observed image layer.");
+      if (!validateImagePixelRuns(runs, width * height)) throw new Error("The local pixel runs are invalid.");
+      if (settings.conditional) throw new Error("Conditional pixel-run edits are not supported. Use conditional pixel changes instead.");
+      const normalized = nextColor === null ? null : normalizePixelColor(nextColor);
+      if (nextColor !== null && normalized === null) throw new Error("The local pixel runs contain an invalid color.");
+      const layer = observed.layers[layerIndex]!;
+      let changed = false;
+      for (const [start, length] of runs) {
+        for (let index = start; index < start + length; index += 1) if (layer.pixels[index] !== normalized) { changed = true; break; }
+        if (changed) break;
+      }
+      if (!changed) return;
+      const before = observed;
+      const pixels = registerNormalizedPixelArray(layer.pixels.slice());
+      const immutableRuns: ImagePixelRun[] = runs.map(([start, length]) => [start, length]);
+      for (const [start, length] of immutableRuns) pixels.fill(normalized, start, start + length);
+      const layers = observed.layers.slice(); layers[layerIndex] = { ...layer, pixels };
+      observed = { ...observed, layers };
+      return queueActions(before, [{ type: "pixel-runs", layer_id: layerId, color: normalized, runs: immutableRuns }], settings);
+    } catch (error) { report(error); }
+  };
   const flush = async () => {
     clearTimer();
     if (!disposed && online() && entries.length) await run();
@@ -631,5 +659,5 @@ export const useImageOperationSync = (options: ImageOperationSyncOptions) => {
     // Let the last local write finish before releasing the tab's ownership.
     void persistence.catch(() => undefined).finally(() => { store?.dispose?.(); releaseSession?.(); });
   };
-  return { status, errorMessage, hasPendingChanges, lastSavedAt, isReady, pendingCount, sharedHistory, canUndo, canRedo, isHistoryBusy, undo, redo, start, schedule, schedulePixels, flush, refresh, retry, acceptResource, discardPending, setInteractionActive, getCachedResource, dispose };
+  return { status, errorMessage, hasPendingChanges, lastSavedAt, isReady, pendingCount, sharedHistory, canUndo, canRedo, isHistoryBusy, undo, redo, start, schedule, schedulePixels, schedulePixelRuns, flush, refresh, retry, acceptResource, discardPending, setInteractionActive, getCachedResource, dispose };
 };

@@ -65,6 +65,7 @@ import {
 } from "../../pixel-art/lib/color";
 import { createImageCanvasRenderPlan } from "../../pixel-art/lib/canvasRendering";
 import { createIncrementalImageCanvasBitmap } from "../../pixel-art/lib/incrementalCanvasBitmap";
+import { floodFillPixelRuns } from "../../pixel-art/lib/floodFillRuns";
 import { MIN_IMAGE_ZOOM, MAX_IMAGE_ZOOM } from "../../pixel-art/lib/zoomLimits";
 import {
   clampCanvasMirrorAxis,
@@ -4243,38 +4244,39 @@ const fillImagePixelsFrom = (startIndex: number, replacementColor: PixelColor) =
     return;
   }
 
-  const targetColor = imagePixels.value[startIndex] || null;
-  if (targetColor === replacementColor) return;
-
-  const nextPixels = [...imagePixels.value];
-  const pending = [startIndex];
-  const visited = new Set<number>();
-
-  while (pending.length > 0) {
-    const index = pending.pop();
-
-    if (
-      index === undefined ||
-      visited.has(index) ||
-      !isImagePixelIndexWithinSelection(index) ||
-      nextPixels[index] !== targetColor
-    ) {
-      continue;
-    }
-
-    visited.add(index);
-    nextPixels[index] = replacementColor;
-
-    const row = Math.floor(index / imageGridWidth.value);
-    const column = index % imageGridWidth.value;
-
-    if (row > 0) pending.push(index - imageGridWidth.value);
-    if (row < imageGridHeight.value - 1) pending.push(index + imageGridWidth.value);
-    if (column > 0) pending.push(index - 1);
-    if (column < imageGridWidth.value - 1) pending.push(index + 1);
+  const fill = floodFillPixelRuns({
+    pixels: imagePixels.value,
+    width: imageGridWidth.value,
+    height: imageGridHeight.value,
+    startIndex,
+    color: replacementColor,
+    contains: imageSelection.value ? isImagePixelIndexWithinSelection : undefined,
+  });
+  if (!fill) return;
+  imagePixels.value = fill.pixels;
+  scheduleImageCanvasRender();
+  // Keep the preview baseline on this immutable frame. The fill's exact region
+  // is already known; do not scan it again or allocate a million changes.
+  lastImageLivePreviewDocument = buildImageDocument(false, false);
+  if (fill.runs.length > 65_536) {
+    // Unusually fragmented selections retain the existing bounded journal path.
+    // Never silently discard a local fill when its compact region exceeds quota.
+    scheduleImageAutosave();
+    return;
   }
-
-  updateImagePixels(nextPixels);
+  const previewSequence = imageLivePreviewSender.enqueueRuns({
+    width: imageGridWidth.value,
+    height: imageGridHeight.value,
+    baseRevision: resource.value?.revision ?? 0,
+    layerId: activeImageLayerId.value,
+    color: fill.color,
+    runs: fill.runs,
+  });
+  void imageAutosave.schedulePixelRuns(imageGridWidth.value, imageGridHeight.value,
+    activeImageLayerId.value, fill.runs, fill.color, {
+      ...(previewSequence === undefined ? {} : { previewSequence }),
+      ...(imageHistoryGroupId ? { historyGroupId: imageHistoryGroupId } : {}),
+    });
 };
 
 const pickImageColorFrom = (pixelIndex: number, channel: ImageColorChannel) => {

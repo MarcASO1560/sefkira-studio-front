@@ -94,6 +94,89 @@ describe("durable image operation synchronization", () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
+  it("queues a frozen full 1024-square fill as one durable operation and sends one POST without a healthy GET", async () => {
+    const initial = createPixelArtDocument(1024, 1024, { layers: [createPixelLayer(1024, 1024, { id: "large" })] });
+    const remote = server(); remote.replace(resource(initial)); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current);
+    const runs = Object.freeze([Object.freeze([0, 1_048_576] as const)]);
+    await local.sync.schedulePixelRuns(1024, 1024, "large", runs, "#abcdef80", { historyGroupId: "one-fill", previewSequence: 7 });
+    expect(disk.saved?.operations).toHaveLength(1); expect(disk.saved?.operations[0]).toMatchObject({ width: 1024, height: 1024, history_group_id: "one-fill", actions: [{ type: "pixel-runs", layer_id: "large", color: "#ABCDEF80", runs: [[0, 1_048_576]] }] });
+    expect(JSON.stringify(disk.saved?.operations).length).toBeLessThan(350); expect(parsePixelArtResourceData({ pixel_art: disk.saved!.localDocument }).document.layers[0]!.pixels[1_048_575]).toBe("#ABCDEF80");
+    await local.sync.flush(); expect(remote.sendOperation).toHaveBeenCalledOnce(); expect(remote.transport.fetchResource).not.toHaveBeenCalled();
+    expect(local.document.layers[0]!.pixels[0]).toBe("#ABCDEF80"); expect(local.document.layers[0]!.pixels[1_048_575]).toBe("#ABCDEF80"); expect(local.sync.status.value).toBe("saved");
+    expect(runs).toEqual([[0, 1_048_576]]); expect(initial.layers[0]!.pixels[1_048_575]).toBeNull(); local.sync.dispose();
+  });
+
+  it("atomic million-pixel fill is undone and redone in a single global server-history step", async () => {
+    const remote = sharedServer(); const local = client(memoryStore().store, remote.transport); await local.sync.start(remote.current);
+    const resize = { width: 1024, height: 1024, anchor: "top-left" as const };
+    await local.sync.schedule(applyImageActions(local.document, [{ type: "resize", ...resize }]), { resize }); await local.sync.flush(); remote.sendOperation.mockClear();
+    await local.sync.schedulePixelRuns(1024, 1024, "layer", [[0, 1_048_576]], "#123456", { historyGroupId: "fill" }); await local.sync.flush();
+    expect(remote.sendOperation).toHaveBeenCalledOnce(); expect(await local.sync.undo()).toBe(true);
+    expect(local.document.width).toBe(1024); expect(local.document.layers[0]!.pixels.every((pixel) => pixel === null)).toBe(true);
+    expect(await local.sync.redo()).toBe(true); expect(local.document.layers[0]!.pixels.every((pixel) => pixel === "#123456")).toBe(true);
+    expect(remote.sendOperation.mock.calls.map(([operation]) => operation.actions[0]!.type)).toEqual(["pixel-runs", "undo", "redo"]); local.sync.dispose();
+  });
+
+  it("cannot transmit a span operation before its pending/attempted journal transaction commits", async () => {
+    const remote = server(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current);
+    const gate = deferred<void>(); const write = disk.store.write;
+    disk.store.write = async (queue) => { if (queue.operations.some((operation) => operation.actions[0]?.type === "pixel-runs")) await gate.promise; await write(queue); };
+    const scheduling = local.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], "#FF0000"); const flushing = local.sync.flush();
+    await settle(); expect(remote.sendOperation).not.toHaveBeenCalled(); gate.resolve(); await scheduling; await flushing;
+    expect(remote.sendOperation).toHaveBeenCalledOnce(); expect(local.sync.status.value).toBe("saved"); expect(disk.saved?.operations).toEqual([]); local.sync.dispose();
+  });
+
+  it("retains original span packets after a lost ACK without repainting subsequent remote edits on retry", async () => {
+    const remote = sharedServer(); const disk = memoryStore(); const local = client(disk.store, remote.transport); const other = client(memoryStore().store, remote.transport); await local.sync.start(remote.current); await other.sync.start(remote.current);
+    const send = remote.transport.sendOperation; let lost = true;
+    remote.transport.sendOperation = async (operation) => { const result = await send(operation); if (operation.actions[0]?.type === "pixel-runs" && lost) { lost = false; throw new TypeError("ACK lost"); } return result; };
+    await local.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], "#FF0000"); await local.sync.flush();
+    const original = clone(disk.saved!.operations[0]); expect(original?._client_attempted).toBe(true); expect(local.sync.hasPendingChanges.value).toBe(true);
+    await other.sync.refresh(); await other.sync.schedulePixels(2, 2, "layer", [{ index: 1, before: "#FF0000", after: "#00FF00" }]); await other.sync.flush();
+    await local.sync.retry(); const retries = remote.sendOperation.mock.calls.filter(([operation]) => operation.operation_id === original!.operation_id).map(([operation]) => operation);
+    expect(retries).toHaveLength(2); expect(retries[0]).toEqual(retries[1]); expect(local.document.layers[0]!.pixels).toEqual(["#FF0000", "#00FF00", "#FF0000", "#FF0000"]);
+    expect(local.sync.hasPendingChanges.value).toBe(false); local.sync.dispose(); other.sync.dispose();
+  });
+
+  it("recovers pending runs through every server resize/crop/undo frame while retrying the original coordinates", async () => {
+    const remote = sharedServer(); const disk = memoryStore(); const offline = client(disk.store, remote.transport, { isOnline: () => false }); await offline.sync.start(remote.current);
+    await offline.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], "#FF0000"); const original = clone(disk.saved!.operations[0]); offline.sync.dispose();
+    const other = client(memoryStore().store, remote.transport); await other.sync.start(remote.current);
+    for (const resize of [{ width: 3, height: 3, anchor: "bottom-right" as const }, { width: 2, height: 2, anchor: "top-left" as const }]) {
+      await other.sync.schedule(applyImageActions(other.document, [{ type: "resize", ...resize }]), { resize }); await other.sync.flush();
+    }
+    expect(await other.sync.undo()).toBe(true);
+    const recovered = client(disk.store, remote.transport); await recovered.sync.start(remote.current); await recovered.sync.flush();
+    expect(recovered.document.width).toBe(3); expect(recovered.document.layers[0]!.pixels).toEqual([null, null, null, null, "#FF0000", null, null, null, null]);
+    const fill = remote.sendOperation.mock.calls.find(([operation]) => operation.operation_id === original!.operation_id)![0];
+    expect(fill.width).toBe(2); expect(fill.height).toBe(2); expect(fill.actions).toEqual(original!.actions); expect(recovered.sync.status.value).toBe("saved"); recovered.sync.dispose(); other.sync.dispose();
+  });
+
+  it("skips unchanged span fills without allocating journal operations and supports null erasure", async () => {
+    const remote = server(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current); vi.mocked(disk.store.write).mockClear();
+    await local.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], null); expect(disk.store.write).not.toHaveBeenCalled();
+    await local.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], "#FFFFFF"); await local.sync.flush();
+    await local.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], null); await local.sync.flush(); expect(local.document.layers[0]!.pixels).toEqual([null, null, null, null]); local.sync.dispose();
+  });
+
+  it.each([
+    { width: 3, height: 2, layerId: "layer", runs: [[0, 4]], color: "#FFFFFF" },
+    { width: 2, height: 2, layerId: "missing", runs: [[0, 4]], color: "#FFFFFF" },
+    { width: 2, height: 2, layerId: "layer", runs: [[0, 5]], color: "#FFFFFF" },
+    { width: 2, height: 2, layerId: "layer", runs: [[0, 3], [2, 1]], color: "#FFFFFF" },
+    { width: 2, height: 2, layerId: "layer", runs: [[0, 4]], color: "invalid" },
+    { width: 2, height: 2, layerId: "layer", runs: [[0, 4]], color: "#FFFFFF", settings: { conditional: true } },
+  ])("rejects invalid observed span edits atomically %#", async ({ width, height, layerId, runs, color, settings }) => {
+    const remote = server(); const disk = memoryStore(); const local = client(disk.store, remote.transport); await local.sync.start(remote.current); vi.mocked(disk.store.write).mockClear();
+    await local.sync.schedulePixelRuns(width, height, layerId, runs as [number, number][], color, settings);
+    expect(local.sync.errorMessage.value).not.toBe(""); expect(local.sync.pendingCount.value).toBe(0); expect(disk.store.write).not.toHaveBeenCalled(); expect(remote.sendOperation).not.toHaveBeenCalled(); expect(local.document).toEqual(baseDocument()); local.sync.dispose();
+  });
+
+  it("retains the account guard for span fills without overwriting another account's journal", async () => {
+    let account = "user"; const remote = server(); const disk = memoryStore(); const local = client(disk.store, remote.transport, { userId: () => account }); await local.sync.start(remote.current); vi.mocked(disk.store.write).mockClear();
+    account = "other"; await local.sync.schedulePixelRuns(2, 2, "layer", [[0, 4]], "#FF0000"); expect(local.sync.errorMessage.value).toContain("signed-in account changed"); expect(disk.store.write).not.toHaveBeenCalled(); expect(remote.sendOperation).not.toHaveBeenCalled(); local.sync.dispose();
+  });
+
   it("persists a compact 1024-square draft and recovers only its pending sparse delta over newer remote pixels", async () => {
     const initial = createPixelArtDocument(1024, 1024, { layers: [createPixelLayer(1024, 1024, { id: "large" })] });
     const remote = server(); remote.replace(resource(initial)); const disk = memoryStore();
