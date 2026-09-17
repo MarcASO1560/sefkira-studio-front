@@ -6,7 +6,7 @@ const initial = () => createPixelArtDocument(2, 1, {
   layers: [createPixelLayer(2, 1, { id: "layer", pixels: [null, null] })],
 });
 
-describe("collaborative image history", () => {
+describe("private gesture rollback snapshots", () => {
   it("undoes our pixels without undoing an external edit on another pixel", () => {
     const oldSnapshot = initial();
     const previous = initial();
@@ -67,5 +67,23 @@ describe("collaborative image history", () => {
   it("safely replaces dimension-dependent history after a resize", () => {
     const next = createPixelArtDocument(3, 1);
     expect(rebaseImageHistoryDocument(initial(), initial(), next)).toEqual(next);
+  });
+
+  it("cancels a tentative touch fill without removing remote pixels or layer settings", () => {
+    const touchStart = initial();
+    const tentativeFill = initial();
+    tentativeFill.layers[0]!.pixels = ["#FF0000", "#FF0000"];
+    const withRemoteEdit = clonePixelArtDocument(tentativeFill);
+    withRemoteEdit.layers[0]!.pixels[1] = "#0000FF";
+    withRemoteEdit.layers[0]!.opacity = 0.5;
+    withRemoteEdit.layers[0]!.locked = true;
+    withRemoteEdit.layers.push(createPixelLayer(2, 1, { id: "remote-layer", pixels: ["#00FF00", null] }));
+
+    const rollback = rebaseImageHistoryDocument(touchStart, tentativeFill, withRemoteEdit);
+    expect(rollback.layers[0]!.pixels).toEqual([null, "#0000FF"]);
+    expect(rollback.layers[0]!.opacity).toBe(0.5);
+    expect(rollback.layers[0]!.locked).toBe(true);
+    expect(rollback.layers[1]!.pixels).toEqual(["#00FF00", null]);
+    expect(rollback.palette).toEqual(["#0000FF", "#00FF00"]);
   });
 });

@@ -2,7 +2,7 @@ import { clonePixelArtDocument } from "./document";
 import { deriveUsedPaletteColors } from "./palette";
 import type { PixelArtDocumentV2, PixelLayer } from "../types";
 
-/** External edits must survive local undo/redo; our acknowledged edits are already in the overlay. */
+/** Keep private gesture-cancellation snapshots current; shared Undo is handled by the server. */
 export const rebaseImageHistoryDocument = (
   snapshot: PixelArtDocumentV2,
   previousOverlay: PixelArtDocumentV2,

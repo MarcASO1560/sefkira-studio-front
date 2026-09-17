@@ -1,11 +1,41 @@
 import { apiUrl, type ProjectResourceDetail } from "../../../lib/api";
 import { parsePixelArtResourceData } from "./migrations";
-import type { ImageOperation } from "./imageOperations";
+import type { ImageOperation, ImageOperationTransform, SharedImageHistory } from "./imageOperations";
 
 export type ImageOperationAcknowledgement = {
   operation_id: string;
   applied_revision: number;
   resource: ProjectResourceDetail;
+  history?: SharedImageHistory;
+  transforms?: ImageOperationTransform[];
+};
+
+export type ImageOperationState = {
+  resource: ProjectResourceDetail;
+  history: SharedImageHistory;
+  transforms: ImageOperationTransform[];
+};
+
+export const validateSharedImageHistory = (value: unknown): SharedImageHistory => {
+  if (!value || typeof value !== "object" || typeof (value as SharedImageHistory).can_undo !== "boolean" || typeof (value as SharedImageHistory).can_redo !== "boolean") throw new Error("The server returned invalid shared history state.");
+  return { can_undo: (value as SharedImageHistory).can_undo, can_redo: (value as SharedImageHistory).can_redo };
+};
+export const validateImageOperationTransforms = (value: unknown): ImageOperationTransform[] => {
+  if (!Array.isArray(value)) throw new Error("The server returned invalid shared coordinate history.");
+  for (const event of value as ImageOperationTransform[]) {
+    if (!event || !Number.isSafeInteger(event.revision) || event.revision < 0 || ![event.from_width, event.from_height, event.to_width, event.to_height].every((dimension) => Number.isInteger(dimension) && dimension >= 1 && dimension <= 256) || !Number.isInteger(event.offset_x) || !Number.isInteger(event.offset_y) || event.operation_id !== undefined && typeof event.operation_id !== "string" || event.user_id !== undefined && event.user_id !== null && typeof event.user_id !== "string") throw new Error("The server returned malformed shared coordinate history.");
+  }
+  if (new Set(value.map((event) => event.revision)).size !== value.length) throw new Error("The server returned duplicate shared coordinate revisions.");
+  return value as ImageOperationTransform[];
+};
+export const validateImageOperationState = (value: unknown, projectId: string, resourceId: string): ImageOperationState => {
+  if (!value || typeof value !== "object") throw new Error("The server returned invalid image synchronization state.");
+  const state = value as ImageOperationState;
+  const resource = normalizeImageOperationResource(state.resource, projectId, resourceId);
+  const history = validateSharedImageHistory(state.history);
+  const transforms = validateImageOperationTransforms(state.transforms);
+  if (transforms.some((event) => event.revision > resource.revision)) throw new Error("The shared coordinate history is newer than its image snapshot.");
+  return { resource, history, transforms };
 };
 
 export class ImageOperationHttpError extends Error {
@@ -35,12 +65,16 @@ export const validateImageOperationAcknowledgement = (value: unknown, operation:
   if (acknowledgement.operation_id !== operation.operation_id || !Number.isSafeInteger(acknowledgement.applied_revision) || acknowledgement.applied_revision <= operation.base_revision) throw new Error("The server returned an invalid image-operation acknowledgement. Your changes remain pending.");
   const resource = normalizeImageOperationResource(acknowledgement.resource, projectId, resourceId);
   if (acknowledgement.applied_revision > resource.revision) throw new Error("The server returned an inconsistent image revision. Your changes remain pending.");
-  return { ...acknowledgement, resource };
+  const history = acknowledgement.history === undefined ? undefined : validateSharedImageHistory(acknowledgement.history);
+  const transforms = acknowledgement.transforms === undefined ? undefined : validateImageOperationTransforms(acknowledgement.transforms);
+  if (transforms?.some((event) => event.revision > resource.revision)) throw new Error("The acknowledged coordinate history is newer than its image snapshot.");
+  return { ...acknowledgement, resource, history, transforms };
 };
 
 export type ImageOperationTransport = {
   fetchResource: () => Promise<ProjectResourceDetail>;
   sendOperation: (operation: ImageOperation) => Promise<unknown>;
+  fetchState?: (sinceRevision: number) => Promise<ImageOperationState>;
 };
 
 export const createImageOperationTransport = (projectId: string, resourceId: string): ImageOperationTransport => {
@@ -65,9 +99,10 @@ export const createImageOperationTransport = (projectId: string, resourceId: str
   };
   return {
     async fetchResource() { return normalizeImageOperationResource(await request("", { cache: "no-store" }), projectId, resourceId); },
+    async fetchState(sinceRevision) { return validateImageOperationState(await request(`/image-operations?since_revision=${encodeURIComponent(sinceRevision)}`, { cache: "no-store" }), projectId, resourceId); },
     sendOperation(operation) {
-      const { operation_id, base_revision, width, height, actions } = operation;
-      return request("/image-operations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation_id, base_revision, width, height, actions }) });
+      const { operation_id, base_revision, width, height, actions, history_group_id, coordinate_after_operation_id } = operation;
+      return request("/image-operations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation_id, base_revision, width, height, actions, ...(history_group_id ? { history_group_id } : {}), ...(coordinate_after_operation_id ? { coordinate_after_operation_id } : {}) }) });
     },
   };
 };

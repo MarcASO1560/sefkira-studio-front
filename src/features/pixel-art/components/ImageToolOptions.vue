@@ -107,7 +107,7 @@ const updateBrushSize = (event: Event) => {
         :disabled="!canEdit || !canUndo || rotationBusy"
         aria-label="Undo"
         aria-keyshortcuts="Control+Z Meta+Z"
-        title="Undo (Ctrl/Cmd + Z)"
+        title="Undo last shared edit (Ctrl/Cmd + Z)"
         @click="emit('undo')"
       >
         <Undo2 aria-hidden="true" />
@@ -118,7 +118,7 @@ const updateBrushSize = (event: Event) => {
         :disabled="!canEdit || !canRedo || rotationBusy"
         aria-label="Redo"
         aria-keyshortcuts="Control+Y Meta+Y Control+Shift+Z Meta+Shift+Z"
-        title="Redo (Ctrl/Cmd + Y)"
+        title="Redo shared edit (Ctrl/Cmd + Y)"
         @click="emit('redo')"
       >
         <Redo2 aria-hidden="true" />

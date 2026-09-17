@@ -82,7 +82,6 @@ import {
   type PixelBuffer,
   type Point,
 } from "../../pixel-art/lib/drawing";
-import { createHistory, type SnapshotHistory } from "../../pixel-art/lib/history";
 import {
   createImageGridOverlayPlan,
   getImageGridKeylineColor,
@@ -174,6 +173,7 @@ import {
   type PngExportScale,
 } from "../../pixel-art/lib/importExport";
 import { useImageOperationSync } from "../../pixel-art/composables/useImageOperationSync";
+import { createImageOperationId } from "../../pixel-art/lib/imageOperationStore";
 import { rebaseImageHistoryDocument } from "../../pixel-art/lib/collaborativeHistory";
 import {
   normalizeImagePreferences,
@@ -518,7 +518,6 @@ const imageFloatingPreview = ref<ImageFloatingPreview>({
   size: IMAGE_PREVIEW_MAX_SIZE,
   visible: false,
 });
-const imageHistory = shallowRef<SnapshotHistory<ImageEditorSnapshot> | null>(null);
 const isImageTransferBusy = ref(false);
 const imageTransferNotice = ref("");
 const imageTransferNoticeTone = ref<"error" | "info" | "success">("info");
@@ -559,6 +558,8 @@ let imageInteractionTool: ImageTool | null = null;
 let imageInteractionPrimaryColor = DEFAULT_PENCIL_COLOR;
 let imageInteractionSecondaryColor = "#000000";
 let imageInteractionGraffitiInverted = false;
+let imageHistoryGroupId: string | null = null;
+let imageOpacityHistoryGroup: { layerId: string; id: string } | null = null;
 let isImageViewportPaintAwaitingArtboard = false;
 let imageViewportPaintClientX = 0;
 let imageViewportPaintClientY = 0;
@@ -570,7 +571,6 @@ let imageTouchViewportGesture: TouchViewportGesture | null = null;
 let imageGestureView: ImageViewportTransform | null = null;
 const imageViewportTransformRevision = ref(0);
 let imageSingleTouchStartSnapshot: ImageEditorSnapshot | null = null;
-let imageSingleTouchStartHistory: SnapshotHistory<ImageEditorSnapshot> | null = null;
 let imageSingleTouchStartTool: ImageTool | null = null;
 let imageSingleTouchStartPrimaryColor: string | null = null;
 let imageSingleTouchStartSecondaryColor: string | null = null;
@@ -673,6 +673,7 @@ const canEditImage = computed(
   () =>
     isImageEditor.value &&
     isImageOperationReady.value &&
+    !imageAutosave.isHistoryBusy.value &&
     (project.value?.access_role === "owner" || project.value?.access_role === "editor"),
 );
 const canManagePersonalImagePalette = computed(
@@ -687,8 +688,8 @@ const isActiveImagePixelMutationTool = computed(() =>
 const isImagePixelMutationBlocked = computed(
   () => isActiveImagePixelMutationTool.value && !canMutateActiveImageLayerPixels.value,
 );
-const canUndoImage = computed(() => Boolean(imageHistory.value?.canUndo) && canEditImage.value);
-const canRedoImage = computed(() => Boolean(imageHistory.value?.canRedo) && canEditImage.value);
+const canUndoImage = computed(() => canEditImage.value && imageInteractionKind.value === null && imageAutosave.canUndo.value);
+const canRedoImage = computed(() => canEditImage.value && imageInteractionKind.value === null && imageAutosave.canRedo.value);
 const getRgbFromHexColor = (color: string) => {
   const hex = color.replace("#", "");
 
@@ -2405,6 +2406,20 @@ const applyRemoteImageDocument = (
   const currentLayerId = activeImageLayerId.value;
   const didResize =
     document.width !== imageGridWidth.value || document.height !== imageGridHeight.value;
+  const didRemoveActiveLayer = !document.layers.some((layer) => layer.id === currentLayerId);
+  if (didResize || didRemoveActiveLayer) {
+    // Gesture coordinates cannot survive a different server canvas frame.
+    // Already-painted deltas are in the durable queue; do not emit a preview.
+    resetImageTouchPointers();
+    cancelImageInteraction(undefined, { commitHistory: false });
+  } else if (imageSingleTouchStartSnapshot && previousDocument) {
+    // This single transient snapshot only cancels an accidental touch stroke
+    // when a second finger starts navigation; it is never the Undo history.
+    imageSingleTouchStartSnapshot = {
+      ...imageSingleTouchStartSnapshot,
+      document: rebaseImageHistoryDocument(imageSingleTouchStartSnapshot.document, previousDocument, document),
+    };
+  }
   imageGridWidth.value = document.width;
   imageGridHeight.value = document.height;
   imageLayers.value = document.layers.map((layer) => ({ ...layer, pixels: [...layer.pixels] }));
@@ -2412,19 +2427,11 @@ const applyRemoteImageDocument = (
     document.layers.some((layer) => layer.id === currentLayerId)
       ? currentLayerId
       : document.layers[document.layers.length - 1]?.id || "";
-  if (didResize) {
+  if (didResize || didRemoveActiveLayer) {
     imageSelection.value = null;
     broadcastImageSelection();
   }
   syncImageDimensionDrafts();
-  if (didResize || !previousDocument || !imageHistory.value) {
-    resetImageHistory();
-  } else {
-    imageHistory.value = imageHistory.value.mapSnapshots((snapshot) => ({
-      ...snapshot,
-      document: rebaseImageHistoryDocument(snapshot.document, previousDocument, document),
-    }));
-  }
   scheduleImageCanvasRender();
   void nextTick(scheduleImagePreviewViewportUpdate);
 };
@@ -2518,10 +2525,6 @@ const imageSnapshotDocumentsAreEqual = (
   });
 };
 
-const imageSnapshotsAreEqual = (left: ImageEditorSnapshot, right: ImageEditorSnapshot) =>
-  imageSnapshotDocumentsAreEqual(left.document, right.document) &&
-  imageSelectionMasksAreEqual(left.selection, right.selection);
-
 const applyImageSnapshot = (snapshot: ImageEditorSnapshot) => {
   const document = snapshot.document;
   const currentActiveLayerId = activeImageLayerId.value;
@@ -2542,64 +2545,27 @@ const applyImageSnapshot = (snapshot: ImageEditorSnapshot) => {
   void nextTick(scheduleImagePreviewViewportUpdate);
 };
 
-const resetImageHistory = () => {
-  imageHistory.value = createHistory(createImageSnapshot(), {
-    equals: imageSnapshotsAreEqual,
-    limit: 100,
-  });
-};
-
 const commitImageHistory = () => {
-  if (!imageHistory.value) {
-    resetImageHistory();
-    broadcastImageDocument();
-    broadcastImageSelection();
-    return;
-  }
-
-  imageHistory.value = imageHistory.value.push(createImageSnapshot());
-  broadcastImageDocument();
+  // Document history is committed atomically by the server, not by UI snapshots.
   broadcastImageSelection();
 };
 
 const commitImageSelectionHistory = () => {
-  if (!imageHistory.value) {
-    resetImageHistory();
-  } else {
-    imageHistory.value = imageHistory.value.push(createImageSnapshot());
-  }
+  // Selection is a private editing aid, not a shared document revision.
   broadcastImageSelection();
 };
 
-const undoImage = () => {
-  if (!imageHistory.value?.canUndo || !canEditImage.value) return;
-  const previousDocument = imageHistory.value.current.document;
-  imageHistory.value = imageHistory.value.undo();
-  const documentChanged = !imageSnapshotDocumentsAreEqual(
-    previousDocument,
-    imageHistory.value.current.document,
-  );
-  applyImageSnapshot(imageHistory.value.current);
-  if (documentChanged) {
-    scheduleImageAutosave({ conditional: true });
-    broadcastImageDocument();
-  }
+const undoImage = async () => {
+  if (!canUndoImage.value) return;
+  imageSelection.value = null;
+  await imageAutosave.undo();
   broadcastImageSelection();
 };
 
-const redoImage = () => {
-  if (!imageHistory.value?.canRedo || !canEditImage.value) return;
-  const previousDocument = imageHistory.value.current.document;
-  imageHistory.value = imageHistory.value.redo();
-  const documentChanged = !imageSnapshotDocumentsAreEqual(
-    previousDocument,
-    imageHistory.value.current.document,
-  );
-  applyImageSnapshot(imageHistory.value.current);
-  if (documentChanged) {
-    scheduleImageAutosave({ conditional: true });
-    broadcastImageDocument();
-  }
+const redoImage = async () => {
+  if (!canRedoImage.value) return;
+  imageSelection.value = null;
+  await imageAutosave.redo();
   broadcastImageSelection();
 };
 
@@ -2617,6 +2583,12 @@ const imageAutosave = useImageOperationSync({
   },
   onConflict() {
     openImageConflict({ kind: "document" }, resource.value?.revision ?? null);
+  },
+  onAccessDenied() {
+    markImageReadOnly();
+    resetImageTouchPointers();
+    cancelImageInteraction(undefined, { commitHistory: false });
+    showImageNotice("Editing access is no longer available. Your pending local copy is preserved; you can export it without overwriting the document.", "error");
   },
 });
 const imageSaveStatus = imageAutosave.status;
@@ -2725,7 +2697,7 @@ const keepLocalImageAfterConflict = async () => {
   if (!operation || isImageConflictResolving.value) return;
 
   if (operation.kind === "document") {
-    // Exceptional resize/import conflicts cannot be merged as pixel edits.
+    // Preserve unsafe legacy drafts without forcing a whole-image overwrite.
     // Exporting preserves the local copy without overwriting another user's work.
     exportImageJson();
     return;
@@ -2760,12 +2732,20 @@ const keepLocalImageAfterConflict = async () => {
   }
 };
 
-const scheduleImageAutosave = (settings: { conditional?: boolean; forceReplace?: boolean } = {}) => {
+const scheduleImageAutosave = (settings: {
+  conditional?: boolean;
+  forceReplace?: boolean;
+  historyGroupId?: string;
+  resize?: { width: number; height: number; anchor: ImageResizeAnchor };
+} = {}) => {
   if (!canEditImage.value) {
     return;
   }
 
-  void imageAutosave.schedule(buildImageDocument(false), settings);
+  void imageAutosave.schedule(buildImageDocument(false), {
+    ...settings,
+    ...(!settings.historyGroupId && imageHistoryGroupId ? { historyGroupId: imageHistoryGroupId } : {}),
+  });
 };
 
 watch(imageInteractionKind, (kind) => {
@@ -3432,6 +3412,7 @@ const startImageViewportInteractionFromPointer = (
   }
 
   imageViewportPaintPointerId = event.pointerId;
+  imageHistoryGroupId = createImageOperationId();
   captureImagePointerInteractionIntent(event);
   const clientX = startPoint?.x ?? event.clientX;
   const clientY = startPoint?.y ?? event.clientY;
@@ -3490,6 +3471,7 @@ const startImageArtboardInteractionFromPointer = (
   }
 
   imageViewportPaintPointerId = event.pointerId;
+  imageHistoryGroupId = createImageOperationId();
   captureImagePointerInteractionIntent(event);
   const clientX = startPoint?.x ?? event.clientX;
   const clientY = startPoint?.y ?? event.clientY;
@@ -3759,7 +3741,6 @@ const resetImageTouchPointers = () => {
   imageTransformGesture = null;
   imageTouchNavigationActive = false;
   imageSingleTouchStartSnapshot = null;
-  imageSingleTouchStartHistory = null;
   imageSingleTouchStartTool = null;
   imageSingleTouchStartPrimaryColor = null;
   imageSingleTouchStartSecondaryColor = null;
@@ -3768,7 +3749,7 @@ const resetImageTouchPointers = () => {
 
 const rollbackSingleTouchInteractionForTransform = () => {
   const snapshot = imageSingleTouchStartSnapshot;
-  const history = imageSingleTouchStartHistory;
+  const gestureGroupId = imageHistoryGroupId;
   const startTool = imageSingleTouchStartTool;
   const startPrimaryColor = imageSingleTouchStartPrimaryColor;
   const startSecondaryColor = imageSingleTouchStartSecondaryColor;
@@ -3782,15 +3763,15 @@ const rollbackSingleTouchInteractionForTransform = () => {
 
   if (hadInteraction) cancelImageInteraction(undefined, { commitHistory: false });
   if (snapshot && hadDocumentInteraction) {
-    if (history) imageHistory.value = history;
+    imageHistoryGroupId = gestureGroupId;
     applyImageSnapshot(snapshot);
     scheduleImageAutosave();
+    imageHistoryGroupId = null;
   }
   if (startTool) activeImageTool.value = startTool;
   if (startPrimaryColor) setSelectedImageColor(startPrimaryColor);
   if (startSecondaryColor) secondaryImageColor.value = startSecondaryColor;
   imageSingleTouchStartSnapshot = null;
-  imageSingleTouchStartHistory = null;
   imageSingleTouchStartTool = null;
   imageSingleTouchStartPrimaryColor = null;
   imageSingleTouchStartSecondaryColor = null;
@@ -3909,7 +3890,6 @@ const startImageTouchPointer = (event: PointerEvent, startsOnArtboard: boolean) 
   if (imageTouchPointers.size === 1) {
     imagePendingTouchPointerId = event.pointerId;
     imageSingleTouchStartSnapshot = null;
-    imageSingleTouchStartHistory = null;
     imageSingleTouchStartTool = null;
     imageSingleTouchStartPrimaryColor = null;
     imageSingleTouchStartSecondaryColor = null;
@@ -3944,7 +3924,6 @@ const continueCommittedImageTouch = (event: PointerEvent) => {
 
 const beginPendingImageTouch = (event: PointerEvent, touch: ImageTouchPointer) => {
   imageSingleTouchStartSnapshot = createImageSnapshot();
-  imageSingleTouchStartHistory = imageHistory.value;
   imageSingleTouchStartTool = activeImageTool.value;
   imageSingleTouchStartPrimaryColor = selectedImageColor.value;
   imageSingleTouchStartSecondaryColor = secondaryImageColor.value;
@@ -3993,7 +3972,6 @@ const finishImageTouchPointer = (event: PointerEvent) => {
     if (imageTouchPointers.size === 0) {
       imageTouchNavigationActive = false;
       imageSingleTouchStartSnapshot = null;
-      imageSingleTouchStartHistory = null;
       imageSingleTouchStartTool = null;
       imageSingleTouchStartPrimaryColor = null;
       imageSingleTouchStartSecondaryColor = null;
@@ -4013,7 +3991,6 @@ const finishImageTouchPointer = (event: PointerEvent) => {
     finishImagePointerInteractionFromPointer(event);
   }
   imageSingleTouchStartSnapshot = null;
-  imageSingleTouchStartHistory = null;
   imageSingleTouchStartTool = null;
   imageSingleTouchStartPrimaryColor = null;
   imageSingleTouchStartSecondaryColor = null;
@@ -4681,6 +4658,7 @@ const stopPaintingImage = (event?: PointerEvent) => {
     if (interactionKind === "move" || interactionKind === "rotate") scheduleImageAutosave();
     commitImageHistory();
   }
+  imageHistoryGroupId = null;
 };
 
 const leaveImageCanvas = () => {
@@ -4764,6 +4742,7 @@ const cancelImageInteraction = (
   if (interactionKind === "paint" && commitHistory) {
     commitImageHistory();
   }
+  imageHistoryGroupId = null;
 };
 
 const cancelImagePointerInteraction = (event: PointerEvent) => {
@@ -4826,7 +4805,7 @@ const resizeImageWorkspace = (nextWidth: number, nextHeight: number) => {
     return;
   }
 
-  if (imagePixelRotationGesture.value) cancelImageInteractionBeforeLayerChange();
+  cancelImageInteractionBeforeLayerChange();
 
   const resizedDocument = resizePixelArtDocument(
     buildImageDocument(),
@@ -4844,7 +4823,7 @@ const resizeImageWorkspace = (nextWidth: number, nextHeight: number) => {
   hoveredImagePixelIndex.value = null;
   hoveredImageVirtualPoint.value = null;
   stopPaintingImage();
-  scheduleImageAutosave();
+  scheduleImageAutosave({ resize: { width, height, anchor: imageResizeAnchor.value } });
   commitImageHistory();
   void nextTick(scheduleImagePreviewViewportUpdate);
 };
@@ -4938,10 +4917,10 @@ const selectImageResizeAnchor = (anchor: ImageResizeAnchor) => {
   imageResizeAnchor.value = anchor;
 };
 
-const finishImageLayerMutation = () => {
+const finishImageLayerMutation = (settings: { historyGroupId?: string } = {}) => {
   triggerRef(imageLayers);
   scheduleImageCanvasRender();
-  scheduleImageAutosave();
+  scheduleImageAutosave(settings);
   commitImageHistory();
 };
 
@@ -5056,16 +5035,24 @@ const setImageLayerOpacity = ({ id, opacity }: { id: string; opacity: number }) 
   imageLayers.value = imageLayers.value.map((layer) =>
     layer.id === id ? { ...layer, opacity: normalizedOpacity } : layer,
   );
-  finishImageLayerMutation();
+  finishImageLayerMutation(imageOpacityHistoryGroup?.layerId === id
+    ? { historyGroupId: imageOpacityHistoryGroup.id }
+    : {});
+  imageOpacityHistoryGroup = null;
 };
 
 const previewImageLayerOpacity = ({ id, opacity }: { id: string; opacity: number }) => {
   if (!canEditImage.value) return;
+  if (!imageOpacityHistoryGroup || imageOpacityHistoryGroup.layerId !== id) {
+    imageOpacityHistoryGroup = { layerId: id, id: createImageOperationId() };
+  }
   const normalizedOpacity = Math.min(1, Math.max(0, opacity));
   imageLayers.value = imageLayers.value.map((layer) =>
     layer.id === id ? { ...layer, opacity: normalizedOpacity } : layer,
   );
-  scheduleImageCanvasRender();
+  // A slider input is a real local edit too: persist it before any remote
+  // refresh, navigation, or another tool can replace its optimistic value.
+  finishImageLayerMutation({ historyGroupId: imageOpacityHistoryGroup.id });
 };
 
 const moveImageLayer = ({
@@ -5490,6 +5477,8 @@ const downloadImageFile = (blob: Blob, extension: "json" | "png") => {
 };
 
 const applyImportedImageDocument = (document: PixelArtDocumentV2) => {
+  if (!canEditImage.value) return false;
+  cancelImageInteractionBeforeLayerChange();
   const importedDocument = clonePixelArtDocument(document);
   imageGridWidth.value = importedDocument.width;
   imageGridHeight.value = importedDocument.height;
@@ -5501,6 +5490,7 @@ const applyImportedImageDocument = (document: PixelArtDocumentV2) => {
   scheduleImageAutosave({ forceReplace: true });
   commitImageHistory();
   void nextTick(scheduleImagePreviewViewportUpdate);
+  return true;
 };
 
 const importImageFile = async (file: File) => {
@@ -5527,11 +5517,16 @@ const importImageFile = async (file: File) => {
       }
     }
 
+    if (!canEditImage.value) {
+      throw new Error("The image is not editable right now. Try importing the file again after synchronization finishes.");
+    }
     if (!window.confirm("Importing this file will replace the current image. Continue?")) {
       return;
     }
 
-    applyImportedImageDocument(importedDocument);
+    if (!applyImportedImageDocument(importedDocument)) {
+      throw new Error("The image is not editable right now. Your imported file has not replaced the drawing.");
+    }
     showImageNotice(
       `Imported ${file.name} (${importedDocument.width} × ${importedDocument.height}).`,
       "success",
@@ -6480,7 +6475,6 @@ const loadEditor = async () => {
         : imagePreferencesController?.preferences.zoom === undefined;
       await imageAutosave.start(resourceDetail);
       isImageOperationReady.value = imageAutosave.isReady.value;
-      resetImageHistory();
     }
 
     const routeKind = editorMetaByType[resourceDetail.type]?.routeKind;

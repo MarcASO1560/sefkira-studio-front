@@ -115,7 +115,7 @@ const handleTab = (event: KeyboardEvent) => {
             {{
               operation === "rename"
                 ? "This resource changed remotely while your new local name was being saved."
-                : "The canvas or a layer changed remotely and these pending changes cannot be combined safely. Your local copy is still preserved on this device."
+                : "These pending changes could not be synchronized safely. Your local copy is still preserved on this device."
             }}
           </p>
         </div>

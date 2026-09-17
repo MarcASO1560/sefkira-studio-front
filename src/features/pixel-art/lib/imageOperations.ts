@@ -1,6 +1,21 @@
-import type { PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
+import type { ImageResizeAnchor, PixelArtDocumentV2, PixelColor, PixelLayer } from "../types";
 import { clonePixelArtDocument, normalizePixelColor } from "./document";
 import { parsePixelArtResourceData } from "./migrations";
+import { resizePixelArtDocument } from "./resize";
+
+export type ImageResizeOperation = { width: number; height: number; anchor: ImageResizeAnchor };
+export type ImageOperationTransform = {
+  revision: number;
+  from_width: number;
+  from_height: number;
+  to_width: number;
+  to_height: number;
+  offset_x: number;
+  offset_y: number;
+  operation_id?: string;
+  user_id?: string | null;
+};
+export type SharedImageHistory = { can_undo: boolean; can_redo: boolean };
 
 export type ImagePixelChange = [number, PixelColor] | [number, PixelColor, PixelColor];
 export type ImageLayerFields = Partial<Pick<PixelLayer, "name" | "visible" | "locked" | "opacity">>;
@@ -10,6 +25,10 @@ export type ImageOperationAction =
   | { type: "layer-remove"; layer_id: string; expected_layer?: PixelLayer }
   | { type: "layer-update"; layer_id: string; fields: ImageLayerFields; expected?: ImageLayerFields }
   | { type: "layer-order"; layer_ids: string[]; expected_layer_ids?: string[] }
+  | ({ type: "resize" } & ImageResizeOperation)
+  | { type: "undo" }
+  | { type: "redo" }
+  | { type: "import"; document: PixelArtDocumentV2 }
   | { type: "replace"; document: PixelArtDocumentV2 };
 
 export type ImageOperation = {
@@ -18,9 +37,13 @@ export type ImageOperation = {
   width: number;
   height: number;
   actions: ImageOperationAction[];
+  history_group_id?: string;
+  coordinate_after_operation_id?: string;
   /** Local journal metadata; never included in HTTP packets. */
   _client_expected_document?: PixelArtDocumentV2;
   _client_attempted?: boolean;
+  _client_frame_dependency?: string;
+  _client_dependency_revision?: number;
 };
 
 export class ImageOperationConflict extends Error {
@@ -33,16 +56,21 @@ export class ImageOperationConflict extends Error {
 const fields = ["name", "visible", "locked", "opacity"] as const;
 const equal = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 const color = (value: PixelColor) => value === null ? null : normalizePixelColor(value);
+const anchors = new Set<ImageResizeAnchor>(["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"]);
 
 /** Only the local change is encoded; unchanged remote pixels never enter a save. */
 export const diffImageDocuments = (
   before: PixelArtDocumentV2,
   after: PixelArtDocumentV2,
-  options: { conditional?: boolean; replace?: boolean } = {},
+  options: { conditional?: boolean; replace?: boolean; resize?: ImageResizeOperation } = {},
 ): ImageOperationAction[] => {
   parsePixelArtResourceData({ pixel_art: before });
   parsePixelArtResourceData({ pixel_art: after });
-  if (options.replace || before.width !== after.width || before.height !== after.height) {
+  if (options.resize) return before.width === options.resize.width && before.height === options.resize.height ? [] : [{ type: "resize", ...options.resize }];
+  if (options.replace) return equal(before, after) ? [] : [{ type: "import", document: clonePixelArtDocument(after) }];
+  if (before.width !== after.width || before.height !== after.height) {
+    // Legacy callers retain a guarded replacement; new resize UI supplies its
+    // semantic anchor explicitly so collaborators' pixels are never replaced.
     return equal(before, after) ? [] : [{ type: "replace", document: clonePixelArtDocument(after) }];
   }
   const actions: ImageOperationAction[] = [];
@@ -91,14 +119,17 @@ export const applyImageActions = (
   dimensions: { width: number; height: number } = source,
 ): PixelArtDocumentV2 => {
   let document = clonePixelArtDocument(source);
-  if (actions.length === 1 && actions[0]?.type === "replace") {
+  if (actions.length === 1 && actions[0]?.type === "resize") return resizePixelArtDocument(source, actions[0].width, actions[0].height, actions[0].anchor);
+  if (actions.length === 1 && (actions[0]?.type === "undo" || actions[0]?.type === "redo")) return document;
+  if (actions.length === 1 && (actions[0]?.type === "replace" || actions[0]?.type === "import")) {
     return clonePixelArtDocument(parsePixelArtResourceData({ pixel_art: actions[0].document }).document);
   }
   if (source.width !== dimensions.width || source.height !== dimensions.height) {
     throw new ImageOperationConflict("The canvas dimensions changed. Your pending changes have been preserved.");
   }
   for (const action of actions) {
-    if (action.type === "replace") throw new ImageOperationConflict("A canvas replacement cannot be combined with pixel edits.");
+    if (action.type === "replace" || action.type === "import") throw new ImageOperationConflict("A canvas replacement cannot be combined with pixel edits.");
+    if (action.type === "resize" || action.type === "undo" || action.type === "redo") throw new ImageOperationConflict("Resize and shared-history actions must be submitted separately.");
     if (action.type === "layer-add") {
       const existing = document.layers.find((layer) => layer.id === action.layer.id);
       if (existing) {
@@ -106,6 +137,7 @@ export const applyImageActions = (
         continue;
       }
       const after = action.after_id === null ? -1 : document.layers.findIndex((layer) => layer.id === action.after_id);
+      if (after === -1 && action.after_id !== null) { document.layers.push({ ...action.layer, pixels: [...action.layer.pixels] }); continue; }
       document.layers.splice(after + 1, 0, { ...action.layer, pixels: [...action.layer.pixels] });
       continue;
     }
@@ -121,10 +153,10 @@ export const applyImageActions = (
     const index = document.layers.findIndex((layer) => layer.id === action.layer_id);
     if (action.type === "layer-remove") {
       if (action.expected_layer && index >= 0 && !equal(document.layers[index], action.expected_layer)) continue;
-      if (index >= 0) document.layers.splice(index, 1);
+      if (index >= 0 && document.layers.length > 1) document.layers.splice(index, 1);
       continue;
     }
-    if (index < 0) throw new ImageOperationConflict("A layer used by your pending changes was removed. Your changes have been preserved.");
+    if (index < 0) continue; // A concurrently removed layer is a safe no-op.
     const layer = document.layers[index]!;
     if (action.type === "layer-update") {
       for (const field of fields) {
@@ -148,9 +180,15 @@ export const validateImageOperation = (value: unknown): value is ImageOperation 
   const operation = value as ImageOperation;
   if (typeof operation.operation_id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(operation.operation_id) || !Number.isSafeInteger(operation.base_revision) || operation.base_revision < 0 || !Number.isInteger(operation.width) || operation.width < 1 || operation.width > 256 || !Number.isInteger(operation.height) || operation.height < 1 || operation.height > 256 || !Array.isArray(operation.actions) || !operation.actions.length || operation.actions.length > 256 || operation.actions.reduce((count, action) => count + (action?.type === "pixels" && Array.isArray(action.changes) ? action.changes.length : 0), 0) > 262144) return false;
   try {
+    if (operation.history_group_id !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(operation.history_group_id)) return false;
+    if (operation.coordinate_after_operation_id !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(operation.coordinate_after_operation_id)) return false;
     for (const action of operation.actions) {
       if (!action || typeof action !== "object") return false;
-      if (action.type === "replace") {
+      if (action.type === "resize") {
+        if (operation.actions.length !== 1 || !Number.isInteger(action.width) || action.width < 1 || action.width > 256 || !Number.isInteger(action.height) || action.height < 1 || action.height > 256 || !anchors.has(action.anchor)) return false;
+      } else if (action.type === "undo" || action.type === "redo") {
+        if (operation.actions.length !== 1) return false;
+      } else if (action.type === "replace" || action.type === "import") {
         if (operation.actions.length !== 1) return false;
         parsePixelArtResourceData({ pixel_art: action.document });
         if (action.document.layers.length > 128) return false;
@@ -179,6 +217,52 @@ export const validateImageOperation = (value: unknown): value is ImageOperation 
     }
     return true;
   } catch { return false; }
+};
+
+/** Immutable original packets are mapped only for the optimistic local view. */
+export const rebaseImageOperationActions = (
+  operation: ImageOperation,
+  transforms: readonly ImageOperationTransform[],
+  userId?: string,
+): { actions: ImageOperationAction[]; width: number; height: number } => {
+  const dependency = operation.coordinate_after_operation_id ?? operation._client_frame_dependency;
+  const dependencyEvent = dependency ? transforms.find((event) => event.operation_id === dependency && (!userId || event.user_id === userId)) : undefined;
+  const sinceRevision = dependencyEvent?.revision ?? operation._client_dependency_revision ?? operation.base_revision;
+  const events = [...transforms].filter((event) => event.revision > sinceRevision).sort((left, right) => left.revision - right.revision);
+  const applicable = dependency && !dependencyEvent && operation._client_dependency_revision === undefined ? [] : events;
+  let width = operation.width;
+  let height = operation.height;
+  for (const event of applicable) {
+    if (event.from_width !== width || event.from_height !== height) throw new ImageOperationConflict("The shared coordinate history is incomplete. Your pending changes remain protected while reconnecting.");
+    width = event.to_width; height = event.to_height;
+  }
+  const mapIndex = (index: number) => {
+    let currentWidth = operation.width;
+    let x = index % currentWidth;
+    let y = Math.floor(index / currentWidth);
+    for (const event of applicable) {
+      x += event.offset_x; y += event.offset_y;
+      if (x < 0 || y < 0 || x >= event.to_width || y >= event.to_height) return null;
+      currentWidth = event.to_width;
+    }
+    return y * width + x;
+  };
+  const mapLayer = (layer: PixelLayer): PixelLayer => {
+    const pixels: PixelColor[] = Array(width * height).fill(null);
+    for (const [index, value] of layer.pixels.entries()) { const mapped = mapIndex(index); if (mapped !== null) pixels[mapped] = value; }
+    return { ...layer, pixels };
+  };
+  const actions = operation.actions.map((action): ImageOperationAction => {
+    if (action.type === "pixels") {
+      const changes: ImagePixelChange[] = [];
+      for (const change of action.changes) { const mapped = mapIndex(change[0]); if (mapped !== null) changes.push(change.length === 3 ? [mapped, change[1], change[2]] : [mapped, change[1]]); }
+      return { ...action, changes };
+    }
+    if (action.type === "layer-add") return { ...action, layer: mapLayer(action.layer) };
+    if (action.type === "layer-remove" && action.expected_layer) return { ...action, expected_layer: mapLayer(action.expected_layer) };
+    return action;
+  });
+  return { actions, width, height };
 };
 
 /** Bounded packets preserve operation order and fit the authoritative endpoint. */
