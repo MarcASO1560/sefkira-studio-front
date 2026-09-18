@@ -3571,18 +3571,6 @@ onUnmounted(() => {
   }
 
   @media (max-width: 560px) {
-    .access-dialog {
-      max-height: calc(100dvh - 32px);
-    }
-
-    .access-dialog > header {
-      padding: 10px 14px;
-    }
-
-    .access-dialog__body {
-      padding: 12px 14px;
-    }
-
     .access-list li {
       gap: 0 8px;
     }
@@ -4175,6 +4163,48 @@ onUnmounted(() => {
   }
 
   @media (max-width: 560px) {
+    .access-dialog-layer {
+      display: flex;
+      align-items: stretch;
+      padding: 0;
+      background: #101111;
+      backdrop-filter: none;
+    }
+
+    .access-dialog {
+      width: 100%;
+      height: 100vh;
+      height: 100dvh;
+      max-height: none;
+      min-height: 0;
+      border: 0;
+      border-radius: 0;
+      background: #101111;
+      box-shadow: none;
+    }
+
+    .access-dialog > header {
+      padding: calc(10px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 10px max(16px, env(safe-area-inset-left, 0px));
+    }
+
+    .access-dialog header p {
+      margin-bottom: 4px;
+    }
+
+    .access-dialog__body {
+      flex: 1 1 0%;
+      gap: 10px;
+      padding: 12px max(16px, env(safe-area-inset-right, 0px)) 12px max(16px, env(safe-area-inset-left, 0px));
+    }
+
+    .access-dialog .access-list li {
+      padding-block: 6px;
+    }
+
+    .access-dialog > footer {
+      padding: 8px max(16px, env(safe-area-inset-right, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+    }
+
     .share-dialog {
       width: 100%;
       max-height: calc(100dvh - 32px);
