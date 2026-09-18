@@ -47,6 +47,36 @@ export type PixelAvatarData = {
   pixels: Array<string | null>;
 };
 
+export type DocumentChatAuthor = {
+  id: string;
+  username?: string | null;
+  avatar_url?: string | null;
+  avatar_pixel_art?: PixelAvatarData | null;
+};
+
+export type DocumentChatMessagePublic = {
+  id: number;
+  client_message_id: string;
+  project_id: string;
+  resource_id: string;
+  author: DocumentChatAuthor;
+  body: string;
+  created_at: string;
+};
+
+export type DocumentChatPage = {
+  messages: DocumentChatMessagePublic[];
+  has_more: boolean;
+  next_before_id: number | null;
+};
+
+export class DocumentChatHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`Chat request failed (HTTP ${status}).`);
+    this.name = "DocumentChatHttpError";
+  }
+}
+
 export type ProjectAccessRole = "owner" | "editor" | "viewer";
 
 export type ProjectPublic = {
@@ -232,6 +262,45 @@ const resourceEditorStatePath = (projectId: string, resourceId: string) =>
 
 export const getResourceEditorState = (projectId: string, resourceId: string) =>
   fetchApi<ResourceEditorStatePublic>(resourceEditorStatePath(projectId, resourceId));
+
+const documentChatPath = (projectId: string, resourceId: string) =>
+  `/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/chat/messages`;
+
+const requestDocumentChat = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
+  const response = await fetch(apiUrl(path), {
+    ...init,
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { Accept: "application/json", ...init.headers },
+  });
+  if (!response.ok) throw new DocumentChatHttpError(response.status);
+  return await response.json() as T;
+};
+
+export const getDocumentChatMessages = (
+  projectId: string,
+  resourceId: string,
+  options: { limit?: number; beforeId?: number; afterId?: number; signal?: AbortSignal } = {},
+) => {
+  const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
+  if (options.beforeId !== undefined) query.set("before_id", String(options.beforeId));
+  if (options.afterId !== undefined) query.set("after_id", String(options.afterId));
+  return requestDocumentChat<DocumentChatPage>(`${documentChatPath(projectId, resourceId)}?${query}`, {
+    signal: options.signal,
+  });
+};
+
+export const postDocumentChatMessage = (
+  projectId: string,
+  resourceId: string,
+  payload: { client_message_id: string; body: string },
+  options: { signal?: AbortSignal } = {},
+) => requestDocumentChat<DocumentChatMessagePublic>(documentChatPath(projectId, resourceId), {
+  method: "POST",
+  signal: options.signal,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(payload),
+});
 
 export const putResourceEditorState = (
   projectId: string,

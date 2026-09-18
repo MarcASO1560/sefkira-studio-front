@@ -13,6 +13,7 @@ export const REALTIME_EVENT_NAMES = [
   "project.deleted",
   "project.access.updated",
   "project.share.updated",
+  "document.chat.created",
 ] as const;
 
 export type RealtimeEventName = (typeof REALTIME_EVENT_NAMES)[number];

@@ -8,6 +8,7 @@ import {
   Link2,
   Link2Off,
   LockKeyhole,
+  MessageSquareText,
   MousePointer2,
   Plus,
   Ruler,
@@ -46,6 +47,8 @@ import {
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
 import ImageDocumentPresence from "./ImageDocumentPresence.vue";
 import ResourceDocumentInfoDialog from "./ResourceDocumentInfoDialog.vue";
+import ResourceDocumentChatDialog from "./ResourceDocumentChatDialog.vue";
+import { useDocumentChat } from "../composables/useDocumentChat";
 import { buildDocumentInfoDetails } from "../lib/documentInfo";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import {
@@ -668,6 +671,36 @@ const projectPixelArt = computed<PixelAvatarData | null>(() => {
 
   return pixelArt as PixelAvatarData;
 });
+
+const documentChatUser = computed(() => currentPresenceUserId.value ? {
+  id: currentPresenceUserId.value,
+  username: profileUsername.value || profileUserName.value || null,
+  avatar_url: profileAvatarUrl.value || null,
+  avatar_pixel_art: profilePixelAvatar.value,
+} : null);
+const documentChat = useDocumentChat({
+  projectId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value ? props.projectId : "",
+  resourceId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value ? props.resourceId : "",
+  user: documentChatUser,
+});
+const {
+  messages: documentChatMessages,
+  loading: isDocumentChatLoading,
+  error: documentChatError,
+  hasOlder: hasOlderDocumentChatMessages,
+  isOpen: isDocumentChatOpen,
+  unreadCount: documentChatUnreadCount,
+  sending: isDocumentChatSending,
+  accessDenied: isDocumentChatAccessDenied,
+} = documentChat;
+const documentChatParticipantsCount = computed(() => getDocumentPresenceMembers(
+  projectPresenceMembers.value,
+  currentPresenceUserId.value,
+  currentImagePresenceMember.value,
+).members.length);
+const documentChatButtonLabel = computed(() => documentChatUnreadCount.value > 0
+  ? `Open document chat, ${documentChatUnreadCount.value} unread messages`
+  : "Open document chat");
 
 const editorStyle = computed(() => ({
   "--resource-editor-color": resourceColor.value,
@@ -1984,6 +2017,12 @@ const openImageConflict = (
     isImageConflictOpen.value = true;
   };
 
+  if (isDocumentChatOpen.value) {
+    documentChat.setOpen(false);
+    void nextTick(() => window.requestAnimationFrame(revealConflict));
+    return;
+  }
+
   if (isDocumentInfoOpen.value) {
     isDocumentInfoOpen.value = false;
     void nextTick(() => window.requestAnimationFrame(revealConflict));
@@ -2156,6 +2195,7 @@ const documentInfoDetails = computed(() => buildDocumentInfoDetails({
 
 const openDocumentInfo = () => {
   if (isLoading.value || errorMessage.value || !resource.value) return;
+  documentChat.setOpen(false);
   clearImageTemporaryKeys();
   isDocumentInfoOpen.value = true;
 };
@@ -2163,6 +2203,16 @@ const openDocumentInfo = () => {
 const closeDocumentInfo = () => {
   cancelRenamingResource();
   isDocumentInfoOpen.value = false;
+};
+
+const openDocumentChat = () => {
+  if (isLoading.value || errorMessage.value || !resource.value || isResourceProjectAccessRevoked.value) return;
+  clearImageTemporaryKeys();
+  closeDocumentInfo();
+  closeImageLayersDialog(false);
+  closeImageMobileColorControls(false);
+  activeImageInspectorPanel.value = null;
+  documentChat.setOpen(true);
 };
 
 const buildImageDocument = (includeRotationPreview = true, includePalette = true): PixelArtDocumentV2 => {
@@ -6342,6 +6392,7 @@ const handleResourceEditorKeydown = (event: KeyboardEvent) => {
     activeImageInspectorPanel.value !== null ||
     isImageConflictOpen.value ||
     isDocumentInfoOpen.value ||
+    isDocumentChatOpen.value ||
     isProfileDialogOpen.value ||
     isEditableKeyboardTarget(event.target) ||
     isImageControlKeyboardTarget(event.target)
@@ -6488,6 +6539,7 @@ const handleResourceVisibilityChange = () => {
 const revokeResourceProjectAccess = () => {
   if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
   isResourceProjectAccessRevoked.value = true;
+  documentChat.setOpen(false);
   markImageReadOnly();
   projectPresenceConnection?.close();
   projectPresenceConnection = null;
@@ -6739,6 +6791,7 @@ onMounted(() => {
   resourceAccessConnection = connectUserRealtime({
     "project.access.updated": handleResourceProjectAccessUpdated,
     "project.deleted": handleResourceProjectAccessUpdated,
+    "document.chat.created": documentChat.receiveRealtime,
   });
   void loadEditor().then(() => {
     if (!resource.value) projectPresenceConnection?.setResourceId(null);
@@ -6952,13 +7005,30 @@ onUnmounted(() => {
         :aria-label="`${editorMeta.label} editor in progress for ${resourceName}`"
       >
         <aside v-if="isImageEditor" class="image-editor-left-dock" aria-label="Drawing tools">
-          <ImageToolbar
-            class="image-editor-toolbar"
-            :active-tool="activeImageTool"
-            :can-edit="canEditImage"
-            :selection-tool="imageSelectionKind"
-            @select-tool="activeImageTool = $event"
-          />
+          <div class="image-editor-drawing-tools">
+            <ImageToolbar
+              class="image-editor-toolbar"
+              :active-tool="activeImageTool"
+              :can-edit="canEditImage"
+              :selection-tool="imageSelectionKind"
+              @select-tool="activeImageTool = $event"
+            />
+          </div>
+          <button
+            type="button"
+            class="image-editor-chat-trigger"
+            :aria-label="documentChatButtonLabel"
+            title="Document chat"
+            aria-haspopup="dialog"
+            aria-controls="resource-document-chat-dialog"
+            :aria-expanded="isDocumentChatOpen"
+            :disabled="isResourceProjectAccessRevoked || isDocumentChatAccessDenied"
+            data-image-shortcuts="off"
+            @click="openDocumentChat"
+          >
+            <MessageSquareText :size="21" :stroke-width="2" aria-hidden="true" />
+            <span v-if="documentChatUnreadCount > 0" class="image-editor-chat-trigger__unread" aria-hidden="true">{{ documentChatUnreadCount > 99 ? '99+' : documentChatUnreadCount }}</span>
+          </button>
         </aside>
 
         <ImageCanvasModesMenu
@@ -8026,6 +8096,25 @@ onUnmounted(() => {
       @close="isProfileDialogOpen = false"
       @saved="updateProfile"
     />
+    <ResourceDocumentChatDialog
+      v-if="isImageEditor && resource && !errorMessage"
+      :key="`${projectId}:${resourceId}`"
+      :open="isDocumentChatOpen"
+      :document-name="resourceName"
+      :participants-count="documentChatParticipantsCount"
+      :current-user-id="currentPresenceUserId"
+      :messages="documentChatMessages"
+      :loading="isDocumentChatLoading"
+      :error="documentChatError"
+      :has-older="hasOlderDocumentChatMessages"
+      :sending="isDocumentChatSending"
+      :access-denied="isDocumentChatAccessDenied || isResourceProjectAccessRevoked"
+      @close="documentChat.setOpen(false)"
+      @send="documentChat.sendMessage"
+      @retry="documentChat.retryMessage"
+      @load-older="documentChat.loadOlder"
+      @reload="documentChat.catchUp"
+    />
     <ImageConflictNotice
       :open="isImageConflictOpen"
       :local-revision="resource?.revision ?? null"
@@ -8315,19 +8404,68 @@ onUnmounted(() => {
     grid-column: 1;
     grid-row: 1 / 3;
     display: flex;
-    align-items: flex-start;
-    justify-content: center;
+    flex-direction: column;
+    align-items: center;
     min-width: 0;
     min-height: 0;
     padding: 6px 5px;
     overflow-x: hidden;
-    overflow-y: auto;
+    overflow-y: hidden;
     box-sizing: border-box;
     background: var(--editor-panel);
     border-right: 1px solid var(--editor-border);
     box-shadow: none;
     scrollbar-color: var(--editor-border-strong) transparent;
     scrollbar-width: thin;
+  }
+
+  .image-editor-drawing-tools {
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-color: var(--editor-border-strong) transparent;
+    scrollbar-width: thin;
+  }
+
+  .image-editor-drawing-tools .image-editor-toolbar { margin-inline: auto; }
+
+  .image-editor-chat-trigger {
+    position: relative;
+    display: grid;
+    flex: 0 0 auto;
+    place-items: center;
+    width: 34px;
+    height: 36px;
+    min-height: 36px;
+    margin-top: 8px;
+    padding: 0;
+    color: var(--editor-text);
+    cursor: pointer;
+    background: var(--editor-surface);
+    border: 0;
+    border-radius: var(--editor-radius-md);
+  }
+
+  .image-editor-chat-trigger:hover:not(:disabled) { background: var(--editor-hover); }
+  .image-editor-chat-trigger:focus-visible { outline: 2px solid var(--editor-focus); outline-offset: -2px; }
+  .image-editor-chat-trigger:disabled { opacity: .4; cursor: not-allowed; }
+  .image-editor-chat-trigger__unread {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    display: grid;
+    place-items: center;
+    min-width: 17px;
+    height: 17px;
+    padding: 0 3px;
+    color: var(--editor-selected-ink);
+    font-size: 10px;
+    font-weight: 650;
+    background: var(--editor-selected);
+    border: 2px solid var(--editor-panel);
+    border-radius: 999px;
   }
 
   .image-editor-canvas-modes {
@@ -10309,6 +10447,8 @@ onUnmounted(() => {
       width: 40px;
       min-width: 40px;
     }
+
+    .image-editor-chat-trigger { width: 40px; height: 44px; min-height: 44px; }
 
     .image-editor-statusbar {
       gap: 4px;
