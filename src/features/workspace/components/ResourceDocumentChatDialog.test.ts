@@ -163,22 +163,34 @@ afterEach(() => {
 });
 
 describe("ResourceDocumentChatDialog interaction", () => {
-  it("leaves mobile Enter available for a newline and sends with desktop Enter", () => {
-    const chat = setupChat(true);
+  it.each([
+    { layout: "mobile", mobile: true },
+    { layout: "desktop", mobile: false },
+  ])("sends and clears the draft with Enter on $layout while preserving composer focus", ({ mobile }) => {
+    const chat = setupChat(mobile);
+    fakeDocument.activeElement = mobile ? chat.composer : chat.closeButton;
     chat.state.draft.value = "  A message  ";
-    const mobileEnter = keyboard("Enter");
-    chat.state.handleComposerKeydown(mobileEnter as unknown as KeyboardEvent);
-    expect(mobileEnter.preventDefault).not.toHaveBeenCalled();
-    expect(chat.emit).not.toHaveBeenCalled();
-    expect(chat.state.draft.value).toBe("  A message  ");
-
-    chat.isMobileLayout.value = false;
-    const desktopEnter = keyboard("Enter");
-    chat.state.handleComposerKeydown(desktopEnter as unknown as KeyboardEvent);
-    expect(desktopEnter.preventDefault).toHaveBeenCalledOnce();
+    const enter = keyboard("Enter");
+    chat.state.handleComposerKeydown(enter as unknown as KeyboardEvent);
+    expect(enter.preventDefault).toHaveBeenCalledOnce();
     expect(chat.emit).toHaveBeenCalledExactlyOnceWith("send", "A message");
     expect(chat.state.draft.value).toBe("");
-    expect(chat.composer.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+    expect(fakeDocument.activeElement).toBe(chat.composer);
+    if (mobile) expect(chat.composer.focus).not.toHaveBeenCalled();
+    else expect(chat.composer.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+  });
+
+  it.each([
+    { layout: "mobile", mobile: true },
+    { layout: "desktop", mobile: false },
+  ])("leaves Shift+Enter available for a newline on $layout", ({ mobile }) => {
+    const chat = setupChat(mobile);
+    chat.state.draft.value = "First line\nSecond line";
+    const shiftEnter = keyboard("Enter", { shiftKey: true });
+    chat.state.handleComposerKeydown(shiftEnter as unknown as KeyboardEvent);
+    expect(shiftEnter.preventDefault).not.toHaveBeenCalled();
+    expect(chat.emit).not.toHaveBeenCalled();
+    expect(chat.state.draft.value).toBe("First line\nSecond line");
   });
 
   it.each([{ isComposing: true }, { keyCode: 229 }])("does not intercept IME Enter or Escape (%j)", async (ime) => {
@@ -222,14 +234,18 @@ describe("ResourceDocumentChatDialog interaction", () => {
     expect(secondaryPress.preventDefault).not.toHaveBeenCalled();
   });
 
-  it("does not send through the button during IME composition and resets composition on close", async () => {
-    const chat = setupChat();
+  it.each([
+    { layout: "mobile", mobile: true },
+    { layout: "desktop", mobile: false },
+  ])("does not send through the button or Enter during active IME composition on $layout", async ({ mobile }) => {
+    const chat = setupChat(mobile);
     chat.props.open = true;
     await settle();
     chat.state.draft.value = "An unfinished character";
     chat.state.isComposing.value = true;
     expect(chat.state.canSend.value).toBe(false);
     chat.state.sendDraft();
+    chat.state.handleComposerKeydown(keyboard("Enter") as unknown as KeyboardEvent);
     expect(chat.emit).not.toHaveBeenCalled();
     expect(chat.state.draft.value).toBe("An unfinished character");
     chat.props.open = false;

@@ -136,8 +136,7 @@ const sendDraft = () => {
   scheduleComposerResize();
 };
 const handleComposerKeydown = (event: KeyboardEvent) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229
-    && !isMobileLayout.value) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     sendDraft();
   }
@@ -338,7 +337,7 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
         <form class="document-chat__composer" @submit.prevent="sendDraft">
           <label class="document-chat__sr-only" for="resource-document-chat-message">Message this document</label>
           <textarea id="resource-document-chat-message" ref="composer" v-model="draft" rows="1" maxlength="2000"
-            placeholder="Message this document…" enterkeyhint="enter" :disabled="accessDenied"
+            placeholder="Message this document…" enterkeyhint="send" :disabled="accessDenied"
             @compositionstart="isComposing = true" @compositionend="isComposing = false; scheduleComposerResize()"
             @input="scheduleComposerResize" @keydown="handleComposerKeydown" />
           <button class="document-chat__icon-button" type="submit" :disabled="!canSend" aria-label="Send message"
