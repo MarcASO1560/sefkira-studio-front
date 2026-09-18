@@ -61,7 +61,14 @@ export type DocumentChatMessagePublic = {
   resource_id: string;
   author: DocumentChatAuthor;
   body: string;
+  sticker_id?: string | null;
   created_at: string;
+};
+
+export type DocumentChatMessageCreate = {
+  client_message_id: string;
+  body: string;
+  sticker_id?: string | null;
 };
 
 export type DocumentChatPage = {
@@ -293,7 +300,7 @@ export const getDocumentChatMessages = (
 export const postDocumentChatMessage = (
   projectId: string,
   resourceId: string,
-  payload: { client_message_id: string; body: string },
+  payload: DocumentChatMessageCreate,
   options: { signal?: AbortSignal } = {},
 ) => requestDocumentChat<DocumentChatMessagePublic>(documentChatPath(projectId, resourceId), {
   method: "POST",

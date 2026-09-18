@@ -8,6 +8,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { DocumentChatMessage } from "../composables/useDocumentChat";
 import * as presentation from "../lib/documentChatPresentation";
+import * as stickers from "../lib/documentChatStickers";
+
+const stickerId = stickers.DOCUMENT_CHAT_STICKERS[0]!.id;
 
 const source = readFileSync(new URL("./ResourceDocumentChatDialog.vue", import.meta.url), "utf8");
 const { descriptor } = parse(source);
@@ -22,14 +25,15 @@ class FakeElement extends EventTarget {
   style = { height: "", overflow: "" };
   scrollHeight = 44;
   clientHeight = 44;
-  dataset: { messageKey?: string } = {};
+  dataset: { messageKey?: string; stickerId?: string } = {};
   children: FakeElement[] = [];
   top = 0;
   focus = vi.fn(() => { fakeDocument.activeElement = this; });
   blur = vi.fn(() => {
     if (fakeDocument.activeElement === this) fakeDocument.activeElement = null;
   });
-  contains(element: unknown) { return element === this || this.children.includes(element as FakeElement); }
+  contains(element: unknown): boolean { return element === this || this.children.some((child) => child.contains(element)); }
+  querySelector(_selector: string) { return this.children[0] ?? null; }
   querySelectorAll(_selector: string): FakeElement[] { return this.children; }
   getBoundingClientRect() { return { top: this.top, bottom: this.top + 40 }; }
   getClientRects() { return [this.getBoundingClientRect()]; }
@@ -85,6 +89,8 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
     if (name === "vue") return { ...vue, onBeforeUnmount: (hook: () => void) => unmountHooks.push(hook) };
     if (name === "@lucide/vue") return {};
     if (name === "../lib/documentChatPresentation") return presentation;
+    if (name === "../lib/documentChatStickers") return stickers;
+    if (name === "./DocumentChatSticker.vue") return { default: {} };
     if (name === "../composables/useDocumentChatViewport") return {
       useDocumentChatViewport: () => ({
         isMobileLayout, viewportStyle: vue.ref(), start: startViewport, stop: stopViewport,
@@ -94,20 +100,26 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
   }, exports);
   const props = vue.reactive({
     open: false, documentName: "Document", participantsCount: 2, currentUserId: "artist",
-    messages: initialMessages, loading: false, error: null, hasOlder: true, sending: false,
+    messages: initialMessages, loading: false, error: null, hasOlder: true, sending: false, accessDenied: false,
   });
   const state = scope.run(() => exports.default!.setup(props, { expose: () => {}, emit })) as {
     dialog: vue.Ref<HTMLElement | null>;
     timeline: vue.Ref<HTMLElement | null>;
     composer: vue.Ref<HTMLTextAreaElement | null>;
     closeButton: vue.Ref<HTMLButtonElement | null>;
+    stickerButton: vue.Ref<HTMLButtonElement | null>;
+    stickerPicker: vue.Ref<HTMLElement | null>;
+    isStickerPickerOpen: vue.Ref<boolean>;
     draft: vue.Ref<string>;
     isComposing: vue.Ref<boolean>;
     canSend: vue.ComputedRef<boolean>;
     handleComposerKeydown: (event: KeyboardEvent) => void;
     handleModalKeydown: (event: KeyboardEvent) => void;
+    handleModalFocus: (event: FocusEvent) => void;
     keepComposerFocused: (event: PointerEvent) => void;
     sendDraft: () => void;
+    sendSticker: (stickerId: string) => void;
+    toggleStickerPicker: () => Promise<void>;
     updateScrollPosition: () => void;
     scheduleComposerResize: () => void;
     loadOlder: () => void;
@@ -115,13 +127,21 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
   };
   const composer = vue.markRaw(new FakeElement());
   const closeButton = vue.markRaw(new FakeElement());
+  const stickerButton = vue.markRaw(new FakeElement());
+  const stickerPicker = vue.markRaw(new FakeElement());
+  stickerPicker.tabIndex = -1;
+  const firstStickerButton = vue.markRaw(new FakeElement());
+  firstStickerButton.dataset.stickerId = stickerId;
+  stickerPicker.children = [firstStickerButton];
   const dialog = vue.markRaw(new FakeElement());
-  dialog.children = [closeButton, composer];
+  dialog.children = [closeButton, stickerButton, composer, stickerPicker];
   const timeline = vue.markRaw(new FakeTimeline());
   timeline.scrollHeight = 1000;
   timeline.clientHeight = 200;
   state.composer.value = composer as unknown as HTMLTextAreaElement;
   state.closeButton.value = closeButton as unknown as HTMLButtonElement;
+  state.stickerButton.value = stickerButton as unknown as HTMLButtonElement;
+  state.stickerPicker.value = stickerPicker as unknown as HTMLElement;
   state.dialog.value = dialog as unknown as HTMLElement;
   state.timeline.value = timeline as unknown as HTMLElement;
   let stopped = false;
@@ -132,7 +152,8 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
     scope.stop();
   };
   cleanups.push(stop);
-  return { state, props, emit, isMobileLayout, composer, closeButton, timeline, startViewport, stopViewport, stop };
+  return { state, props, emit, isMobileLayout, composer, closeButton, stickerButton, firstStickerButton,
+    timeline, startViewport, stopViewport, stop };
 };
 
 beforeEach(() => {
@@ -288,7 +309,7 @@ describe("ResourceDocumentChatDialog interaction", () => {
   it("restores the original focus and overflow after an ordinary completed leave", async () => {
     const previousFocus = vue.markRaw(new FakeElement());
     fakeDocument.activeElement = previousFocus;
-    const chat = setupChat();
+    const chat = setupChat(true);
     chat.props.open = true;
     await settle();
     chat.props.open = false;
@@ -298,6 +319,160 @@ describe("ResourceDocumentChatDialog interaction", () => {
     expect(fakeDocument.body.style.overflow).toBe("scroll");
     expect(previousFocus.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
     expect(fakeDocument.activeElement).toBe(previousFocus);
+  });
+
+  it("keeps the desktop panel nonmodal and leaves canvas focus alone when it closes", async () => {
+    const previousFocus = vue.markRaw(new FakeElement());
+    const canvas = vue.markRaw(new FakeElement());
+    fakeDocument.activeElement = previousFocus;
+    const addDocumentListener = vi.spyOn(fakeDocument, "addEventListener");
+    const chat = setupChat();
+    chat.props.open = true;
+    await settle();
+    expect(fakeDocument.body.style.overflow).toBe("scroll");
+    expect(addDocumentListener.mock.calls.some((call) => call[0] === "focusin")).toBe(false);
+    const tab = keyboard("Tab");
+    chat.state.handleModalKeydown(tab as unknown as KeyboardEvent);
+    expect(tab.preventDefault).not.toHaveBeenCalled();
+
+    fakeDocument.activeElement = canvas;
+    chat.state.handleModalFocus({ target: canvas } as unknown as FocusEvent);
+    expect(fakeDocument.activeElement).toBe(canvas);
+    const escape = keyboard("Escape", { target: canvas as unknown as EventTarget });
+    chat.state.handleModalKeydown(escape as unknown as KeyboardEvent);
+    expect(escape.preventDefault).not.toHaveBeenCalled();
+    expect(chat.emit).not.toHaveBeenCalled();
+    chat.props.open = false;
+    await settle();
+    await chat.state.finishClose();
+    expect(previousFocus.focus).not.toHaveBeenCalled();
+    expect(fakeDocument.activeElement).toBe(canvas);
+  });
+
+  it("traps mobile focus and releases the trap and body lock on a desktop breakpoint", async () => {
+    const canvas = vue.markRaw(new FakeElement());
+    const removeDocumentListener = vi.spyOn(fakeDocument, "removeEventListener");
+    const chat = setupChat(true);
+    chat.props.open = true;
+    await settle();
+    expect(fakeDocument.body.style.overflow).toBe("hidden");
+    fakeDocument.activeElement = chat.composer;
+    const mobileTab = keyboard("Tab");
+    chat.state.handleModalKeydown(mobileTab as unknown as KeyboardEvent);
+    expect(mobileTab.preventDefault).toHaveBeenCalledOnce();
+    expect(fakeDocument.activeElement).toBe(chat.closeButton);
+    fakeDocument.activeElement = canvas;
+    chat.state.handleModalFocus({ target: canvas } as unknown as FocusEvent);
+    expect(fakeDocument.activeElement).toBe(chat.closeButton);
+
+    chat.isMobileLayout.value = false;
+    await settle();
+    expect(fakeDocument.body.style.overflow).toBe("scroll");
+    expect(removeDocumentListener).toHaveBeenCalledWith("focusin", chat.state.handleModalFocus, true);
+    fakeDocument.activeElement = canvas;
+    chat.state.handleModalFocus({ target: canvas } as unknown as FocusEvent);
+    expect(fakeDocument.activeElement).toBe(canvas);
+    const desktopTab = keyboard("Tab");
+    chat.state.handleModalKeydown(desktopTab as unknown as KeyboardEvent);
+    expect(desktopTab.preventDefault).not.toHaveBeenCalled();
+    chat.isMobileLayout.value = true;
+    await settle();
+    expect(fakeDocument.body.style.overflow).toBe("hidden");
+  });
+
+  it.each([
+    { focus: "canvas", outside: true },
+    { focus: "composer", outside: false },
+  ])("moves $focus focus into the newly mobile modal only when it is outside the chat", async ({ outside }) => {
+    const canvas = vue.markRaw(new FakeElement());
+    const chat = setupChat();
+    chat.props.open = true;
+    await settle();
+    fakeDocument.activeElement = outside ? canvas : chat.composer;
+    chat.closeButton.focus.mockClear();
+    chat.isMobileLayout.value = true;
+    await settle();
+    expect(fakeDocument.body.style.overflow).toBe("hidden");
+    expect(fakeDocument.activeElement).toBe(outside ? chat.closeButton : chat.composer);
+    if (outside) expect(chat.closeButton.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+    else expect(chat.closeButton.focus).not.toHaveBeenCalled();
+  });
+
+  it("does not move canvas focus into the mobile dialog when it closes during the breakpoint update", async () => {
+    const canvas = vue.markRaw(new FakeElement());
+    const chat = setupChat();
+    chat.props.open = true;
+    await settle();
+    fakeDocument.activeElement = canvas;
+    chat.closeButton.focus.mockClear();
+    // Close during the DOM update, before the breakpoint watcher's nextTick focus step.
+    vue.queuePostFlushCb(() => { chat.props.open = false; });
+    chat.isMobileLayout.value = true;
+    await settle();
+    expect(chat.closeButton.focus).not.toHaveBeenCalled();
+    expect(fakeDocument.activeElement).toBe(canvas);
+    await chat.state.finishClose();
+    expect(fakeDocument.body.style.overflow).toBe("scroll");
+  });
+
+  it.each([
+    { layout: "mobile", mobile: true },
+    { layout: "desktop", mobile: false },
+  ])("closes the sticker picker before the chat when Escape is pressed on $layout", async ({ mobile }) => {
+    const chat = setupChat(mobile);
+    chat.props.open = true;
+    await settle();
+    await chat.state.toggleStickerPicker();
+    expect(chat.state.isStickerPickerOpen.value).toBe(true);
+    expect(fakeDocument.activeElement).toBe(chat.firstStickerButton);
+    const pickerEscape = keyboard("Escape");
+    chat.state.handleModalKeydown(pickerEscape as unknown as KeyboardEvent);
+    expect(pickerEscape.preventDefault).toHaveBeenCalledOnce();
+    expect(chat.state.isStickerPickerOpen.value).toBe(false);
+    expect(fakeDocument.activeElement).toBe(chat.stickerButton);
+    expect(chat.emit).not.toHaveBeenCalled();
+    chat.state.handleModalKeydown(keyboard("Escape") as unknown as KeyboardEvent);
+    expect(chat.emit).toHaveBeenCalledExactlyOnceWith("close");
+  });
+
+  it.each([
+    { layout: "mobile", mobile: true },
+    { layout: "desktop", mobile: false },
+  ])("sends a catalogue sticker on $layout without consuming the text draft", async ({ mobile }) => {
+    const chat = setupChat(mobile);
+    chat.props.open = true;
+    await settle();
+    chat.state.draft.value = "Keep this\nunfinished draft";
+    await chat.state.toggleStickerPicker();
+    chat.composer.focus.mockClear();
+    chat.stickerButton.focus.mockClear();
+    chat.state.sendSticker(stickerId);
+    expect(chat.emit).toHaveBeenCalledExactlyOnceWith("sendSticker", stickerId);
+    expect(chat.state.isStickerPickerOpen.value).toBe(false);
+    expect(chat.state.draft.value).toBe("Keep this\nunfinished draft");
+    expect(fakeDocument.activeElement).toBe(mobile ? chat.stickerButton : chat.composer);
+    if (mobile) expect(chat.composer.focus).not.toHaveBeenCalled();
+    else expect(chat.composer.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+  });
+
+  it.each([
+    { guard: "unknown sticker", sticker: "tiny-rpg-unavailable", denied: false, user: "artist", composing: false },
+    { guard: "access denied", sticker: stickerId, denied: true, user: "artist", composing: false },
+    { guard: "signed-out author", sticker: stickerId, denied: false, user: "", composing: false },
+    { guard: "IME composition", sticker: stickerId, denied: false, user: "artist", composing: true },
+  ])("does not send a sticker with $guard", async ({ sticker, denied, user, composing }) => {
+    const chat = setupChat();
+    chat.props.accessDenied = denied;
+    chat.props.currentUserId = user;
+    chat.state.isComposing.value = composing;
+    chat.state.isStickerPickerOpen.value = true;
+    chat.state.draft.value = "Preserve me";
+    chat.state.sendSticker(sticker);
+    expect(chat.emit).not.toHaveBeenCalled();
+    expect(chat.state.draft.value).toBe("Preserve me");
+    expect(chat.composer.focus).not.toHaveBeenCalled();
+    await settle();
+    if (denied) expect(chat.state.isStickerPickerOpen.value).toBe(false);
   });
 
   it("preserves the visible row on an actual prepend after status and realtime append updates", async () => {
@@ -365,7 +540,7 @@ describe("ResourceDocumentChatDialog interaction", () => {
   it("cancels scheduled composer resizing and releases modal effects on unmount", async () => {
     const removeKeyListener = vi.spyOn(fakeWindow, "removeEventListener");
     const removeFocusListener = vi.spyOn(fakeDocument, "removeEventListener");
-    const chat = setupChat();
+    const chat = setupChat(true);
     chat.props.open = true;
     await settle();
     chat.state.scheduleComposerResize();
@@ -374,7 +549,7 @@ describe("ResourceDocumentChatDialog interaction", () => {
     expect(frames.size).toBe(0);
     expect(fakeWindow.cancelAnimationFrame).toHaveBeenCalledOnce();
     expect(removeKeyListener).toHaveBeenCalledWith("keydown", chat.state.handleModalKeydown, true);
-    expect(removeFocusListener).toHaveBeenCalledOnce();
+    expect(removeFocusListener.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining(["focusin", "pointerdown"]));
     expect(chat.stopViewport).toHaveBeenCalledOnce();
     expect(fakeDocument.body.style.overflow).toBe("scroll");
   });

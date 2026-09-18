@@ -60,7 +60,7 @@ describe("document chat HTTP transport", () => {
     ]);
   });
 
-  it("sends only a body and stable client receipt, never a bitmap or revision", async () => {
+  it("keeps text payloads backward compatible without requiring a sticker ID", async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse(message));
     vi.stubGlobal("fetch", fetchMock);
@@ -77,6 +77,25 @@ describe("document chat HTTP transport", () => {
       headers: { Accept: "application/json", "Content-Type": "application/json" },
     });
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(payload);
+  });
+
+  it("sends an empty-body sticker ID and stable client receipt and preserves the acknowledgement", async () => {
+    const stickerMessage = { ...message, body: "", sticker_id: "tiny-rpg-slime" };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse(stickerMessage));
+    vi.stubGlobal("fetch", fetchMock);
+    const payload = { client_message_id: message.client_message_id, body: "", sticker_id: "tiny-rpg-slime" };
+    await expect(postDocumentChatMessage("project", "resource", payload)).resolves.toEqual(stickerMessage);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(payload);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "POST", cache: "no-store", credentials: "same-origin" });
+  });
+
+  it("preserves optional and nullable sticker IDs alongside existing text history", async () => {
+    const stickerHistory = {
+      ...history,
+      messages: [message, { ...message, id: 2, sticker_id: null }, { ...message, id: 3, body: "", sticker_id: "tiny-rpg-slime" }],
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(stickerHistory)));
+    await expect(getDocumentChatMessages("project", "resource")).resolves.toEqual(stickerHistory);
   });
 
   it.each([401, 403, 404, 409, 422, 500])("retains a typed HTTP status without exposing server internals (%s)", async (status) => {
@@ -120,7 +139,8 @@ describe("dedicated document chat realtime event", () => {
     expect(REALTIME_EVENT_NAMES).toContain("document.chat.created");
     expect(constructor).toHaveBeenCalledOnce();
     expect(constructor).toHaveBeenCalledWith("/api/v1/events/stream", { withCredentials: true });
-    const payload = { project_id: message.project_id, resource_id: message.resource_id, message };
+    const payload = { project_id: message.project_id, resource_id: message.resource_id,
+      message: { ...message, body: "", sticker_id: "tiny-rpg-slime" } };
     listeners.get("document.chat.created")?.({ data: JSON.stringify(payload) } as MessageEvent<string>);
     expect(onChat).toHaveBeenCalledWith(payload);
     expect(onCanvasUpdate).not.toHaveBeenCalled();

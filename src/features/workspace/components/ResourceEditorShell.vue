@@ -2207,6 +2207,10 @@ const closeDocumentInfo = () => {
 
 const openDocumentChat = () => {
   if (isLoading.value || errorMessage.value || !resource.value || isResourceProjectAccessRevoked.value) return;
+  if (isDocumentChatOpen.value) {
+    documentChat.setOpen(false);
+    return;
+  }
   clearImageTemporaryKeys();
   closeDocumentInfo();
   closeImageLayersDialog(false);
@@ -6392,7 +6396,6 @@ const handleResourceEditorKeydown = (event: KeyboardEvent) => {
     activeImageInspectorPanel.value !== null ||
     isImageConflictOpen.value ||
     isDocumentInfoOpen.value ||
-    isDocumentChatOpen.value ||
     isProfileDialogOpen.value ||
     isEditableKeyboardTarget(event.target) ||
     isImageControlKeyboardTarget(event.target)
@@ -7019,7 +7022,6 @@ onUnmounted(() => {
             class="image-editor-chat-trigger"
             :aria-label="documentChatButtonLabel"
             title="Document chat"
-            aria-haspopup="dialog"
             aria-controls="resource-document-chat-dialog"
             :aria-expanded="isDocumentChatOpen"
             :disabled="isResourceProjectAccessRevoked || isDocumentChatAccessDenied"
@@ -8084,6 +8086,26 @@ onUnmounted(() => {
           />
         </footer>
       </div>
+      <ResourceDocumentChatDialog
+        v-if="isImageEditor && resource && !errorMessage"
+        :key="`${projectId}:${resourceId}`"
+        :open="isDocumentChatOpen"
+        :document-name="resourceName"
+        :participants-count="documentChatParticipantsCount"
+        :current-user-id="currentPresenceUserId"
+        :messages="documentChatMessages"
+        :loading="isDocumentChatLoading"
+        :error="documentChatError"
+        :has-older="hasOlderDocumentChatMessages"
+        :sending="isDocumentChatSending"
+        :access-denied="isDocumentChatAccessDenied || isResourceProjectAccessRevoked"
+        @close="documentChat.setOpen(false)"
+        @send="documentChat.sendMessage"
+        @send-sticker="documentChat.sendSticker"
+        @retry="documentChat.retryMessage"
+        @load-older="documentChat.loadOlder"
+        @reload="documentChat.catchUp"
+      />
     </main>
 
     <UserProfileDialog
@@ -8095,25 +8117,6 @@ onUnmounted(() => {
       :user-pixel-avatar="profilePixelAvatar"
       @close="isProfileDialogOpen = false"
       @saved="updateProfile"
-    />
-    <ResourceDocumentChatDialog
-      v-if="isImageEditor && resource && !errorMessage"
-      :key="`${projectId}:${resourceId}`"
-      :open="isDocumentChatOpen"
-      :document-name="resourceName"
-      :participants-count="documentChatParticipantsCount"
-      :current-user-id="currentPresenceUserId"
-      :messages="documentChatMessages"
-      :loading="isDocumentChatLoading"
-      :error="documentChatError"
-      :has-older="hasOlderDocumentChatMessages"
-      :sending="isDocumentChatSending"
-      :access-denied="isDocumentChatAccessDenied || isResourceProjectAccessRevoked"
-      @close="documentChat.setOpen(false)"
-      @send="documentChat.sendMessage"
-      @retry="documentChat.retryMessage"
-      @load-older="documentChat.loadOlder"
-      @reload="documentChat.catchUp"
     />
     <ImageConflictNotice
       :open="isImageConflictOpen"
@@ -8373,15 +8376,18 @@ onUnmounted(() => {
 
   .resource-editor-stage {
     position: relative;
+    display: flex;
     flex: 1;
+    min-width: 0;
     min-height: 0;
+    overflow: hidden;
     background: var(--editor-bg);
   }
 
   .resource-editor-canvas {
     --editor-left-dock: 48px;
-    position: absolute;
-    inset: 0;
+    position: relative;
+    flex: 1 1 auto;
     display: grid;
     grid-template-columns: var(--editor-left-dock) minmax(0, 1fr);
     grid-template-rows: 40px minmax(0, 1fr) 30px;

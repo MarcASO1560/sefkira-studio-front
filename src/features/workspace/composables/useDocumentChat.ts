@@ -3,6 +3,7 @@ import {
   DocumentChatHttpError, getDocumentChatMessages, postDocumentChatMessage,
   type DocumentChatAuthor, type DocumentChatMessagePublic,
 } from "../../../lib/api";
+import { getDocumentChatSticker } from "../lib/documentChatStickers";
 
 export type DocumentChatMessage = Omit<DocumentChatMessagePublic, "id"> & {
   id: number | null;
@@ -25,6 +26,13 @@ const compareMessages = (a: DocumentChatMessage, b: DocumentChatMessage) => {
   return a.created_at.localeCompare(b.created_at) || a.client_message_id.localeCompare(b.client_message_id);
 };
 const isDenied = (error: unknown) => error instanceof DocumentChatHttpError && [401, 403, 404].includes(error.status);
+const hasValidContent = (body: unknown, stickerId: unknown) => {
+  if (typeof body !== "string" || body.length > 2000) return false;
+  if (stickerId === undefined || stickerId === null) return Boolean(body.trim());
+  // Preserve unknown catalogue IDs for the renderer's unavailable-sticker fallback.
+  return typeof stickerId === "string" && stickerId.length <= 80
+    && /^tiny-rpg-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(stickerId);
+};
 const newClientId = () => {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (character) => {
@@ -91,7 +99,9 @@ export const useDocumentChat = (options: Options) => {
         const message = value as Partial<DocumentChatMessage>;
         if (message.author?.id !== current.user.id || message.project_id !== current.projectId ||
           message.resource_id !== current.resourceId || typeof message.body !== "string" ||
-          !message.body.trim() || message.body.length > 2000 || typeof message.client_message_id !== "string" ||
+          !hasValidContent(message.body, message.sticker_id) ||
+          (message.sticker_id != null && (!getDocumentChatSticker(message.sticker_id) || message.body !== "")) ||
+          typeof message.client_message_id !== "string" ||
           !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(message.client_message_id) ||
           typeof message.created_at !== "string" || !Number.isFinite(Date.parse(message.created_at)) ||
           key !== `${prefix}${message.client_message_id}`) continue;
@@ -99,6 +109,7 @@ export const useDocumentChat = (options: Options) => {
           id: null, project_id: current.projectId, resource_id: current.resourceId,
           client_message_id: message.client_message_id, author: current.user,
           body: message.body, created_at: message.created_at, status: "failed",
+          ...(message.sticker_id ? { sticker_id: message.sticker_id } : {}),
           error: "Waiting to reconnect. You can retry this message.",
         };
         unique.set(messageKey(restored), restored);
@@ -110,7 +121,8 @@ export const useDocumentChat = (options: Options) => {
     if (!context) return;
     const existing = new Map(messages.value.map((message) => [messageKey(message), message]));
     for (const message of incoming) {
-      if (message.project_id !== context.projectId || message.resource_id !== context.resourceId) continue;
+      if (message.project_id !== context.projectId || message.resource_id !== context.resourceId
+        || !hasValidContent(message.body, message.sticker_id)) continue;
       const key = messageKey(message);
       if (!existing.has(key) && countUnread && !isOpen.value && message.author.id !== context.user.id) unreadCount.value++;
       existing.set(key, { ...message, status: "sent" });
@@ -134,6 +146,7 @@ export const useDocumentChat = (options: Options) => {
     const epoch = generation;
     const row = messages.value.find((message) => message.client_message_id === clientMessageId && message.author.id === current.user.id);
     if (!row || row.status === "sent") return Promise.resolve(!!row);
+    if (row.sticker_id != null && !getDocumentChatSticker(row.sticker_id)) return Promise.resolve(false);
     const key = messageKey(row);
     const existingRequest = inFlight.get(key);
     if (existingRequest) return existingRequest;
@@ -144,8 +157,15 @@ export const useDocumentChat = (options: Options) => {
     const request = (async () => {
       try {
         const accepted = await postDocumentChatMessage(current.projectId, current.resourceId,
-          { client_message_id: row.client_message_id, body: row.body }, { signal: controller.signal });
+          { client_message_id: row.client_message_id, body: row.body,
+            ...(row.sticker_id ? { sticker_id: row.sticker_id } : {}) }, { signal: controller.signal });
         if (!isCurrent(epoch)) return false;
+        if (row.sticker_id && (accepted.project_id !== current.projectId
+          || accepted.resource_id !== current.resourceId || accepted.author?.id !== current.user.id
+          || accepted.client_message_id !== row.client_message_id
+          || accepted.sticker_id !== row.sticker_id || accepted.body !== "")) {
+          throw new Error("The server did not confirm the sticker message.");
+        }
         merge([accepted], false);
         return true;
       } catch (cause) {
@@ -254,7 +274,7 @@ export const useDocumentChat = (options: Options) => {
     if (event.project_id !== context.projectId || event.resource_id !== context.resourceId || !event.message || typeof event.message !== "object") return;
     const message = event.message as DocumentChatMessagePublic;
     if (!Number.isSafeInteger(message.id) || message.id < 1 || typeof message.client_message_id !== "string" ||
-      typeof message.body !== "string" || message.body.length > 2000 || typeof message.created_at !== "string" ||
+      !hasValidContent(message.body, message.sticker_id) || typeof message.created_at !== "string" ||
       !Number.isFinite(Date.parse(message.created_at)) || !message.author || typeof message.author.id !== "string") return;
     merge([message], initialized);
     void catchUp();
@@ -303,18 +323,28 @@ export const useDocumentChat = (options: Options) => {
     if (open) { unreadCount.value = 0; void catchUp(); }
     schedulePoll();
   };
-  const sendMessage = (body: string): Promise<boolean> => {
-    const text = body.trim();
-    if (!context || !started || disposed || accessDenied.value || !text || text.length > 2000) return Promise.resolve(false);
+  const sendContent = (body: string, stickerId?: string): Promise<boolean> => {
+    if (!context || !started || disposed || accessDenied.value) return Promise.resolve(false);
     const user = toValue(options.user) || context.user;
     const message: DocumentChatMessage = {
       id: null, client_message_id: newClientId(), project_id: context.projectId,
-      resource_id: context.resourceId, author: user, body: text,
+      resource_id: context.resourceId, author: user, body,
+      ...(stickerId ? { sticker_id: stickerId } : {}),
       created_at: new Date().toISOString(), status: "failed",
     };
     messages.value = [...messages.value, message];
     persistPending();
     return retryMessage(message.client_message_id);
+  };
+  const sendMessage = (body: string): Promise<boolean> => {
+    const text = body.trim();
+    if (!text || text.length > 2000) return Promise.resolve(false);
+    return sendContent(text);
+  };
+  const sendSticker = (stickerId: string): Promise<boolean> => {
+    const sticker = getDocumentChatSticker(stickerId);
+    if (!sticker) return Promise.resolve(false);
+    return sendContent("", sticker.id);
   };
   const stopWatch = watch([() => toValue(options.projectId), () => toValue(options.resourceId), () => toValue(options.user)?.id || ""],
     () => { if (started && !disposed) resetContext(); });
@@ -348,5 +378,5 @@ export const useDocumentChat = (options: Options) => {
   };
   if (getCurrentInstance()) { onMounted(start); onBeforeUnmount(dispose); }
   return { messages, loading, error, hasOlder, isOpen, unreadCount, sending, accessDenied,
-    setOpen, sendMessage, retryMessage, loadOlder, receiveRealtime, catchUp, start, dispose };
+    setOpen, sendMessage, sendSticker, retryMessage, loadOlder, receiveRealtime, catchUp, start, dispose };
 };

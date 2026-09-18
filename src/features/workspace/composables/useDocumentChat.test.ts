@@ -9,6 +9,7 @@ import {
   type DocumentChatPage,
 } from "../../../lib/api";
 import { useDocumentChat } from "./useDocumentChat";
+import { DOCUMENT_CHAT_STICKERS } from "../lib/documentChatStickers";
 
 vi.mock("../../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../lib/api")>();
@@ -27,6 +28,7 @@ class MemoryStorage implements Storage {
 
 const ownUser: DocumentChatAuthor = { id: "owner", username: "Owner", avatar_url: null, avatar_pixel_art: null };
 const otherUser: DocumentChatAuthor = { id: "editor", username: "Editor", avatar_url: null, avatar_pixel_art: null };
+const stickerId = DOCUMENT_CHAT_STICKERS[0]!.id;
 const uuid = (index: number) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
 const message = (id: number, extra: Partial<DocumentChatMessagePublic> = {}): DocumentChatMessagePublic => ({
   id,
@@ -95,6 +97,7 @@ describe("document chat synchronization", () => {
       resource_id: resourceId,
       client_message_id: payload.client_message_id,
       body: payload.body,
+      ...(payload.sticker_id ? { sticker_id: payload.sticker_id } : {}),
       author: ownUser,
     }));
   });
@@ -135,6 +138,177 @@ describe("document chat synchronization", () => {
     expect(chat.messages.value[0]).toMatchObject({ id: 5, status: "sent", client_message_id: pendingId });
     expect(chat.unreadCount.value).toBe(0);
     expect(chat.sending.value).toBe(false);
+  });
+
+  it("queues an empty-body sticker optimistically and preserves it through realtime and HTTP acknowledgement", async () => {
+    const gate = deferred<DocumentChatMessagePublic>();
+    vi.mocked(postDocumentChatMessage).mockReturnValueOnce(gate.promise);
+    const { chat } = makeClient();
+    await startChat(chat);
+    const sending = chat.sendSticker(stickerId);
+    expect(chat.messages.value).toHaveLength(1);
+    expect(chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "pending", author: ownUser });
+    expect(chat.sending.value).toBe(true);
+    const originalId = chat.messages.value[0]!.client_message_id;
+    expect(vi.mocked(postDocumentChatMessage).mock.calls[0]?.[2]).toEqual({
+      client_message_id: originalId, body: "", sticker_id: stickerId,
+    });
+    const accepted = message(9, { author: ownUser, client_message_id: originalId, body: "", sticker_id: stickerId });
+    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: accepted });
+    gate.resolve(accepted);
+    expect(await sending).toBe(true);
+    await settle();
+    expect(chat.messages.value).toHaveLength(1);
+    expect(chat.messages.value[0]).toMatchObject({ id: 9, body: "", sticker_id: stickerId, status: "sent" });
+    expect(chat.sending.value).toBe(false);
+    expect(chat.unreadCount.value).toBe(0);
+    expect(storage.length).toBe(0);
+  });
+
+  it("retries a failed sticker with the same receipt and unchanged empty-body payload", async () => {
+    vi.mocked(postDocumentChatMessage).mockRejectedValueOnce(new TypeError("Offline"));
+    const { chat } = makeClient();
+    await startChat(chat);
+    expect(await chat.sendSticker(stickerId)).toBe(false);
+    const failed = chat.messages.value[0]!;
+    expect(failed).toMatchObject({ body: "", sticker_id: stickerId, status: "failed" });
+    const originalId = failed.client_message_id;
+    expect(await chat.retryMessage(originalId)).toBe(true);
+    expect(vi.mocked(postDocumentChatMessage).mock.calls.map((call) => call[2])).toEqual([
+      { client_message_id: originalId, body: "", sticker_id: stickerId },
+      { client_message_id: originalId, body: "", sticker_id: stickerId },
+    ]);
+    expect(chat.messages.value).toHaveLength(1);
+    expect(chat.messages.value[0]).toMatchObject({ sticker_id: stickerId, status: "sent", client_message_id: originalId });
+  });
+
+  it("recovers a failed sticker after reopening and sends its original receipt and payload", async () => {
+    vi.mocked(postDocumentChatMessage).mockRejectedValueOnce(new TypeError("ACK lost"));
+    const original = makeClient();
+    await startChat(original.chat);
+    await original.chat.sendSticker(stickerId);
+    const originalId = original.chat.messages.value[0]!.client_message_id;
+    original.chat.dispose();
+    original.scope.stop();
+    vi.mocked(postDocumentChatMessage).mockClear();
+    const recovered = makeClient();
+    await startChat(recovered.chat);
+    expect(vi.mocked(postDocumentChatMessage).mock.calls.map((call) => call[2])).toEqual([
+      { client_message_id: originalId, body: "", sticker_id: stickerId },
+    ]);
+    expect(recovered.chat.messages.value).toHaveLength(1);
+    expect(recovered.chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "sent", client_message_id: originalId });
+    expect(storage.length).toBe(0);
+  });
+
+  it("acknowledges a recovered sticker from history without posting it twice", async () => {
+    vi.mocked(postDocumentChatMessage).mockRejectedValueOnce(new TypeError("ACK lost"));
+    const original = makeClient();
+    await startChat(original.chat);
+    await original.chat.sendSticker(stickerId);
+    const originalId = original.chat.messages.value[0]!.client_message_id;
+    original.chat.dispose();
+    original.scope.stop();
+    vi.mocked(postDocumentChatMessage).mockClear();
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([
+      message(11, { author: ownUser, body: "", sticker_id: stickerId, client_message_id: originalId }),
+    ]));
+    const recovered = makeClient();
+    await startChat(recovered.chat);
+    expect(postDocumentChatMessage).not.toHaveBeenCalled();
+    expect(recovered.chat.messages.value).toHaveLength(1);
+    expect(recovered.chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "sent", client_message_id: originalId });
+    expect(storage.length).toBe(0);
+  });
+
+  it("retains a realtime sticker acknowledgement when its HTTP response is lost", async () => {
+    const gate = deferred<DocumentChatMessagePublic>();
+    vi.mocked(postDocumentChatMessage).mockReturnValueOnce(gate.promise);
+    const { chat } = makeClient();
+    await startChat(chat);
+    const sending = chat.sendSticker(stickerId);
+    const originalId = chat.messages.value[0]!.client_message_id;
+    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(12, {
+      author: ownUser, body: "", sticker_id: stickerId, client_message_id: originalId,
+    }) });
+    gate.reject(new TypeError("Response lost"));
+    expect(await sending).toBe(true);
+    expect(chat.messages.value).toHaveLength(1);
+    expect(chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "sent" });
+    expect(storage.length).toBe(0);
+  });
+
+  it("keeps sticker history and unknown remote catalogue IDs available for a safe renderer fallback", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([
+      message(1, { body: "", sticker_id: stickerId }),
+    ]));
+    const { chat } = makeClient();
+    await startChat(chat);
+    expect(chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "sent" });
+    const unknownId = "tiny-rpg-future-sticker";
+    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(2, {
+      body: "", sticker_id: unknownId,
+    }) });
+    await settle();
+    expect(chat.messages.value.map((row) => row.sticker_id)).toEqual([stickerId, unknownId]);
+    expect(chat.unreadCount.value).toBe(1);
+    expect(postDocumentChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not send or queue unknown IDs, property names or asset paths as stickers", async () => {
+    const { chat } = makeClient();
+    await startChat(chat);
+    for (const invalidId of ["", "tiny-rpg-unknown-sticker", "constructor", "__proto__", "../../asset.png", "https://example.com/sticker.gif"]) {
+      expect(await chat.sendSticker(invalidId)).toBe(false);
+    }
+    expect(postDocumentChatMessage).not.toHaveBeenCalled();
+    expect(chat.messages.value).toEqual([]);
+    expect(storage.length).toBe(0);
+  });
+
+  it("rejects empty realtime text messages and malformed sticker IDs", async () => {
+    const { chat } = makeClient();
+    await startChat(chat);
+    for (const invalidId of [undefined, null, {}, "../../asset.png", "tiny-rpg-" + "a".repeat(80)]) {
+      chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: {
+        ...message(2), body: "", sticker_id: invalidId,
+      } });
+    }
+    await settle();
+    expect(chat.messages.value).toEqual([]);
+    expect(chat.unreadCount.value).toBe(0);
+  });
+
+  it("does not recover or replay a pending receipt with an unavailable sticker", async () => {
+    vi.mocked(postDocumentChatMessage).mockRejectedValueOnce(new TypeError("Offline"));
+    const original = makeClient();
+    await startChat(original.chat);
+    await original.chat.sendSticker(stickerId);
+    original.chat.dispose();
+    original.scope.stop();
+    const [key, value] = [...storage.values.entries()][0]!;
+    storage.setItem(key, JSON.stringify({ ...JSON.parse(value), sticker_id: "tiny-rpg-unavailable" }));
+    vi.mocked(postDocumentChatMessage).mockClear();
+    const recovered = makeClient();
+    await startChat(recovered.chat);
+    expect(postDocumentChatMessage).not.toHaveBeenCalled();
+    expect(recovered.chat.messages.value).toEqual([]);
+  });
+
+  it.each([
+    { label: "missing sticker", sticker_id: undefined, body: "" },
+    { label: "different sticker", sticker_id: "tiny-rpg-wrong-sticker", body: "" },
+    { label: "text response", sticker_id: stickerId, body: "Unexpected caption" },
+  ])("keeps an unconfirmed sticker pending for retry when the ACK has a $label", async (ack) => {
+    vi.mocked(postDocumentChatMessage).mockImplementationOnce(async (_projectId, _resourceId, payload) => message(9, {
+      author: ownUser, client_message_id: payload.client_message_id, body: ack.body, sticker_id: ack.sticker_id,
+    }));
+    const { chat } = makeClient();
+    await startChat(chat);
+    expect(await chat.sendSticker(stickerId)).toBe(false);
+    expect(chat.messages.value).toHaveLength(1);
+    expect(chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "failed" });
+    expect(storage.length).toBe(1);
   });
 
   it("does not conflate different authors who reuse the same client message UUID", async () => {

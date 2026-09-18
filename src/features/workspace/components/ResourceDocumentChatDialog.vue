@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { MessageSquareText, SendHorizontal, UsersRound, X } from "@lucide/vue";
+import { MessageSquareText, SendHorizontal, Sticker, UsersRound, X } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import type { DocumentChatAuthor } from "../../../lib/api";
 import type { DocumentChatMessage } from "../composables/useDocumentChat";
 import { useDocumentChatViewport } from "../composables/useDocumentChatViewport";
 import { groupDocumentChatMessages, validatedDocumentChatAvatar } from "../lib/documentChatPresentation";
+import { DOCUMENT_CHAT_STICKERS, getDocumentChatSticker } from "../lib/documentChatStickers";
+import DocumentChatSticker from "./DocumentChatSticker.vue";
 
 const props = defineProps<{
   open: boolean;
@@ -22,6 +24,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: [];
   send: [body: string];
+  sendSticker: [stickerId: string];
   retry: [clientMessageId: string];
   loadOlder: [];
   reload: [];
@@ -30,6 +33,9 @@ const dialog = ref<HTMLElement | null>(null);
 const timeline = ref<HTMLElement | null>(null);
 const composer = ref<HTMLTextAreaElement | null>(null);
 const closeButton = ref<HTMLButtonElement | null>(null);
+const stickerButton = ref<HTMLButtonElement | null>(null);
+const stickerPicker = ref<HTMLElement | null>(null);
+const isStickerPickerOpen = ref(false);
 const draft = ref("");
 const isComposing = ref(false);
 const failedAvatarUrls = ref(new Map<string, string>());
@@ -40,6 +46,8 @@ const canSend = computed(() => Boolean(draft.value.trim()) && draft.value.trim()
 let previousFocus: HTMLElement | null = null;
 let previousBodyOverflow: string | null = null;
 let dialogEffectsActive = false;
+let modalEffectsActive = false;
+let restoreFocusOnClose = true;
 let dialogGeneration = 0;
 let composerResizeFrame: number | null = null;
 let messageAnimationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -135,6 +143,35 @@ const sendDraft = () => {
   if (!isMobileLayout.value) composer.value?.focus({ preventScroll: true });
   scheduleComposerResize();
 };
+const closeStickerPicker = (restoreFocus = false) => {
+  isStickerPickerOpen.value = false;
+  if (restoreFocus) stickerButton.value?.focus({ preventScroll: true });
+};
+const toggleStickerPicker = async () => {
+  if (props.accessDenied || !props.currentUserId) return;
+  if (isStickerPickerOpen.value) {
+    closeStickerPicker(true);
+    return;
+  }
+  // Give the picker the space occupied by the phone keyboard.
+  if (isMobileLayout.value) composer.value?.blur();
+  isStickerPickerOpen.value = true;
+  await nextTick();
+  stickerPicker.value?.querySelector<HTMLButtonElement>("[data-sticker-id]")?.focus({ preventScroll: true });
+};
+const sendSticker = (stickerId: string) => {
+  if (props.accessDenied || !props.currentUserId || isComposing.value || !getDocumentChatSticker(stickerId)) return;
+  scrollOwnMessage = true;
+  emit("sendSticker", stickerId);
+  closeStickerPicker(isMobileLayout.value);
+  if (!isMobileLayout.value) composer.value?.focus({ preventScroll: true });
+};
+const handleOutsidePointer = (event: PointerEvent) => {
+  if (!isStickerPickerOpen.value || !(event.target instanceof Node)) return;
+  if (!stickerPicker.value?.contains(event.target) && !stickerButton.value?.contains(event.target)) {
+    closeStickerPicker();
+  }
+};
 const handleComposerKeydown = (event: KeyboardEvent) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
@@ -146,11 +183,13 @@ const focusableElements = () => [...(dialog.value?.querySelectorAll<HTMLElement>
 ) || [])].filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0);
 function handleModalKeydown(event: KeyboardEvent) {
   if (!dialogEffectsActive || event.isComposing || event.keyCode === 229) return;
+  if (!isMobileLayout.value && !dialog.value?.contains(event.target instanceof Node ? event.target : document.activeElement)) return;
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopImmediatePropagation();
-    if (props.open) emit("close");
-  } else if (event.key === "Tab") {
+    if (isStickerPickerOpen.value) closeStickerPicker(true);
+    else if (props.open) emit("close");
+  } else if (event.key === "Tab" && isMobileLayout.value) {
     const elements = focusableElements();
     const first = elements[0];
     const last = elements[elements.length - 1];
@@ -167,15 +206,30 @@ function handleModalKeydown(event: KeyboardEvent) {
   }
 }
 function handleModalFocus(event: FocusEvent) {
-  if (dialogEffectsActive && event.target instanceof Node && !dialog.value?.contains(event.target)) {
+  if (modalEffectsActive && event.target instanceof Node && !dialog.value?.contains(event.target)) {
     closeButton.value?.focus({ preventScroll: true });
   }
 }
+const syncModalEffects = () => {
+  const needsModal = dialogEffectsActive && isMobileLayout.value;
+  if (needsModal && !modalEffectsActive) {
+    previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.addEventListener("focusin", handleModalFocus, true);
+    modalEffectsActive = true;
+  } else if (!needsModal && modalEffectsActive) {
+    document.removeEventListener("focusin", handleModalFocus, true);
+    if (previousBodyOverflow !== null) document.body.style.overflow = previousBodyOverflow;
+    previousBodyOverflow = null;
+    modalEffectsActive = false;
+  }
+};
 const stopDialogEffects = () => {
   if (typeof window === "undefined") return;
   dialogEffectsActive = false;
   window.removeEventListener("keydown", handleModalKeydown, true);
-  document.removeEventListener("focusin", handleModalFocus, true);
+  document.removeEventListener("pointerdown", handleOutsidePointer, true);
+  syncModalEffects();
   stopViewport();
   if (composerResizeFrame !== null) window.cancelAnimationFrame(composerResizeFrame);
   composerResizeFrame = null;
@@ -195,7 +249,7 @@ const finishClose = async () => {
   await nextTick();
   if (generation === dialogGeneration && !props.open) {
     previousFocus = null;
-    if (target?.isConnected) target.focus({ preventScroll: true });
+    if (restoreFocusOnClose && target?.isConnected) target.focus({ preventScroll: true });
   }
 };
 
@@ -203,6 +257,8 @@ watch(() => props.open, async (open) => {
   if (typeof window === "undefined") return;
   const generation = ++dialogGeneration;
   if (!open) {
+    restoreFocusOnClose = isMobileLayout.value || Boolean(dialog.value?.contains(document.activeElement));
+    closeStickerPicker();
     composer.value?.blur();
     isComposing.value = false;
     return;
@@ -211,16 +267,15 @@ watch(() => props.open, async (open) => {
     if (!previousFocus?.isConnected) {
       previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     }
-    previousBodyOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     dialogEffectsActive = true;
     window.addEventListener("keydown", handleModalKeydown, true);
-    document.addEventListener("focusin", handleModalFocus, true);
+    document.addEventListener("pointerdown", handleOutsidePointer, true);
   }
   nearBottom = true;
   scrollOwnMessage = false;
   renderedMessageKeys = props.messages.map(messageKey);
   startViewport();
+  syncModalEffects();
   await nextTick();
   if (!props.open || generation !== dialogGeneration) return;
   scrollToBottom();
@@ -228,6 +283,23 @@ watch(() => props.open, async (open) => {
   // Avoid opening the virtual keyboard before the user chooses to write.
   (isMobileLayout.value ? closeButton.value : composer.value)?.focus({ preventScroll: true });
 }, { immediate: true });
+
+watch(isMobileLayout, async (mobile) => {
+  if (!dialogEffectsActive) return;
+  syncModalEffects();
+  scheduleComposerResize();
+  if (!mobile) return;
+  const generation = dialogGeneration;
+  await nextTick();
+  if (props.open && isMobileLayout.value && generation === dialogGeneration
+    && !dialog.value?.contains(document.activeElement)) closeButton.value?.focus({ preventScroll: true });
+});
+watch(() => props.accessDenied, (denied) => { if (denied) closeStickerPicker(); });
+watch(isStickerPickerOpen, async () => {
+  const keepBottom = nearBottom;
+  await nextTick();
+  if (props.open && keepBottom) scrollToBottom();
+});
 
 watch(() => props.messages.map((message) => `${messageKey(message)}:${message.status}`).join("|"), async () => {
   const previousKeys = renderedMessageKeys;
@@ -261,12 +333,12 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 </script>
 
 <template>
-  <Teleport to="body">
+  <Teleport to="body" :disabled="!isMobileLayout">
     <Transition name="document-chat" @after-leave="finishClose">
-    <div v-if="open" class="document-chat-backdrop" :style="viewportStyle" @click.self="emit('close')"
+    <div v-if="open" class="document-chat-backdrop" :style="viewportStyle"
       @wheel.stop @pointerdown.stop @pointermove.stop @pointerup.stop @keydown.stop>
-      <section id="resource-document-chat-dialog" ref="dialog" class="document-chat" role="dialog"
-        aria-modal="true" aria-labelledby="resource-document-chat-title" data-image-shortcuts="off" tabindex="-1">
+      <section id="resource-document-chat-dialog" ref="dialog" class="document-chat" :role="isMobileLayout ? 'dialog' : 'complementary'"
+        :aria-modal="isMobileLayout ? true : undefined" aria-labelledby="resource-document-chat-title" data-image-shortcuts="off" tabindex="-1">
         <header class="document-chat__header">
           <MessageSquareText :size="22" aria-hidden="true" class="document-chat__header-icon" />
           <div class="document-chat__identity">
@@ -318,7 +390,10 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
                   :data-message-key="messageKey(message)"
                   :class="{ 'document-chat__message--pending': message.status === 'pending',
                     'document-chat__message--new': enteringMessageKeys.has(messageKey(message)) }">
-                  <p>{{ message.body }}</p>
+                  <DocumentChatSticker v-if="getDocumentChatSticker(message.sticker_id)"
+                    :sticker="getDocumentChatSticker(message.sticker_id)!" class="document-chat__sticker" />
+                  <p v-else-if="message.sticker_id" class="document-chat__unavailable-sticker">Sticker unavailable</p>
+                  <p v-else>{{ message.body }}</p>
                   <span v-if="message.status === 'pending'" class="document-chat__delivery" role="status">Sending…</span>
                   <div v-else-if="message.status === 'failed'" class="document-chat__failed" role="status">
                     <span>{{ message.error || 'Message not sent.' }}</span>
@@ -334,12 +409,35 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
           <span>{{ accessDenied ? 'You no longer have access to this document.' : error }}</span>
           <button v-if="!accessDenied" type="button" :disabled="loading" @click="emit('reload')">Retry</button>
         </div>
+        <Transition name="sticker-picker">
+          <section v-if="isStickerPickerOpen" id="resource-document-chat-stickers" ref="stickerPicker"
+            class="document-chat__sticker-picker" aria-labelledby="resource-document-chat-stickers-title">
+            <header class="document-chat__sticker-picker-header">
+              <h3 id="resource-document-chat-stickers-title">Pixel stickers</h3>
+              <button class="document-chat__icon-button" type="button" aria-label="Close stickers" @click="closeStickerPicker(true)">
+                <X :size="18" aria-hidden="true" />
+              </button>
+            </header>
+            <div class="document-chat__sticker-grid">
+              <button v-for="sticker in DOCUMENT_CHAT_STICKERS" :key="sticker.id" type="button" class="document-chat__sticker-option"
+                :data-sticker-id="sticker.id" :aria-label="`Send ${sticker.label} sticker`" :title="sticker.label"
+                :disabled="accessDenied || isComposing" @click="sendSticker(sticker.id)">
+                <DocumentChatSticker :sticker="sticker" :size="64" preview />
+              </button>
+            </div>
+          </section>
+        </Transition>
         <form class="document-chat__composer" @submit.prevent="sendDraft">
           <label class="document-chat__sr-only" for="resource-document-chat-message">Message this document</label>
           <textarea id="resource-document-chat-message" ref="composer" v-model="draft" rows="1" maxlength="2000"
             placeholder="Message this document…" enterkeyhint="send" :disabled="accessDenied"
             @compositionstart="isComposing = true" @compositionend="isComposing = false; scheduleComposerResize()"
             @input="scheduleComposerResize" @keydown="handleComposerKeydown" />
+          <button ref="stickerButton" class="document-chat__icon-button" type="button" aria-label="Choose a sticker"
+            aria-controls="resource-document-chat-stickers" :aria-expanded="isStickerPickerOpen"
+            :disabled="accessDenied || !currentUserId || isComposing" @click="toggleStickerPicker">
+            <Sticker :size="21" aria-hidden="true" />
+          </button>
           <button class="document-chat__icon-button" type="submit" :disabled="!canSend" aria-label="Send message"
             @pointerdown="keepComposerFocused">
             <SendHorizontal :size="22" aria-hidden="true" />
@@ -352,14 +450,14 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 </template>
 
 <style scoped>
-.document-chat-backdrop { position: fixed; z-index: 300; inset: 0; display: grid; place-items: center; padding: 20px; box-sizing: border-box; background: rgb(0 0 0 / 64%); overscroll-behavior: contain; }
-.document-chat { display: flex; flex-direction: column; width: min(100%, 520px); height: min(620px, calc(var(--document-info-viewport-height, 100dvh) - 40px)); min-height: 0; overflow: hidden; box-sizing: border-box; border: 1px solid #353638; border-radius: 14px; background: #17181a; color: #fff; font-family: inherit; }
+.document-chat-backdrop { position: relative; z-index: 6; display: flex; flex: 0 0 min(380px, 42vw); width: min(380px, 42vw); min-width: 0; min-height: 0; height: 100%; box-sizing: border-box; overscroll-behavior: contain; }
+.document-chat { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; overflow: hidden; box-sizing: border-box; border: 0; border-left: 1px solid #303134; background: #17181a; color: #fff; font-family: inherit; }
 .document-chat-enter-active { transition: opacity 180ms ease-out; }
 .document-chat-leave-active { transition: opacity 140ms ease-in; }
 .document-chat-enter-active .document-chat { transition: transform 180ms cubic-bezier(0.2, 0.7, 0.3, 1); }
 .document-chat-leave-active .document-chat { transition: transform 140ms ease-in; }
 .document-chat-enter-from, .document-chat-leave-to { opacity: 0; }
-.document-chat-enter-from .document-chat, .document-chat-leave-to .document-chat { transform: translateY(8px) scale(0.985); }
+.document-chat-enter-from .document-chat, .document-chat-leave-to .document-chat { transform: translateX(16px); }
 .document-chat__header { display: flex; align-items: center; flex: 0 0 auto; gap: 12px; padding: 12px 12px 12px 20px; border-bottom: 1px solid #303134; }
 .document-chat__header-icon { flex: 0 0 auto; }
 .document-chat__identity { flex: 1 1 auto; min-width: 0; }
@@ -382,12 +480,14 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 .document-chat__you, .document-chat time { color: #989da5; font-size: 10px; }
 .document-chat__message p { margin: 0; color: #e7e8eb; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.55; }
 .document-chat__message + .document-chat__message { margin-top: 5px; }
+.document-chat__sticker { margin-block: 6px; }
+.document-chat__message .document-chat__unavailable-sticker { color: #989da5; font-style: italic; }
 .document-chat__message--new { animation: document-chat-message-enter 160ms ease-out both; }
 @keyframes document-chat-message-enter {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
 }
-.document-chat__message--pending p { opacity: 0.6; }
+.document-chat__message--pending p, .document-chat__message--pending .document-chat__sticker { opacity: 0.6; }
 .document-chat__delivery { color: #a9adb2; font-size: 11px; }
 .document-chat__failed { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #c1c4ca; font-size: 11px; }
 .document-chat__failed button, .document-chat__error button { min-width: 44px; min-height: 44px; padding: 4px 8px; color: #fff; border: 0; border-radius: 5px; background: transparent; text-decoration: underline; font-family: inherit; cursor: pointer; touch-action: manipulation; transition: background-color 140ms ease, opacity 100ms ease; -webkit-tap-highlight-color: transparent; }
@@ -399,19 +499,29 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 .document-chat__empty p { margin: 0; color: #e7e8eb; font-size: 14px; }
 .document-chat__empty span { font-size: 12px; }
 .document-chat__error { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 20px; border-top: 1px solid #303134; color: #c1c4ca; font-size: 12px; overflow-wrap: anywhere; }
-.document-chat__composer { display: flex; align-items: flex-end; flex: 0 0 auto; gap: 4px; margin: 0 16px 16px; padding: 4px 4px 4px 10px; background: #25272b; border: 1px solid transparent; border-radius: 8px; transition: border-color 140ms ease; }
+.document-chat__composer { display: flex; align-items: flex-end; flex: 0 0 auto; gap: 2px; margin: 0 12px 12px; padding: 4px 4px 4px 10px; background: #25272b; border: 1px solid transparent; border-radius: 8px; transition: border-color 140ms ease; }
 .document-chat__composer:focus-within { border-color: #989da5; }
 .document-chat__composer textarea { display: block; flex: 1 1 auto; width: 0; min-width: 0; min-height: 44px; max-height: clamp(44px, calc(var(--document-info-viewport-height, 100dvh) * 0.3), 120px); padding: 11px 4px; resize: none; box-sizing: border-box; overflow-y: auto; color: #fff; background: transparent; border: 0; border-radius: 4px; outline: none; box-shadow: none; font-family: inherit; font-size: 16px; line-height: 22px; overscroll-behavior: contain; }
 .document-chat__composer textarea:focus-visible { outline: none; box-shadow: none; }
 .document-chat__composer textarea::placeholder { color: #969ba3; }
 .document-chat__composer textarea:disabled { opacity: 0.5; }
+.document-chat__sticker-picker { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; max-height: min(280px, calc(var(--document-info-viewport-height, 100dvh) * 0.45)); margin: 0 12px 10px; overflow: hidden; border: 1px solid #353638; border-radius: 8px; background: #202125; }
+.document-chat__sticker-picker-header { display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; padding-left: 12px; border-bottom: 1px solid #303134; }
+.document-chat__sticker-picker-header h3 { margin: 0; color: #c1c4ca; font-size: 12px; font-weight: 600; }
+.document-chat__sticker-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); align-content: start; min-height: 0; gap: 4px; padding: 8px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #484a4e transparent; }
+.document-chat__sticker-option { display: grid; place-items: center; min-width: 0; min-height: 72px; padding: 4px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; transition: background-color 140ms ease, transform 100ms ease; }
+.document-chat__sticker-option:active:not(:disabled) { background: #353638; transform: scale(0.94); }
+.document-chat__sticker-option:disabled { opacity: 0.4; cursor: default; }
+.sticker-picker-enter-active, .sticker-picker-leave-active { transition: opacity 120ms ease, transform 120ms ease; }
+.sticker-picker-enter-from, .sticker-picker-leave-to { opacity: 0; transform: translateY(6px); }
 .document-chat__sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (hover: hover) and (pointer: fine) {
   .document-chat__icon-button:hover:not(:disabled), .document-chat__older:hover:not(:disabled),
-  .document-chat__failed button:hover:not(:disabled), .document-chat__error button:hover:not(:disabled) { background: #303135; }
+  .document-chat__failed button:hover:not(:disabled), .document-chat__error button:hover:not(:disabled),
+  .document-chat__sticker-option:hover:not(:disabled) { background: #303135; }
 }
-@media (max-width: 600px), (max-width: 960px) and (max-height: 500px) {
-  .document-chat-backdrop { top: var(--document-info-viewport-top, 0px); bottom: auto; height: var(--document-info-viewport-height, 100dvh); padding: 0; background: #17181a; }
+@media (max-width: 600px), (max-width: 960px) and (max-height: 500px) and (pointer: coarse) {
+  .document-chat-backdrop { position: fixed; z-index: 300; inset: var(--document-info-viewport-top, 0px) 0 auto; width: 100%; height: var(--document-info-viewport-height, 100dvh); background: #17181a; }
   .document-chat { width: 100%; height: 100%; max-height: none; border: 0; border-radius: 0; }
   .document-chat-enter-from .document-chat, .document-chat-leave-to .document-chat { transform: translateY(12px); }
   .document-chat__header { gap: 10px; padding: calc(8px + env(safe-area-inset-top, 0px)) max(8px, env(safe-area-inset-right, 0px)) 8px max(16px, env(safe-area-inset-left, 0px)); }
@@ -423,9 +533,11 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
   .document-chat-enter-active, .document-chat-leave-active,
   .document-chat-enter-active .document-chat, .document-chat-leave-active .document-chat,
   .document-chat__icon-button, .document-chat__older, .document-chat__failed button,
-  .document-chat__error button, .document-chat__composer { transition: none; }
+  .document-chat__error button, .document-chat__composer, .document-chat__sticker-option,
+  .sticker-picker-enter-active, .sticker-picker-leave-active { transition: none; }
   .document-chat-enter-from .document-chat, .document-chat-leave-to .document-chat,
-  .document-chat__icon-button:active:not(:disabled) { transform: none; }
+  .document-chat__icon-button:active:not(:disabled), .document-chat__sticker-option:active:not(:disabled),
+  .sticker-picker-enter-from, .sticker-picker-leave-to { transform: none; }
   .document-chat__message--new { animation: none; }
 }
 </style>

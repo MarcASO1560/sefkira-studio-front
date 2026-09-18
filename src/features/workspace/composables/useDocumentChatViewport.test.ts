@@ -69,7 +69,7 @@ describe("document chat viewport", () => {
     });
     expect(viewport.isMobileLayout.value).toBe(true);
     expect(fakeWindow.matchMedia).toHaveBeenCalledExactlyOnceWith(
-      "(max-width: 600px), (max-width: 960px) and (max-height: 500px)",
+      "(max-width: 600px), (max-width: 960px) and (max-height: 500px) and (pointer: coarse)",
     );
     expect(windowListener).toHaveBeenCalledTimes(1);
     expect(viewportListener).toHaveBeenCalledTimes(2);

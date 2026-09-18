@@ -3,7 +3,7 @@ import { getCurrentScope, onScopeDispose, ref } from "vue";
 import { getDocumentInfoViewportStyle } from "../lib/documentInfoViewport";
 
 type Options = { onResize?: () => void };
-const viewportQuery = "(max-width: 600px), (max-width: 960px) and (max-height: 500px)";
+const viewportQuery = "(max-width: 600px), (max-width: 960px) and (max-height: 500px) and (pointer: coarse)";
 
 export const useDocumentChatViewport = (options: Options = {}) => {
   const isMobileLayout = ref(false);
