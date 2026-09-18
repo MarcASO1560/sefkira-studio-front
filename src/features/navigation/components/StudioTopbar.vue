@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Folder } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 
 import type { PixelAvatarData } from "../../../lib/api";
@@ -171,7 +172,15 @@ const handleUserClick = () => {
           class="studio-topbar__project-logo-loader"
           aria-hidden="true"
         ></span>
-        <span v-else>{{ brandTrailText }}</span>
+        <template v-else>
+          <Folder
+            class="studio-topbar__project-fallback"
+            :size="24"
+            :stroke-width="1.8"
+            aria-hidden="true"
+          />
+          <span>{{ brandTrailText }}</span>
+        </template>
       </component>
     </div>
 
@@ -379,6 +388,10 @@ const handleUserClick = () => {
     border: 1px solid rgba(247, 241, 231, 0.18);
     border-radius: 8px;
     image-rendering: pixelated;
+  }
+
+  .studio-topbar__project-fallback {
+    display: none;
   }
 
   .studio-topbar__project-logo-loader {

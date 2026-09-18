@@ -8,7 +8,7 @@ import {
   Link2,
   Link2Off,
   LockKeyhole,
-  MessageSquareText,
+  MessageCircleMore,
   MousePointer2,
   Plus,
   Ruler,
@@ -6932,7 +6932,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section ref="editorRoot" class="resource-editor" :class="{ 'resource-editor--with-chat-action': isImageEditor }" :style="editorStyle">
+  <section ref="editorRoot" class="resource-editor" :style="editorStyle">
     <StudioTopbar
       mode="project"
       center-max-width="min(520px, 38vw)"
@@ -7008,7 +7008,7 @@ onUnmounted(() => {
           data-image-shortcuts="off"
           @click="openDocumentChat"
         >
-          <MessageSquareText :size="21" :stroke-width="2" aria-hidden="true" />
+          <MessageCircleMore :size="21" :stroke-width="2" aria-hidden="true" />
           <span v-if="documentChatUnreadCount > 0" class="image-editor-chat-trigger__unread" aria-hidden="true">{{ documentChatUnreadCount > 99 ? '99+' : documentChatUnreadCount }}</span>
         </button>
       </template>
@@ -10231,9 +10231,26 @@ onUnmounted(() => {
       grid-template-areas: "brand center user";
       grid-template-columns: max-content minmax(0, 1fr) max-content;
       row-gap: 0;
-      column-gap: 6px;
-      padding-right: 6px;
-      padding-left: 6px;
+      column-gap: 4px;
+      padding-right: 4px;
+      padding-left: 4px;
+    }
+
+    .resource-editor :deep(.studio-topbar__brand),
+    .resource-editor :deep(.studio-topbar__actions) {
+      gap: 4px;
+    }
+
+    .resource-editor :deep(.studio-topbar__brand-main),
+    .resource-editor :deep(.studio-topbar__brand-trail),
+    .resource-editor :deep(.studio-topbar__brand-trail.has-logo),
+    .resource-editor :deep(.studio-topbar__user) {
+      display: inline-grid;
+      place-items: center;
+      flex: 0 0 44px;
+      width: 44px;
+      height: 44px;
+      max-width: 44px;
     }
 
     .resource-editor :deep(.studio-topbar__center) {
@@ -10245,8 +10262,12 @@ onUnmounted(() => {
     .resource-editor :deep(.studio-topbar__brand-name),
     .resource-editor :deep(.studio-topbar__brand-separator),
     .resource-editor :deep(.studio-topbar__user-label),
-    .resource-editor :deep(.studio-topbar__brand-trail > :not(.studio-topbar__project-logo)) {
+    .resource-editor :deep(.studio-topbar__brand-trail > :not(.studio-topbar__project-logo, .studio-topbar__project-logo-loader, .studio-topbar__project-fallback)) {
       display: none;
+    }
+
+    .resource-editor :deep(.studio-topbar__project-fallback) {
+      display: block;
     }
 
     .resource-editor-title__kind {
@@ -10255,15 +10276,17 @@ onUnmounted(() => {
 
     .resource-editor-title {
       height: 44px;
-      gap: 8px;
-      padding: 0 8px;
+      gap: 6px;
+      padding: 0 6px;
+      background: transparent;
+      border-color: transparent;
     }
 
-    .resource-editor-title__identity { gap: 8px; }
+    .resource-editor-title__identity { gap: 6px; }
 
     .resource-editor-title__status {
-      gap: 8px;
-      padding-left: 8px;
+      gap: 6px;
+      padding-left: 6px;
     }
 
     .resource-editor-canvas {
@@ -10577,10 +10600,14 @@ onUnmounted(() => {
   }
 
   @media (max-width: 520px) {
-    .resource-editor--with-chat-action :deep(.studio-topbar) {
-      grid-template-areas: "brand user" "center center";
-      grid-template-columns: minmax(0, 1fr) max-content;
-      row-gap: 6px;
+    .resource-editor-title__status :deep(.image-save-status > span) {
+      display: none;
+    }
+  }
+
+  @media (max-width: 380px) {
+    .resource-editor-title__icon {
+      display: none;
     }
   }
 

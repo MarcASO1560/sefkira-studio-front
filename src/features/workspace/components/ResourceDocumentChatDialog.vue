@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { MessageSquareText, SendHorizontal, Sticker, UsersRound, X } from "@lucide/vue";
+import { MessageCircleMore, SendHorizontal, Sticker, UsersRound, X } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import type { DocumentChatAuthor } from "../../../lib/api";
@@ -361,7 +361,7 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
           @pointerup.stop="chatResize.endDrag" @pointercancel.stop="chatResize.endDrag"
           @lostpointercapture.stop="chatResize.endDrag" @keydown="chatResize.handleKeydown" @dblclick="chatResize.reset" />
         <header class="document-chat__header">
-          <MessageSquareText :size="22" aria-hidden="true" class="document-chat__header-icon" />
+          <MessageCircleMore :size="22" aria-hidden="true" class="document-chat__header-icon" />
           <div class="document-chat__identity">
             <h2 id="resource-document-chat-title">{{ documentName }}</h2>
             <p>Document chat</p>
@@ -381,7 +381,7 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
           </button>
           <p v-if="loading && !messages.length" class="document-chat__notice" role="status">Loading messages…</p>
           <div v-else-if="!messages.length && !error" class="document-chat__empty">
-            <MessageSquareText :size="32" aria-hidden="true" />
+            <MessageCircleMore :size="32" aria-hidden="true" />
             <p>A conversation for this document.</p>
             <span>Send the first message.</span>
           </div>
