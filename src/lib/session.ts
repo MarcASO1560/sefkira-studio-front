@@ -49,8 +49,13 @@ export const clearStoredAccessTokens = () => {
     return;
   }
 
-  window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
-  window.localStorage.removeItem(LEGACY_ACCESS_TOKEN_STORAGE_KEY);
+  for (const key of [ACCESS_TOKEN_STORAGE_KEY, LEGACY_ACCESS_TOKEN_STORAGE_KEY]) {
+    try {
+      window.localStorage.removeItem(key);
+    } catch {
+      // Legacy storage is optional; the active session uses an HttpOnly cookie.
+    }
+  }
 };
 
 export const clearClientSession = async () => {

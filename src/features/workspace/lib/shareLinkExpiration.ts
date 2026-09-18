@@ -68,6 +68,9 @@ export const shareLinkFailureMessage = (status: number, detail?: unknown): strin
     return "You are blocked from this project. A project owner must unblock you before you can join.";
   }
   if (status === 403) return "You cannot join this project. Ask a project owner to check your access or unblock you.";
+  if (status === 408 || status === 429 || status >= 500) {
+    return "The project could not be opened right now. Wait a moment and try again.";
+  }
   return "This share link is not available anymore. Ask a project owner for an active link.";
 };
 

@@ -493,11 +493,20 @@ onMounted(async () => {
     return;
   }
 
-  if (window.sessionStorage.getItem(WORKSPACE_TRANSITION_STORAGE_KEY) !== "pending") {
+  let pending = false;
+  try {
+    pending = window.sessionStorage.getItem(WORKSPACE_TRANSITION_STORAGE_KEY) === "pending";
+    if (pending) window.sessionStorage.removeItem(WORKSPACE_TRANSITION_STORAGE_KEY);
+  } catch {
+    // The workspace remains usable when the browser blocks optional storage.
+    document.documentElement.classList.remove("route-transition-pending");
+    return;
+  }
+  if (!pending) {
+    document.documentElement.classList.remove("route-transition-pending");
     return;
   }
 
-  window.sessionStorage.removeItem(WORKSPACE_TRANSITION_STORAGE_KEY);
   const transitionToken = entryTransitionToken + 1;
   entryTransitionToken = transitionToken;
   const startedAt = performance.now();

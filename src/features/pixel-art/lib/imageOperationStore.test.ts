@@ -127,4 +127,16 @@ describe("durable image operation storage", () => {
     expect(duplicated.id).not.toBe(first.id); expect(held.has(`sefkirastudio-image-tab:${duplicated.id}`)).toBe(true);
     first.release(); duplicated.release();
   });
+  it("claims isolated editor sessions when even the sessionStorage getter is forbidden", async () => {
+    const held = fakeLocks();
+    vi.stubGlobal("sessionStorage", undefined);
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, get: () => { throw new Error("Storage blocked"); } });
+    const first = await claimImageOperationSession();
+    const second = await claimImageOperationSession();
+    expect(first.id).toBeTruthy();
+    expect(second.id).not.toBe(first.id);
+    expect(held.has(`sefkirastudio-image-tab:${first.id}`)).toBe(true);
+    expect(held.has(`sefkirastudio-image-tab:${second.id}`)).toBe(true);
+    first.release(); second.release();
+  });
 });

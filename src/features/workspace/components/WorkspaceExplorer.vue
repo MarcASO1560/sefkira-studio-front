@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 import {
   API_V1_URL,
@@ -19,6 +19,7 @@ import {
 } from "../../../lib/realtime";
 import { WORKSPACE_TRANSITION_STORAGE_KEY } from "../../../lib/routeTransition";
 import { getAccessUserDisplayName, getUserDisplayName, getUserInitials } from "../../../lib/userDisplayName";
+import { copyShareLinkText } from "../lib/shareLinkClipboard";
 import {
   canBlockProjectMember,
   isShareLinkExpired,
@@ -94,6 +95,9 @@ const projectPendingLeave = ref<ExplorerProject | null>(null);
 const projectPendingDelete = ref<ExplorerProject | null>(null);
 const isDeletingProject = ref(false);
 const projectPendingShare = ref<ExplorerProject | null>(null);
+const shareDialogRef = ref<HTMLElement | null>(null);
+let shareOpener: HTMLElement | null = null;
+let shareOpenerFallback: HTMLElement | null = null;
 const projectShareLink = ref<ProjectShareLinkPublic | null>(null);
 const shareLinkLoaded = ref(false);
 const shareRole = ref<ShareLinkRole>("editor");
@@ -808,9 +812,54 @@ const closeShareDialog = () => {
   resetShareDialog();
 };
 
+const shareFocusableElements = () => Array.from(shareDialogRef.value?.querySelectorAll<HTMLElement>(
+  'button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+) || []).filter((element) => element.tabIndex >= 0 && !element.closest("[inert]") && element.getClientRects().length > 0);
+
+const handleShareDialogKeydown = (event: KeyboardEvent) => {
+  if (event.defaultPrevented || event.isComposing || !projectPendingShare.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeShareDialog();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const elements = shareFocusableElements();
+  const first = elements[0];
+  const last = elements[elements.length - 1];
+  if (!first || !last) {
+    event.preventDefault();
+    shareDialogRef.value?.focus({ preventScroll: true });
+  } else if (event.shiftKey && (document.activeElement === first || !elements.includes(document.activeElement as HTMLElement))) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && (document.activeElement === last || !elements.includes(document.activeElement as HTMLElement))) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+  }
+};
+
+watch(shareMessage, async (message) => {
+  if (!message || !projectPendingShare.value) return;
+  const version = shareDialogVersion;
+  await nextTick();
+  if (version !== shareDialogVersion || !projectPendingShare.value || shareMessage.value !== message) return;
+  shareDialogRef.value?.querySelector<HTMLElement>(".share-dialog__message")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+});
+
 const resetShareDialog = () => {
+  const focusTargets = [shareOpener, shareOpenerFallback];
+  shareOpener = null;
+  shareOpenerFallback = null;
   projectPendingShare.value = null;
   shareDialogVersion += 1;
+  const version = shareDialogVersion;
+  void nextTick(() => {
+    if (version !== shareDialogVersion || projectPendingShare.value) return;
+    const target = focusTargets.find((element) => element?.isConnected && !element.closest("[inert]") && element.getClientRects().length > 0);
+    target?.focus({ preventScroll: true });
+  });
   projectShareLink.value = null;
   shareRole.value = "editor";
   shareMessage.value = "";
@@ -847,6 +896,12 @@ const applyShareLink = (link: ProjectShareLinkPublic | null) => {
 
 const openShareDialog = async (project: ExplorerProject) => {
   if (isSharingProject.value || project.accessRole !== "owner" || project.id.startsWith("local-")) return;
+  if (!projectPendingShare.value) {
+    shareOpener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+    const card = shareOpener?.closest<HTMLElement>(".project-card") ||
+      document.querySelectorAll<HTMLElement>(".project-card")[visibleProjects.value.findIndex((item) => item.id === project.id)];
+    shareOpenerFallback = card?.querySelector<HTMLElement>('.card-menu button[aria-label="Project actions"]') || card || null;
+  }
   const version = ++shareDialogVersion;
   shareSnapshotVersion += 1;
   isSyncingShareLink = false;
@@ -858,6 +913,9 @@ const openShareDialog = async (project: ExplorerProject) => {
   shareDisablePending.value = false;
   shareMessage.value = "";
   isSharingProject.value = true;
+  void nextTick(() => {
+    if (isCurrent()) (shareFocusableElements()[0] || shareDialogRef.value)?.focus({ preventScroll: true });
+  });
 
   try {
     const existingShareLink = await requestJson<ProjectShareLinkPublic | null>(
@@ -999,12 +1057,14 @@ const copyShareLink = async () => {
     return;
   }
   const version = shareDialogVersion;
-  try {
-    await navigator.clipboard.writeText(shareUrl);
-    if (version === shareDialogVersion) shareMessage.value = "Link copied.";
-  } catch (error) {
-    if (version === shareDialogVersion) shareMessage.value = error instanceof Error ? error.message : "Link could not be copied.";
-  }
+  const isCurrent = () => version === shareDialogVersion && shareProjectUrl.value === shareUrl;
+  const result = await copyShareLinkText(
+    shareUrl, document.getElementById("project-share-url") as HTMLInputElement | null, isCurrent,
+  );
+  if (!isCurrent()) return;
+  shareMessage.value = result === "copied" ? "Link copied." : result === "selected" ?
+    "The link is selected. Press and hold to copy on mobile, or press Ctrl+C / ⌘C." :
+    "Copy is not available in this browser. Select the link and copy it manually.";
 };
 
 const buildLocalProjectAccess = (): ProjectAccessUserPublic => ({
@@ -1471,7 +1531,11 @@ const openProject = (project: ExplorerProject) => {
     return;
   }
 
-  window.sessionStorage.removeItem(WORKSPACE_TRANSITION_STORAGE_KEY);
+  try {
+    window.sessionStorage.removeItem(WORKSPACE_TRANSITION_STORAGE_KEY);
+  } catch {
+    // Optional transition storage must not block opening a project.
+  }
   document.documentElement.classList.remove("route-transition-pending");
   window.location.assign(`/studio/${encodeURIComponent(project.id)}`);
 };
@@ -1604,6 +1668,7 @@ onMounted(() => {
   }, 1000);
   window.addEventListener("focus", syncSharedState);
   document.addEventListener("visibilitychange", syncSharedState);
+  document.addEventListener("keydown", handleShareDialogKeydown, true);
 });
 
 onUnmounted(() => {
@@ -1621,6 +1686,7 @@ onUnmounted(() => {
   }
   window.removeEventListener("focus", syncSharedState);
   document.removeEventListener("visibilitychange", syncSharedState);
+  document.removeEventListener("keydown", handleShareDialogKeydown, true);
 });
 </script>
 
@@ -2132,23 +2198,17 @@ onUnmounted(() => {
     >
       <section
         class="share-dialog"
+        ref="shareDialogRef"
+        tabindex="-1"
         role="dialog"
         aria-modal="true"
         aria-labelledby="share-project-title"
         @click.stop
       >
         <header>
-          <div class="share-dialog__heading">
-            <svg class="share-dialog__mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-              <path d="M11 16h6V7h6M17 16v9h6" />
-              <rect x="5" y="13" width="6" height="6" />
-              <rect x="23" y="4" width="6" height="6" />
-              <rect x="23" y="22" width="6" height="6" />
-            </svg>
-            <div>
-              <h2 id="share-project-title">Share project</h2>
-              <p>Invite people into your creative space.</p>
-            </div>
+          <div>
+            <p>Project info</p>
+            <h2 id="share-project-title">Share project</h2>
           </div>
           <button
             type="button"
@@ -2161,7 +2221,7 @@ onUnmounted(() => {
           </button>
         </header>
 
-        <div class="share-dialog__body">
+        <div class="share-dialog__body" :aria-busy="isSharingProject">
           <div class="share-dialog__summary">
             <div class="share-dialog__project" aria-hidden="true">
               <ProjectPixelArtThumbnail
@@ -2176,103 +2236,63 @@ onUnmounted(() => {
             </div>
             <div class="share-dialog__project-copy">
               <strong>{{ projectPendingShare.name }}</strong>
-              <span role="status">{{ shareExpirationLabel }}</span>
+              <span role="status">{{ isSharingProject && shareLinkLoaded ? "Updating link…" : shareExpirationLabel }}</span>
             </div>
           </div>
           <p v-if="shareExpired" class="share-dialog__notice">This link has expired. Renew it to create a new link; the previous link will no longer work.</p>
-          <fieldset class="share-role-fieldset share-dialog__section">
-            <legend>
-              <span class="share-dialog__section-title">
-                <svg class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <circle cx="9" cy="8" r="3" /><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M21 20v-2a6 6 0 0 0-3-5" />
-                </svg>
-                Permission
-              </span>
-            </legend>
-            <div
-              class="share-role-options"
-              role="group"
-              aria-label="Share link permission"
-            >
-              <button
-                v-for="option in shareRoleOptions"
-                :key="`share-role-${option.value}`"
-                type="button"
-                :class="{
-                  'is-active': shareRole === option.value,
-                }"
-                :aria-label="`${option.label}. ${option.description}`"
-                :aria-pressed="shareRole === option.value"
+          <section class="share-dialog__settings" aria-label="Share link settings">
+            <div class="share-dialog__setting-row">
+              <label for="project-share-permission">Permission</label>
+              <select
+                id="project-share-permission"
+                class="share-setting-select"
+                :value="shareRole"
+                aria-label="Share link permission"
+                aria-describedby="share-permission-hint"
                 :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending"
-                @click="updateShareRole(option.value)"
+                @change="updateShareRole(($event.target as HTMLSelectElement).value as ShareLinkRole)"
               >
-                <svg v-if="option.value === 'viewer'" class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" />
-                </svg>
-                <svg v-else class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <path d="m16 3 5 5-12 12-6 1 1-6ZM13 6l5 5" />
-                </svg>
-                <span>{{ option.label }}</span>
-              </button>
+                <option v-for="option in shareRoleOptions" :key="option.value" :value="option.value" :selected="shareRole === option.value">{{ option.label }}</option>
+              </select>
             </div>
-          </fieldset>
-
-          <fieldset class="share-role-fieldset share-expiration-fieldset share-dialog__section">
-            <legend>
-              <span class="share-dialog__section-title">
-                <svg class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" />
-                </svg>
-                Expiration
-              </span>
-            </legend>
-            <div class="share-expiration-row">
-              <div class="share-expiration-select" :class="{ 'is-disabled': isSharingProject || !shareLinkLoaded || shareDisablePending }">
-                <select v-model="shareExpirationPreset" aria-label="Share link expiration" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" @change="shareExpirationDirty = true">
-                  <option v-for="option in SHARE_EXPIRATION_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
-                </select>
-                <svg class="share-expiration-select__chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <path d="m6 9 6 6 6-6" />
-                </svg>
-              </div>
-              <button v-if="projectShareLink && !shareExpired" type="button" class="secondary-action" :disabled="isSharingProject || !shareExpirationDirty || shareDisablePending" @click="updateShareExpiration(false)">Save expiration</button>
+            <p id="share-permission-hint" class="share-dialog__hint">{{ shareRoleOptions.find((option) => option.value === shareRole)?.description }}</p>
+            <div class="share-dialog__setting-row">
+              <label for="project-share-expiration">Expiration</label>
+              <select id="project-share-expiration" class="share-setting-select" v-model="shareExpirationPreset" aria-label="Share link expiration" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" @change="shareExpirationDirty = true">
+                <option v-for="option in SHARE_EXPIRATION_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
+              </select>
             </div>
-            <label v-if="shareExpirationPreset === 'custom'">
+            <label v-if="shareExpirationPreset === 'custom'" class="share-dialog__date">
               <span class="share-dialog__label">Date and time</span>
               <input v-model="shareCustomExpiration" type="datetime-local" :disabled="isSharingProject || !shareLinkLoaded || shareDisablePending" aria-label="Share link expiration date and time" @input="shareExpirationDirty = true" />
             </label>
-            <p class="share-dialog__hint">Dates use your device’s local timezone. Existing members keep their access when the link expires.</p>
-          </fieldset>
+            <p v-if="shareExpirationPreset === 'custom'" class="share-dialog__hint">Dates use your device’s local timezone.</p>
+            <div v-if="projectShareLink && !shareExpired && shareExpirationDirty" class="share-dialog__actions">
+              <button type="button" class="secondary-action" :disabled="isSharingProject || shareDisablePending" @click="updateShareExpiration(false)">Save expiration</button>
+            </div>
+          </section>
 
           <section class="share-dialog__section share-dialog__link-section" aria-labelledby="share-link-title">
             <h3 id="share-link-title">
               <label for="project-share-url" class="share-dialog__section-title">
-                <svg class="share-dialog__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <path d="m10 13 4-4M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" transform="translate(0 1)" />
-                </svg>
                 Link
               </label>
             </h3>
             <div class="share-dialog__link-row">
-              <div
-                v-if="isSharingProject"
-                class="share-dialog__loading"
-                role="status"
-                aria-label="Updating project share link"
-              >Updating link…</div>
               <input
-                v-else
                 id="project-share-url"
                 :value="shareProjectUrl"
                 type="text"
                 readonly
+                spellcheck="false"
+                inputmode="none"
                 aria-label="Project share link"
-                placeholder="No active share link"
+                :placeholder="!shareLinkLoaded ? 'Share link not available' : 'No active share link'"
               />
               <button
                 type="button"
                 class="secondary-action share-copy-button"
-                :disabled="isSharingProject || !projectShareLink || shareExpired || shareDisablePending"
+                :disabled="isSharingProject || !shareLinkLoaded || !projectShareLink || shareExpired || shareDisablePending"
                 @click="copyShareLink"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -2283,9 +2303,9 @@ onUnmounted(() => {
               </button>
             </div>
             <div v-if="!shareDisablePending" class="share-dialog__actions">
-              <button v-if="!shareLinkLoaded" type="button" class="secondary-action" :disabled="isSharingProject" @click="openShareDialog(projectPendingShare)">Retry loading</button>
-              <button v-else-if="!projectShareLink" type="button" class="primary-action" :disabled="isSharingProject" @click="updateShareExpiration(false)">Create link</button>
-              <template v-else>
+              <button v-if="!shareLinkLoaded && !isSharingProject" type="button" class="secondary-action" @click="openShareDialog(projectPendingShare)">Retry loading</button>
+              <button v-else-if="shareLinkLoaded && !projectShareLink" type="button" class="primary-action" :disabled="isSharingProject" @click="updateShareExpiration(false)">Create link</button>
+              <template v-else-if="projectShareLink">
                 <button type="button" class="secondary-action" :disabled="isSharingProject" @click="updateShareExpiration(true)">Renew link</button>
                 <button type="button" class="secondary-action" :disabled="isSharingProject" @click="shareDisablePending = true">Disable link</button>
               </template>
@@ -2298,7 +2318,8 @@ onUnmounted(() => {
                 <button type="button" class="secondary-action" :disabled="isSharingProject" @click="disableShareLink">Disable link</button>
               </div>
             </div>
-            <p v-if="projectShareLink && !shareDisablePending" class="share-dialog__hint">Renewing replaces the current link. Unless you choose another expiration, dated links renew for 7 days.</p>
+            <p class="share-dialog__hint">Existing members keep their access when a link expires or is disabled.</p>
+            <p v-if="projectShareLink && !shareDisablePending" class="share-dialog__hint">Renewing replaces the link. Dated links renew for 7 days unless you choose another expiration.</p>
           </section>
           <p v-if="shareMessage" class="share-dialog__message" role="status">{{ shareMessage }}</p>
         </div>
@@ -3080,17 +3101,6 @@ onUnmounted(() => {
     box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5);
   }
 
-  .share-dialog {
-    --text: #fff;
-    --line: rgba(255, 255, 255, 0.14);
-    --line-strong: rgba(255, 255, 255, 0.26);
-    width: min(560px, 100%);
-    color: #fff;
-    background: #111;
-    border-color: var(--line-strong);
-    box-shadow: none;
-  }
-
   .access-dialog,
   .share-dialog {
     display: flex;
@@ -3100,7 +3110,8 @@ onUnmounted(() => {
 
   .access-dialog > header,
   .access-dialog > footer,
-  .share-dialog > header {
+  .share-dialog > header,
+  .share-dialog > footer {
     flex-shrink: 0;
   }
 
@@ -3110,94 +3121,29 @@ onUnmounted(() => {
     flex-shrink: 0;
   }
 
-  .share-dialog__heading {
-    display: flex;
-    gap: 14px;
-    align-items: center;
-    min-width: 0;
-  }
-
-  .share-dialog__heading > div {
-    min-width: 0;
-  }
-
-  .share-dialog .share-dialog__heading p {
-    margin: 5px 0 0;
-    color: #fff;
-    font-size: 0.8125rem;
-    font-weight: 400;
-    line-height: 1.4;
-    letter-spacing: 0;
-    text-transform: none;
-  }
-
-  .share-dialog__mark {
-    width: 36px;
-    height: 36px;
-    flex-shrink: 0;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.5;
-    stroke-linecap: square;
-    stroke-linejoin: miter;
-  }
-
-  .share-dialog__icon {
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.8;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-  }
-
-  .share-dialog .project-modal__close:hover:not(:disabled) {
-    background: #242424;
-    border-color: var(--line);
-  }
-
-  .share-dialog .project-modal__close span::before,
-  .share-dialog .project-modal__close span::after {
-    background: #fff;
-  }
-
   .share-dialog .primary-action,
   .share-dialog .secondary-action {
     min-width: 0;
     min-height: 44px;
-    padding: 10px 14px;
-    color: #fff;
-    font-size: 0.875rem;
-    font-weight: 600;
+    font-weight: 550;
+    box-shadow: none;
+    transform: none;
+    touch-action: manipulation;
+    transition: background-color 130ms ease, opacity 100ms ease;
+  }
+
+  .share-dialog .secondary-action {
+    padding: 0 8px;
+    color: var(--muted);
+    font-size: 0.8125rem;
     line-height: 1.3;
-    background: #191919;
-    border: 1px solid var(--line-strong);
-    box-shadow: none;
-    transition: background 150ms ease, border-color 150ms ease;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
   }
 
-  .share-dialog .primary-action {
-    background: #292929;
-    border-color: rgba(255, 255, 255, 0.5);
-  }
-
-  .share-dialog .primary-action:hover:not(:disabled),
-  .share-dialog .secondary-action:hover:not(:disabled) {
-    background: #303030;
-    border-color: rgba(255, 255, 255, 0.65);
-    box-shadow: none;
-    transform: none;
-  }
-
-  .share-dialog .primary-action:disabled,
-  .share-dialog .secondary-action:disabled {
-    cursor: not-allowed;
-    opacity: 0.45;
-    filter: none;
-    box-shadow: none;
-    transform: none;
+  .share-dialog button:active:not(:disabled) {
+    opacity: 0.7;
   }
 
   .share-dialog button:focus-visible {
@@ -3213,7 +3159,8 @@ onUnmounted(() => {
     overscroll-behavior: contain;
   }
 
-  .access-dialog {
+  .access-dialog,
+  .share-dialog {
     width: min(540px, 100%);
     background: rgba(16, 17, 17, 0.98);
     border-color: rgba(255, 252, 244, 0.18);
@@ -3238,12 +3185,8 @@ onUnmounted(() => {
     border-bottom: 1px solid var(--line);
   }
 
+  .access-dialog > header,
   .share-dialog > header {
-    align-items: center;
-    padding: 16px 24px;
-  }
-
-  .access-dialog > header {
     align-items: center;
     padding: 12px 18px;
   }
@@ -3526,7 +3469,9 @@ onUnmounted(() => {
   @media (hover: hover) and (pointer: fine) {
     .access-role-select:hover:not(:disabled),
     .access-list .access-remove-button:hover:not(:disabled),
-    .access-list .access-unblock-button:hover:not(:disabled) {
+    .access-list .access-unblock-button:hover:not(:disabled),
+    .share-setting-select:hover:not(:disabled),
+    .share-dialog .secondary-action:hover:not(:disabled) {
       color: #fff;
       background: rgba(255, 252, 244, 0.06);
       box-shadow: none;
@@ -3580,35 +3525,32 @@ onUnmounted(() => {
 
   .share-dialog__body {
     display: grid;
-    gap: 20px;
-    padding: 20px 24px;
-    scrollbar-gutter: stable;
+    grid-template-columns: minmax(0, 1fr);
+    flex: 1 1 auto;
+    align-content: start;
+    gap: 16px;
+    padding: 14px 18px;
   }
 
   .share-dialog__summary {
     display: grid;
-    grid-template-columns: 48px minmax(0, 1fr);
-    gap: 14px;
+    grid-template-columns: 32px minmax(0, 1fr);
+    gap: 10px;
     align-items: center;
-    padding-bottom: 18px;
-    border-bottom: 1px solid var(--line);
   }
 
   .share-dialog__project {
     display: grid;
     place-items: center;
-    width: 48px;
-    height: 48px;
-    padding: 5px;
+    width: 32px;
+    height: 32px;
     overflow: hidden;
-    background: #191919;
-    border: 1px solid var(--line-strong);
-    border-radius: 6px;
+    border-radius: 4px;
   }
 
   .share-dialog__project-fallback {
-    width: 32px;
-    height: 32px;
+    width: 28px;
+    height: 28px;
     fill: none;
     stroke: currentColor;
     stroke-width: 1.5;
@@ -3617,228 +3559,112 @@ onUnmounted(() => {
 
   .share-dialog__project-copy {
     display: grid;
-    gap: 6px;
+    gap: 4px;
     min-width: 0;
   }
 
   .share-dialog__summary strong {
     overflow-wrap: anywhere;
-    font-size: 1.125rem;
+    font-size: 1rem;
     line-height: 1.35;
   }
 
   .share-dialog__project-copy > span,
   .share-dialog__hint {
     margin: 0;
-    color: #fff;
+    color: var(--muted);
     font-size: 0.8125rem;
     line-height: 1.5;
+    overflow-wrap: anywhere;
   }
 
-  .share-dialog__notice {
+  .share-dialog__notice,
+  .share-dialog__message {
     margin: 0;
-    padding: 12px;
-    color: #fff;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
+    color: rgba(255, 176, 159, 0.9);
     font-size: 0.8125rem;
     line-height: 1.5;
+    overflow-wrap: anywhere;
   }
 
-  .share-dialog__section,
-  .share-role-fieldset.share-dialog__section {
-    min-width: 0;
-    padding-bottom: 18px;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .share-dialog__link-section {
+  .share-dialog__settings {
     display: grid;
-    gap: 12px;
-    padding-bottom: 0;
-    border: 0;
+    gap: 4px;
+    min-width: 0;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
   }
 
-  .share-dialog__link-section h3 {
-    margin: 0;
-    font-size: 0.875rem;
-    font-weight: 700;
-    line-height: 1.3;
-  }
-
-  .share-dialog__section-title,
-  .share-dialog__body label.share-dialog__section-title {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .share-expiration-row {
+  .share-dialog__setting-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
-  }
-
-  .share-expiration-select {
-    position: relative;
-    min-width: 0;
-  }
-
-  .share-expiration-row select {
-    appearance: none;
-    -webkit-appearance: none;
-    min-width: 0;
-    min-height: 44px;
-    width: 100%;
-    box-sizing: border-box;
-    color-scheme: dark;
-    color: #fff;
-    background: #191919;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
-    padding: 0 44px 0 14px;
-    font: inherit;
-  }
-
-  .share-expiration-select__chevron {
-    position: absolute;
-    top: 50%;
-    right: 16px;
-    width: 16px;
-    height: 16px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.8;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    pointer-events: none;
-    transform: translateY(-50%);
-  }
-
-  .share-expiration-select.is-disabled .share-expiration-select__chevron {
-    opacity: 0.45;
-  }
-
-  .share-expiration-row select:focus-visible {
-    outline: 2px solid #fff;
-    outline-offset: 2px;
-  }
-
-  .share-expiration-fieldset input {
-    color-scheme: dark;
-    min-width: 0;
-    width: 100%;
-    box-sizing: border-box;
-  }
-
-  .share-dialog__actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-  }
-
-  .share-dialog__actions > button:only-child {
-    grid-column: 1 / -1;
-  }
-
-  .share-disable-confirmation {
-    display: grid;
-    gap: 12px;
-    padding: 14px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-  }
-
-  .share-disable-confirmation p {
-    margin: 0;
-    font-size: 0.9rem;
-    line-height: 1.5;
-  }
-
-  .share-disable-confirmation h4 {
-    margin: 0;
-    font-size: 0.9375rem;
-    line-height: 1.3;
-  }
-
-  .share-dialog__body label {
-    display: grid;
-    gap: 9px;
-  }
-
-  .share-dialog__label {
-    color: #fff;
-    font-size: 0.8125rem;
-    font-weight: 700;
-  }
-
-  .share-role-fieldset {
-    display: grid;
-    gap: 8px;
-    padding: 0;
-    margin: 0;
-    border: 0;
-  }
-
-  .share-role-fieldset legend {
-    padding: 0;
-    margin-bottom: 10px;
-    color: #fff;
-    font-size: 0.875rem;
-    font-weight: 700;
-  }
-
-  .share-role-options {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 4px;
-    padding: 4px;
-    background: #191919;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
-  }
-
-  .share-role-options button {
-    display: inline-flex;
-    gap: 8px;
     align-items: center;
-    justify-content: center;
+  }
+
+  .share-dialog__setting-row > label,
+  .share-dialog__section-title,
+  .share-dialog__label {
+    color: var(--text);
+    font-size: 0.875rem;
+    font-weight: 550;
+    line-height: 1.4;
+  }
+
+  .share-setting-select {
+    justify-self: end;
     min-width: 0;
+    max-width: 100%;
     min-height: 44px;
-    padding: 8px 12px;
-    color: #fff;
-    text-align: center;
+    padding: 0 6px;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.8125rem;
+    font-weight: 550;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 6px;
     cursor: pointer;
+    color-scheme: dark;
   }
 
-  .share-role-options button:hover:not(:disabled) {
-    background: #242424;
+  .share-setting-select option {
+    color: var(--text);
+    background: #161717;
   }
 
-  .share-role-options button:focus-visible {
-    outline: 2px solid #fff;
-    outline-offset: 2px;
+  .share-setting-select:disabled {
+    cursor: wait;
+    opacity: 0.52;
   }
 
-  .share-role-options button.is-active {
-    background: #303030;
-    border-color: rgba(255, 255, 255, 0.65);
+  .share-setting-select:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: -2px;
   }
 
-  .share-role-options button:disabled {
-    cursor: not-allowed;
-    opacity: 0.45;
-  }
-
-  .share-role-options span {
+  .share-dialog__date {
+    display: grid;
+    gap: 8px;
     min-width: 0;
-    overflow-wrap: anywhere;
-    font-size: 0.875rem;
-    font-weight: 600;
-    line-height: 1.15;
+    margin-top: 8px;
+  }
+
+  .share-dialog__date input {
+    color-scheme: dark;
+  }
+
+  .share-dialog__link-section {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+
+  .share-dialog__link-section h3 {
+    margin: 0;
+    line-height: 1.4;
   }
 
   .share-dialog__link-row {
@@ -3849,28 +3675,33 @@ onUnmounted(() => {
 
   .share-dialog__body input {
     width: 100%;
-    height: 44px;
     min-width: 0;
+    height: 44px;
     box-sizing: border-box;
-    padding: 0 14px;
-    color: #fff;
-    background: #191919;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
-    outline: 0;
+    padding: 0 12px;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.875rem;
+    background: rgba(255, 252, 244, 0.045);
+    border: 1px solid var(--line);
+    border-radius: 6px;
   }
 
   .share-dialog__body input::placeholder {
-    color: #fff;
-    opacity: 0.65;
+    color: var(--muted);
+  }
+
+  .share-dialog__body input:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: -2px;
+    box-shadow: none;
   }
 
   .share-copy-button {
     display: inline-flex;
-    gap: 8px;
+    gap: 6px;
     align-items: center;
     justify-content: center;
-    min-width: 86px;
   }
 
   .share-copy-button svg {
@@ -3883,34 +3714,31 @@ onUnmounted(() => {
     stroke-width: 1.8;
   }
 
-  .share-dialog__loading {
+  .share-dialog__actions {
     display: flex;
-    align-items: center;
-    height: 44px;
-    box-sizing: border-box;
-    padding: 0 14px;
-    color: #fff;
-    font-size: 0.875rem;
-    background: #191919;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
+    flex-wrap: wrap;
+    gap: 4px;
+    justify-content: flex-end;
   }
 
-  .share-dialog__body input:focus {
-    border-color: #fff;
-    outline: 2px solid #fff;
-    outline-offset: 2px;
-    box-shadow: none;
+  .share-disable-confirmation {
+    display: grid;
+    gap: 8px;
+    padding-top: 8px;
   }
 
-  .share-dialog__message {
+  .share-disable-confirmation p {
     margin: 0;
-    padding: 12px;
-    color: #fff;
+    color: var(--muted);
     font-size: 0.8125rem;
     line-height: 1.5;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
+    overflow-wrap: anywhere;
+  }
+
+  .share-disable-confirmation h4 {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.4;
   }
 
   .leave-confirm-dialog__body p,
@@ -3936,7 +3764,8 @@ onUnmounted(() => {
     padding: 20px;
   }
 
-  .access-dialog footer {
+  .access-dialog footer,
+  .share-dialog footer {
     display: flex;
     gap: 10px;
     justify-content: flex-end;
@@ -3945,7 +3774,8 @@ onUnmounted(() => {
     background: #101111;
   }
 
-  .access-dialog footer .primary-action {
+  .access-dialog footer .primary-action,
+  .share-dialog footer .primary-action {
     min-height: 44px;
     padding: 0 16px;
     border-radius: 6px;
@@ -3955,21 +3785,10 @@ onUnmounted(() => {
 
   @media (prefers-reduced-motion: reduce) {
     .access-list .access-remove-button,
-    .access-list .access-unblock-button {
+    .access-list .access-unblock-button,
+    .share-dialog button {
       transition: none;
     }
-  }
-
-  .share-dialog footer {
-    display: flex;
-    flex-shrink: 0;
-    justify-content: flex-end;
-    padding: 16px 24px;
-    border-top: 1px solid var(--line);
-  }
-
-  .share-dialog footer .primary-action {
-    min-width: 100px;
   }
 
   .sr-only {
@@ -4149,14 +3968,11 @@ onUnmounted(() => {
       width: min(420px, 100%);
     }
 
-    .share-dialog__link-row {
-      grid-template-columns: 1fr;
-    }
-
   }
 
   @media (max-width: 560px) {
-    .access-dialog-layer {
+    .access-dialog-layer,
+    .share-dialog-layer {
       display: flex;
       align-items: stretch;
       padding: 0;
@@ -4164,7 +3980,8 @@ onUnmounted(() => {
       backdrop-filter: none;
     }
 
-    .access-dialog {
+    .access-dialog,
+    .share-dialog {
       width: 100%;
       height: 100vh;
       height: 100dvh;
@@ -4176,15 +3993,18 @@ onUnmounted(() => {
       box-shadow: none;
     }
 
-    .access-dialog > header {
+    .access-dialog > header,
+    .share-dialog > header {
       padding: calc(10px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 10px max(16px, env(safe-area-inset-left, 0px));
     }
 
-    .access-dialog header p {
+    .access-dialog header p,
+    .share-dialog header p {
       margin-bottom: 4px;
     }
 
-    .access-dialog__body {
+    .access-dialog__body,
+    .share-dialog__body {
       flex: 1 1 0%;
       gap: 10px;
       padding: 12px max(16px, env(safe-area-inset-right, 0px)) 12px max(16px, env(safe-area-inset-left, 0px));
@@ -4194,64 +4014,10 @@ onUnmounted(() => {
       padding-block: 6px;
     }
 
-    .access-dialog > footer {
+    .access-dialog > footer,
+    .share-dialog > footer {
       padding: 8px max(16px, env(safe-area-inset-right, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
     }
 
-    .share-dialog {
-      width: 100%;
-      max-height: calc(100dvh - 32px);
-    }
-
-    .share-dialog > header {
-      padding: 12px 18px;
-    }
-
-    .share-dialog__body {
-      padding: 18px;
-    }
-
-    .share-dialog__heading {
-      gap: 10px;
-    }
-
-    .share-dialog__mark {
-      width: 28px;
-      height: 28px;
-    }
-
-    .share-role-options button {
-      gap: 6px;
-      padding: 8px;
-    }
-
-    .share-expiration-row,
-    .share-dialog__link-row {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .share-copy-button {
-      width: 100%;
-    }
-
-    .share-dialog footer {
-      padding: 12px 18px;
-    }
-
-    .share-dialog footer .primary-action {
-      width: 100%;
-    }
-  }
-
-  @media (forced-colors: active) {
-    .share-expiration-row select {
-      appearance: auto;
-      -webkit-appearance: auto;
-      padding-right: 14px;
-    }
-
-    .share-expiration-select__chevron {
-      display: none;
-    }
   }
 </style>

@@ -30,8 +30,8 @@ const STORE_NAME = "queues";
 
 /** sessionStorage survives reload, but unlike localStorage isolates different tabs. */
 export const getImageOperationSessionId = () => {
-  if (typeof sessionStorage === "undefined") return createImageOperationId();
   try {
+    if (typeof sessionStorage === "undefined") return createImageOperationId();
     const previous = sessionStorage.getItem(SESSION_KEY);
     if (previous) return previous;
     const id = createImageOperationId();

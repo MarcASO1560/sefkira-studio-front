@@ -51,4 +51,8 @@ describe("share link expiration", () => {
     expect(shouldShareLinkRedirectToLogin(403, "Not enough permissions")).toBe(false);
     expect(shouldShareLinkRedirectToLogin(410, "Could not validate credentials")).toBe(false);
   });
+  it.each([408, 429, 500, 503])("identifies temporary failures without claiming the link was revoked: %s", (status) => {
+    expect(shareLinkFailureMessage(status)).toContain("try again");
+    expect(shareLinkFailureMessage(status)).not.toContain("active link");
+  });
 });

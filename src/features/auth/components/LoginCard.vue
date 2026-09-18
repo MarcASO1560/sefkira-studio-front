@@ -218,7 +218,11 @@ const completeSession = () => {
   persistSession();
   status.value = "success";
   hideToast();
-  window.sessionStorage.setItem(WORKSPACE_TRANSITION_STORAGE_KEY, "pending");
+  try {
+    window.sessionStorage.setItem(WORKSPACE_TRANSITION_STORAGE_KEY, "pending");
+  } catch {
+    // Session cookies still work when private browsers disable client storage.
+  }
   document.documentElement.classList.add("route-transition-pending");
   redirectAfterSignIn();
 };

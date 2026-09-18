@@ -12,10 +12,12 @@ const props = defineProps<{
 const status = ref<"joining" | "redirecting" | "error">("joining");
 const message = ref("Joining shared project...");
 
-const canRetry = computed(() => status.value === "error");
-const controller = new AbortController();
+const retryable = ref(false);
+const canRetry = computed(() => status.value === "error" && retryable.value);
+let controller: AbortController | null = null;
 let mounted = true;
 let redirectTimeout: number | null = null;
+let joinedProjectPath = "/studio";
 
 const studioPath = "/studio";
 
@@ -25,20 +27,32 @@ const redirectToLogin = () => {
   window.location.assign(loginUrl.toString());
 };
 
-const redirectToStudio = () => {
-  window.sessionStorage.setItem(WORKSPACE_TRANSITION_STORAGE_KEY, "pending");
+const navigateToStudio = (path: string) => {
+  try {
+    window.sessionStorage.setItem(WORKSPACE_TRANSITION_STORAGE_KEY, "pending");
+  } catch {
+    // Storage can be unavailable in private or embedded browsers.
+  }
   document.documentElement.classList.add("route-transition-pending");
-  window.location.assign(studioPath);
+  window.location.assign(path);
 };
+const redirectToStudio = () => navigateToStudio(studioPath);
+const redirectToJoinedProject = () => navigateToStudio(joinedProjectPath);
 
 const joinSharedProject = async () => {
-  const timeout = window.setTimeout(() => controller.abort(), 18000);
+  if (controller || !mounted) return;
+  const requestController = new AbortController();
+  controller = requestController;
+  status.value = "joining";
+  retryable.value = false;
+  message.value = "Joining shared project...";
+  const timeout = window.setTimeout(() => requestController.abort(), 18000);
   try {
     const response = await fetch(
       `${API_V1_URL}/projects/share-links/${encodeURIComponent(props.token)}/accept`,
       {
         method: "POST",
-        signal: controller.signal,
+        signal: requestController.signal,
         credentials: "same-origin",
         headers: { Accept: "application/json" },
       },
@@ -62,20 +76,25 @@ const joinSharedProject = async () => {
         return;
       }
       status.value = "error";
+      retryable.value = response.status === 408 || response.status === 429 || response.status >= 500;
       message.value = shareLinkFailureMessage(response.status, detail);
       return;
     }
 
+    if (typeof project.id !== "string" || !project.id) throw new Error("Missing project");
+    joinedProjectPath = `/studio/${encodeURIComponent(project.id)}`;
     status.value = "redirecting";
     message.value = "Project added. Opening studio...";
-    redirectTimeout = window.setTimeout(redirectToStudio, 260);
+    redirectTimeout = window.setTimeout(redirectToJoinedProject, 260);
   } catch {
     if (mounted) {
       status.value = "error";
+      retryable.value = true;
       message.value = "The project could not be opened. Check your connection and try the link again.";
     }
   } finally {
     window.clearTimeout(timeout);
+    if (controller === requestController) controller = null;
   }
 };
 
@@ -84,7 +103,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   mounted = false;
-  controller.abort();
+  controller?.abort();
   if (redirectTimeout !== null) window.clearTimeout(redirectTimeout);
 });
 </script>
@@ -95,7 +114,8 @@ onUnmounted(() => {
       <p>Project sharing</p>
       <h1>{{ status === "error" ? "Could not join project" : "Opening shared project" }}</h1>
       <span>{{ message }}</span>
-      <button v-if="canRetry" type="button" @click="redirectToStudio">Go to studio</button>
+      <button v-if="canRetry" type="button" @click="joinSharedProject">Try again</button>
+      <button v-if="status === 'error'" type="button" :class="{ 'share-gate__secondary': canRetry }" @click="redirectToStudio">Go to studio</button>
     </div>
   </section>
 </template>
@@ -156,5 +176,12 @@ onUnmounted(() => {
   font: inherit;
   font-weight: 800;
   padding: 12px 16px;
+}
+
+.share-gate__card button.share-gate__secondary {
+  margin-top: 10px;
+  border-color: rgba(247, 241, 231, 0.24);
+  background: transparent;
+  color: #f7f1e7;
 }
 </style>
