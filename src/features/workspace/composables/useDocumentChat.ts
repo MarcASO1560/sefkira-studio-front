@@ -1,7 +1,7 @@
 import { computed, getCurrentInstance, onBeforeUnmount, onMounted, ref, toValue, watch, type MaybeRefOrGetter } from "vue";
 import {
-  DocumentChatHttpError, getDocumentChatMessages, postDocumentChatMessage,
-  type DocumentChatAuthor, type DocumentChatMessagePublic,
+  DocumentChatHttpError, getDocumentChatMessages, markDocumentChatRead, postDocumentChatMessage,
+  type DocumentChatAuthor, type DocumentChatMessagePublic, type DocumentChatPage, type DocumentChatUnreadSummary,
 } from "../../../lib/api";
 import { getDocumentChatSticker } from "../lib/documentChatStickers";
 
@@ -49,6 +49,7 @@ export const useDocumentChat = (options: Options) => {
   const hasOlder = ref(false);
   const isOpen = ref(false);
   const unreadCount = ref(0);
+  const lastReadMessageId = ref(0);
   const accessDenied = ref(false);
   const sending = computed(() => messages.value.some((message) => message.status === "pending"));
   let started = false;
@@ -63,12 +64,16 @@ export const useDocumentChat = (options: Options) => {
   let syncing: Promise<void> | null = null;
   let syncAgain = false;
   let olderLoading = false;
+  let historyVisibleFrom: string | null = null;
+  let serverLastMessageId = 0;
+  let requestedReadId = 0;
+  let reading: Promise<void> | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const controllers = new Set<AbortController>();
   const inFlight = new Map<string, Promise<boolean>>();
 
   const storageKey = (current: Context) => `${storagePrefix}:${current.user.id}:${current.projectId}:${current.resourceId}`;
-  const isCurrent = (epoch: number) => !disposed && started && epoch === generation && !!context;
+  const isCurrent = (epoch: number) => !disposed && started && !accessDenied.value && epoch === generation && !!context;
   const makeController = () => { const controller = new AbortController(); controllers.add(controller); return controller; };
   const clearTimer = () => { if (timer !== null) clearTimeout(timer); timer = null; };
   const persistPending = () => {
@@ -117,14 +122,16 @@ export const useDocumentChat = (options: Options) => {
       return [...unique.values()].sort(compareMessages);
     } catch { return []; }
   };
-  const merge = (incoming: DocumentChatMessagePublic[], countUnread: boolean) => {
+  const merge = (incoming: DocumentChatMessagePublic[]) => {
     if (!context) return;
     const existing = new Map(messages.value.map((message) => [messageKey(message), message]));
     for (const message of incoming) {
       if (message.project_id !== context.projectId || message.resource_id !== context.resourceId
-        || !hasValidContent(message.body, message.sticker_id)) continue;
+        || !Number.isSafeInteger(message.id) || message.id < 1
+        || !hasValidContent(message.body, message.sticker_id)
+        || !Number.isFinite(Date.parse(message.created_at))
+        || historyVisibleFrom && Date.parse(message.created_at) < Date.parse(historyVisibleFrom)) continue;
       const key = messageKey(message);
-      if (!existing.has(key) && countUnread && !isOpen.value && message.author.id !== context.user.id) unreadCount.value++;
       existing.set(key, { ...message, status: "sent" });
       if (message.author.id === context.user.id && typeof window !== "undefined") {
         try { window.localStorage.removeItem(`${storageKey(context)}:${message.client_message_id}`); }
@@ -139,11 +146,98 @@ export const useDocumentChat = (options: Options) => {
     error.value = "You no longer have access to this document's chat.";
     clearTimer();
     for (const controller of controllers) controller.abort();
+    messages.value = [];
+    loading.value = false;
+    unreadCount.value = 0;
+    isOpen.value = false;
+  };
+  const applyUnread = (summary: Pick<DocumentChatUnreadSummary, "unread_count" | "last_read_message_id" | "last_message_id">) => {
+    if (!Number.isSafeInteger(summary.last_read_message_id) || summary.last_read_message_id < lastReadMessageId.value
+      || !Number.isSafeInteger(summary.unread_count) || summary.unread_count < 0) return;
+    lastReadMessageId.value = summary.last_read_message_id;
+    const newest = summary.last_message_id ?? 0;
+    if (!Number.isSafeInteger(newest) || newest < serverLastMessageId) return;
+    serverLastMessageId = newest;
+    unreadCount.value = summary.unread_count;
+  };
+  const applyPage = (page: DocumentChatPage) => {
+    // A new membership must never inherit the previous membership's history,
+    // pending sends or read cursor, even while this component stays mounted.
+    if (!Number.isFinite(Date.parse(page.history_visible_from))) throw new Error("Invalid chat history boundary.");
+    if (historyVisibleFrom && Date.parse(page.history_visible_from) < Date.parse(historyVisibleFrom)) {
+      throw new Error("Stale chat membership response.");
+    }
+    const membershipChanged = historyVisibleFrom !== null && historyVisibleFrom !== page.history_visible_from;
+    if (historyVisibleFrom !== page.history_visible_from) {
+      const nextBoundary = Date.parse(page.history_visible_from);
+      const stalePending = messages.value.filter((message) => message.status !== "sent"
+        && Date.parse(message.created_at) < nextBoundary);
+      if (context && typeof window !== "undefined") for (const pending of stalePending) {
+        try { window.localStorage.removeItem(`${storageKey(context)}:${pending.client_message_id}`); } catch { /* Best effort cleanup. */ }
+      }
+      if (historyVisibleFrom !== null) {
+        for (const controller of controllers) controller.abort();
+        inFlight.clear();
+        reading = null;
+        if (context && typeof window !== "undefined") for (const pending of messages.value.filter((message) => message.status !== "sent")) {
+          try { window.localStorage.removeItem(`${storageKey(context)}:${pending.client_message_id}`); } catch { /* Best effort cleanup. */ }
+        }
+        messages.value = [];
+        lastReadMessageId.value = 0;
+        requestedReadId = 0;
+        serverLastMessageId = 0;
+        beforeCursor = null;
+        hasOlder.value = false;
+        initialized = false;
+        forwardCursor = null;
+      } else messages.value = messages.value.filter((message) => Date.parse(message.created_at) >= nextBoundary);
+      historyVisibleFrom = page.history_visible_from;
+    }
+    applyUnread(page);
+    merge(page.messages);
+    return membershipChanged;
+  };
+  const canRead = () => isOpen.value && (typeof document === "undefined"
+    || document.visibilityState === "visible" && (typeof document.hasFocus !== "function" || document.hasFocus()));
+  const flushRead = async (): Promise<void> => {
+    if (reading) return reading;
+    if (!context || !started || disposed || accessDenied.value || !canRead()
+      || requestedReadId <= lastReadMessageId.value) return;
+    const current = context;
+    const epoch = generation;
+    const boundary = historyVisibleFrom;
+    const target = requestedReadId;
+    const controller = makeController();
+    let task!: Promise<void>;
+    task = (async () => {
+      try {
+        const result = await markDocumentChatRead(current.projectId, current.resourceId, target, { signal: controller.signal });
+        if (!isCurrent(epoch) || boundary !== historyVisibleFrom || result.resource_id !== current.resourceId) return;
+        applyUnread(result);
+      } catch (cause) {
+        if (isCurrent(epoch) && boundary === historyVisibleFrom && isDenied(cause)) denyAccess();
+        // Keep the unread badge and the requested cursor until a later poll or
+        // return to the tab confirms the read receipt. Network failure isn't read.
+      } finally {
+        controllers.delete(controller);
+        if (isCurrent(epoch) && reading === task) reading = null;
+      }
+    })();
+    reading = task;
+    await task;
+    if (isCurrent(epoch) && requestedReadId > target && lastReadMessageId.value >= target) await flushRead();
+  };
+  const markRead = (lastVisibleId: number): Promise<void> => {
+    if (!canRead() || !Number.isSafeInteger(lastVisibleId) || lastVisibleId < 1
+      || !messages.value.some((message) => message.id === lastVisibleId && message.status === "sent")) return Promise.resolve();
+    requestedReadId = Math.max(requestedReadId, lastVisibleId);
+    return flushRead();
   };
   const retryMessage = (clientMessageId: string): Promise<boolean> => {
     if (!context || !started || disposed || accessDenied.value) return Promise.resolve(false);
     const current = context;
     const epoch = generation;
+    const boundary = historyVisibleFrom;
     const row = messages.value.find((message) => message.client_message_id === clientMessageId && message.author.id === current.user.id);
     if (!row || row.status === "sent") return Promise.resolve(!!row);
     if (row.sticker_id != null && !getDocumentChatSticker(row.sticker_id)) return Promise.resolve(false);
@@ -160,16 +254,18 @@ export const useDocumentChat = (options: Options) => {
           { client_message_id: row.client_message_id, body: row.body,
             ...(row.sticker_id ? { sticker_id: row.sticker_id } : {}) }, { signal: controller.signal });
         if (!isCurrent(epoch)) return false;
+        if (boundary !== null && boundary !== historyVisibleFrom) return false;
         if (row.sticker_id && (accepted.project_id !== current.projectId
           || accepted.resource_id !== current.resourceId || accepted.author?.id !== current.user.id
           || accepted.client_message_id !== row.client_message_id
           || accepted.sticker_id !== row.sticker_id || accepted.body !== "")) {
           throw new Error("The server did not confirm the sticker message.");
         }
-        merge([accepted], false);
+        merge([accepted]);
         return true;
       } catch (cause) {
         if (!isCurrent(epoch)) return false;
+        if (boundary !== null && boundary !== historyVisibleFrom) return false;
         const pending = messages.value.find((message) => messageKey(message) === key);
         // A realtime echo can acknowledge the send even if its HTTP response was lost.
         if (pending?.status === "sent") return true;
@@ -199,6 +295,7 @@ export const useDocumentChat = (options: Options) => {
     if (syncing) { syncAgain = true; return syncing; }
     const current = context;
     const epoch = generation;
+    const requestBoundary = historyVisibleFrom;
     const controller = makeController();
     const initial = !initialized;
     if (initial) loading.value = true;
@@ -207,7 +304,7 @@ export const useDocumentChat = (options: Options) => {
         if (!initialized) {
           const page = await getDocumentChatMessages(current.projectId, current.resourceId, { limit: 50, signal: controller.signal });
           if (!isCurrent(epoch)) return;
-          merge(page.messages, false);
+          applyPage(page);
           hasOlder.value = page.has_more;
           beforeCursor = page.next_before_id;
           forwardCursor = page.messages.at(-1)?.id ?? 0;
@@ -219,7 +316,7 @@ export const useDocumentChat = (options: Options) => {
             const page = await getDocumentChatMessages(current.projectId, current.resourceId,
               { limit: 100, afterId: previous, signal: controller.signal });
             if (!isCurrent(epoch)) return;
-            merge(page.messages, true);
+            if (applyPage(page)) { syncAgain = true; break; }
             const last = page.messages.at(-1)?.id;
             if (last !== undefined && last > previous) forwardCursor = last;
             more = page.has_more && last !== undefined && last > previous;
@@ -228,8 +325,10 @@ export const useDocumentChat = (options: Options) => {
         if (!isCurrent(epoch)) return;
         error.value = null;
         await retryPending(epoch);
+        await flushRead();
       } catch (cause) {
         if (!isCurrent(epoch)) return;
+        if (requestBoundary !== null && requestBoundary !== historyVisibleFrom) return;
         if (isDenied(cause)) denyAccess();
         else if (!controller.signal.aborted) error.value = "Couldn't load the chat. Check your connection and retry.";
       } finally {
@@ -248,6 +347,7 @@ export const useDocumentChat = (options: Options) => {
     if (!context || !started || disposed || accessDenied.value || olderLoading || !hasOlder.value || beforeCursor === null) return;
     const current = context;
     const epoch = generation;
+    const requestBoundary = historyVisibleFrom;
     const controller = makeController();
     olderLoading = true;
     loading.value = true;
@@ -255,12 +355,13 @@ export const useDocumentChat = (options: Options) => {
       const page = await getDocumentChatMessages(current.projectId, current.resourceId,
         { limit: 50, beforeId: beforeCursor, signal: controller.signal });
       if (!isCurrent(epoch)) return;
-      merge(page.messages, false);
+      if (applyPage(page)) { void catchUp(); return; }
       hasOlder.value = page.has_more;
       beforeCursor = page.next_before_id;
       error.value = null;
     } catch (cause) {
       if (!isCurrent(epoch)) return;
+      if (requestBoundary !== null && requestBoundary !== historyVisibleFrom) return;
       if (isDenied(cause)) denyAccess();
       else if (!controller.signal.aborted) error.value = "Couldn't load older messages. Please retry.";
     } finally {
@@ -276,7 +377,16 @@ export const useDocumentChat = (options: Options) => {
     if (!Number.isSafeInteger(message.id) || message.id < 1 || typeof message.client_message_id !== "string" ||
       !hasValidContent(message.body, message.sticker_id) || typeof message.created_at !== "string" ||
       !Number.isFinite(Date.parse(message.created_at)) || !message.author || typeof message.author.id !== "string") return;
-    merge([message], initialized);
+    // The shared realtime channel is a hint, never an authority for history.
+    // Confirm messages over HTTP so a new member cannot receive old events.
+    void catchUp();
+  };
+  const receiveReadRealtime = (payload: unknown) => {
+    if (!context || !started || disposed || accessDenied.value || !payload || typeof payload !== "object") return;
+    const event = payload as Partial<DocumentChatUnreadSummary> & { project_id?: unknown; history_visible_from?: unknown };
+    if (event.project_id !== context.projectId || event.resource_id !== context.resourceId) return;
+    // Confirm user-scoped receipts over HTTP too, so delayed events from a
+    // previous membership cannot move this membership's read cursor.
     void catchUp();
   };
   const schedulePoll = () => {
@@ -297,6 +407,11 @@ export const useDocumentChat = (options: Options) => {
     syncing = null;
     syncAgain = false;
     olderLoading = false;
+    historyVisibleFrom = null;
+    serverLastMessageId = 0;
+    lastReadMessageId.value = 0;
+    requestedReadId = 0;
+    reading = null;
     initialized = false;
     forwardCursor = null;
     beforeCursor = null;
@@ -320,7 +435,7 @@ export const useDocumentChat = (options: Options) => {
   const setOpen = (open: boolean) => {
     if (disposed) return;
     isOpen.value = open;
-    if (open) { unreadCount.value = 0; void catchUp(); }
+    if (open) void catchUp();
     schedulePoll();
   };
   const sendContent = (body: string, stickerId?: string): Promise<boolean> => {
@@ -389,6 +504,6 @@ export const useDocumentChat = (options: Options) => {
     if (typeof document !== "undefined") document.removeEventListener("visibilitychange", refreshOnReturn);
   };
   if (getCurrentInstance()) { onMounted(start); onBeforeUnmount(dispose); }
-  return { messages, loading, error, hasOlder, isOpen, unreadCount, sending, accessDenied,
-    setOpen, sendMessage, sendSticker, retryMessage, loadOlder, receiveRealtime, catchUp, start, dispose };
+  return { messages, loading, error, hasOlder, isOpen, unreadCount, lastReadMessageId, sending, accessDenied,
+    setOpen, markRead, sendMessage, sendSticker, retryMessage, loadOlder, receiveRealtime, receiveReadRealtime, catchUp, start, dispose };
 };

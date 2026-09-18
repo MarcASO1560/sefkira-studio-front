@@ -30,6 +30,7 @@ const emit = defineEmits<{
   retry: [clientMessageId: string];
   loadOlder: [];
   reload: [];
+  read: [lastVisibleId: number];
 }>();
 const dialog = ref<HTMLElement | null>(null);
 const panel = ref<HTMLElement | null>(null);
@@ -54,6 +55,8 @@ let restoreFocusOnClose = true;
 let dialogGeneration = 0;
 let composerResizeFrame: number | null = null;
 let messageAnimationTimer: ReturnType<typeof setTimeout> | null = null;
+let readFrame: number | null = null;
+let emittedReadId = 0;
 let nearBottom = true;
 let scrollOwnMessage = false;
 const messageKey = (message: DocumentChatMessage) => `${message.author.id}:${message.client_message_id}`;
@@ -94,11 +97,35 @@ const dayLabel = (timestamp: string) => {
 function scrollToBottom() {
   if (timeline.value) timeline.value.scrollTop = timeline.value.scrollHeight;
   nearBottom = true;
+  scheduleReadReceipt();
 }
 const updateScrollPosition = () => {
   const element = timeline.value;
   if (element) nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 64;
+  scheduleReadReceipt();
 };
+function scheduleReadReceipt() {
+  if (typeof window === "undefined" || !props.open || readFrame !== null
+    || !props.messages.some((message) => message.status === "sent" && message.id !== null)) return;
+  readFrame = window.requestAnimationFrame(() => {
+    readFrame = null;
+    const element = timeline.value;
+    if (!props.open || props.loading || props.accessDenied || document.visibilityState !== "visible"
+      || typeof document.hasFocus === "function" && !document.hasFocus()
+      || !element || element.clientHeight <= 0
+      || element.scrollHeight - element.scrollTop - element.clientHeight > 2) return;
+    const latest = props.messages.filter((message) => message.status === "sent" && message.id !== null).at(-1);
+    if (!latest?.id || latest.id <= emittedReadId) return;
+    const row = [...element.querySelectorAll<HTMLElement>("[data-message-key]")]
+      .find((message) => message.dataset.messageKey === messageKey(latest));
+    if (!row) return;
+    const bounds = element.getBoundingClientRect();
+    const rowBounds = row.getBoundingClientRect();
+    if (bounds.bottom <= bounds.top || rowBounds.bottom > bounds.bottom + 2 || rowBounds.bottom <= bounds.top) return;
+    emittedReadId = latest.id;
+    emit("read", latest.id);
+  });
+}
 const loadOlder = () => {
   if (props.loading || !props.hasOlder || !timeline.value) return;
   emit("loadOlder");
@@ -234,12 +261,16 @@ const stopDialogEffects = () => {
   if (typeof window === "undefined") return;
   dialogEffectsActive = false;
   window.removeEventListener("keydown", handleModalKeydown, true);
+  window.removeEventListener("focus", scheduleReadReceipt);
+  document.removeEventListener("visibilitychange", scheduleReadReceipt);
   document.removeEventListener("pointerdown", handleOutsidePointer, true);
   syncModalEffects();
   stopViewport();
   chatResize.stop();
   if (composerResizeFrame !== null) window.cancelAnimationFrame(composerResizeFrame);
   composerResizeFrame = null;
+  if (readFrame !== null) window.cancelAnimationFrame(readFrame);
+  readFrame = null;
   if (messageAnimationTimer !== null) clearTimeout(messageAnimationTimer);
   messageAnimationTimer = null;
   enteringMessageKeys.value = new Set();
@@ -277,6 +308,8 @@ watch(() => props.open, async (open) => {
     }
     dialogEffectsActive = true;
     window.addEventListener("keydown", handleModalKeydown, true);
+    window.addEventListener("focus", scheduleReadReceipt);
+    document.addEventListener("visibilitychange", scheduleReadReceipt);
     document.addEventListener("pointerdown", handleOutsidePointer, true);
   }
   nearBottom = true;
@@ -306,6 +339,8 @@ watch(isMobileLayout, async (mobile) => {
     && !dialog.value?.contains(document.activeElement)) closeButton.value?.focus({ preventScroll: true });
 });
 watch(() => props.accessDenied, (denied) => { if (denied) closeStickerPicker(); });
+watch(() => props.currentUserId, () => { emittedReadId = 0; });
+watch(() => props.loading, (loading) => { if (!loading) scheduleReadReceipt(); });
 watch(isStickerPickerOpen, async () => {
   const keepBottom = nearBottom;
   await nextTick();
@@ -316,6 +351,7 @@ watch(() => props.messages.map((message) => `${messageKey(message)}:${message.st
   const previousKeys = renderedMessageKeys;
   const keys = props.messages.map(messageKey);
   renderedMessageKeys = keys;
+  if (!props.messages.some((message) => message.status === "sent")) emittedReadId = 0;
   if (!props.open) return;
   const generation = dialogGeneration;
   const prepended = previousKeys.length > 0 && keys.indexOf(previousKeys[0]!) > 0;
@@ -331,6 +367,7 @@ watch(() => props.messages.map((message) => `${messageKey(message)}:${message.st
       messageAnimationTimer = setTimeout(() => {
         enteringMessageKeys.value = new Set();
         messageAnimationTimer = null;
+        scheduleReadReceipt();
       }, 200);
     }
   }

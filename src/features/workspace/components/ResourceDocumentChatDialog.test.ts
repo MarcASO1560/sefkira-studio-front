@@ -46,9 +46,10 @@ class FakeTimeline extends FakeElement {
   private position = 0;
   get scrollTop() { return this.position; }
   set scrollTop(value: number) { this.position = Math.max(0, Math.min(value, this.scrollHeight - this.clientHeight)); }
+  getBoundingClientRect() { return { top: this.top, bottom: this.top + this.clientHeight }; }
 }
 
-let fakeDocument: EventTarget & { activeElement: FakeElement | null; body: FakeElement };
+let fakeDocument: EventTarget & { activeElement: FakeElement | null; body: FakeElement; visibilityState: string; hasFocus: () => boolean };
 let fakeWindow: EventTarget & {
   requestAnimationFrame: ReturnType<typeof vi.fn>;
   cancelAnimationFrame: ReturnType<typeof vi.fn>;
@@ -169,6 +170,7 @@ beforeEach(() => {
   fakeDocument = Object.assign(new EventTarget(), {
     activeElement: null as FakeElement | null,
     body: vue.markRaw(new FakeElement()),
+    visibilityState: "visible", hasFocus: () => true,
   });
   fakeDocument.body.style.overflow = "scroll";
   fakeWindow = Object.assign(new EventTarget(), {
@@ -191,6 +193,71 @@ afterEach(() => {
 });
 
 describe("ResourceDocumentChatDialog interaction", () => {
+  it("acknowledges only a confirmed last message rendered at the bottom of a visible focused timeline", async () => {
+    const chat = setupChat(false, [message(7)]);
+    const row = vue.markRaw(new FakeElement());
+    row.dataset.messageKey = "artist:message-7";
+    row.top = 160;
+    chat.timeline.children = [row];
+    chat.props.open = true;
+    await settle();
+    expect(chat.emit).not.toHaveBeenCalledWith("read", expect.anything());
+    flushFrames();
+    expect(chat.emit).toHaveBeenCalledExactlyOnceWith("read", 7);
+    chat.state.updateScrollPosition();
+    flushFrames();
+    expect(chat.emit).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps new messages unread while viewing history and while the browser tab is hidden or unfocused", async () => {
+    const chat = setupChat(false, [message(7)]);
+    const row = vue.markRaw(new FakeElement());
+    row.dataset.messageKey = "artist:message-7";
+    row.top = 160;
+    chat.timeline.children = [row];
+    chat.props.open = true;
+    fakeDocument.visibilityState = "hidden";
+    await settle();
+    flushFrames();
+    expect(chat.emit).not.toHaveBeenCalled();
+    fakeDocument.visibilityState = "visible";
+    chat.timeline.scrollTop = 400;
+    chat.state.updateScrollPosition();
+    flushFrames();
+    expect(chat.emit).not.toHaveBeenCalled();
+    chat.timeline.scrollTop = 800;
+    fakeDocument.hasFocus = () => false;
+    chat.state.updateScrollPosition();
+    flushFrames();
+    expect(chat.emit).not.toHaveBeenCalled();
+    fakeDocument.hasFocus = () => true;
+    fakeWindow.dispatchEvent(new Event("focus"));
+    flushFrames();
+    expect(chat.emit).toHaveBeenCalledExactlyOnceWith("read", 7);
+  });
+
+  it("waits for the message row to reach the viewport and for loading to finish before acknowledging", async () => {
+    const chat = setupChat(false, [message(7)]);
+    const row = vue.markRaw(new FakeElement());
+    row.dataset.messageKey = "artist:message-7";
+    row.top = 180;
+    chat.timeline.children = [row];
+    chat.props.open = true;
+    await settle();
+    flushFrames();
+    expect(chat.emit).not.toHaveBeenCalled();
+    row.top = 160;
+    chat.props.loading = true;
+    await settle();
+    chat.state.updateScrollPosition();
+    flushFrames();
+    expect(chat.emit).not.toHaveBeenCalled();
+    chat.props.loading = false;
+    await settle();
+    flushFrames();
+    expect(chat.emit).toHaveBeenCalledExactlyOnceWith("read", 7);
+  });
+
   it("uses exact usernames, complete display-name fallbacks and generic legacy author names", () => {
     const { state } = setupChat();
     expect(state.displayName({ id: "artist", username: "  Artist  Name  ", display_name: "artist@example.com" }))

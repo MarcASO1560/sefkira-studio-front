@@ -76,6 +76,17 @@ export type DocumentChatPage = {
   messages: DocumentChatMessagePublic[];
   has_more: boolean;
   next_before_id: number | null;
+  unread_count: number;
+  last_read_message_id: number;
+  last_message_id: number | null;
+  history_visible_from: string;
+};
+
+export type DocumentChatUnreadSummary = {
+  resource_id: string;
+  unread_count: number;
+  last_message_id: number | null;
+  last_read_message_id: number;
 };
 
 export class DocumentChatHttpError extends Error {
@@ -309,6 +320,22 @@ export const postDocumentChatMessage = (
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(payload),
 });
+
+export const getProjectChatUnread = (projectId: string, options: { signal?: AbortSignal } = {}) =>
+  requestDocumentChat<{ documents: DocumentChatUnreadSummary[] }>(
+    `/projects/${encodeURIComponent(projectId)}/chat/unread`, { signal: options.signal });
+
+export const markDocumentChatRead = (
+  projectId: string,
+  resourceId: string,
+  lastReadMessageId: number,
+  options: { signal?: AbortSignal } = {},
+) => requestDocumentChat<DocumentChatUnreadSummary>(
+  `/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/chat/read`, {
+    method: "POST", signal: options.signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ last_read_message_id: lastReadMessageId }),
+  });
 
 export const putResourceEditorState = (
   projectId: string,

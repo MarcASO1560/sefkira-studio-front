@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DocumentChatHttpError,
   getDocumentChatMessages,
+  getProjectChatUnread,
+  markDocumentChatRead,
   postDocumentChatMessage,
   type DocumentChatMessagePublic,
   type DocumentChatPage,
@@ -19,7 +21,8 @@ const message: DocumentChatMessagePublic = {
   body: "Hello from the document",
   created_at: "2026-09-18T12:00:00Z",
 };
-const history: DocumentChatPage = { messages: [message], has_more: false, next_before_id: 1 };
+const history: DocumentChatPage = { messages: [message], has_more: false, next_before_id: 1,
+  unread_count: 1, last_read_message_id: 0, last_message_id: 1, history_visible_from: "2026-09-18T10:00:00Z" };
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status,
   headers: { "Content-Type": "application/json" },
@@ -33,6 +36,18 @@ afterEach(() => {
 });
 
 describe("document chat HTTP transport", () => {
+  it("loads project counters and acknowledges a document cursor privately without retrieving message bodies", async () => {
+    const summary = { resource_id: "resource/1", unread_count: 2, last_message_id: 9, last_read_message_id: 7 };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse({ documents: [summary] }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(getProjectChatUnread("project /one")).resolves.toEqual({ documents: [summary] });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...summary, unread_count: 0, last_read_message_id: 9 }));
+    await expect(markDocumentChatRead("project /one", "resource/1", 9)).resolves.toMatchObject({ unread_count: 0 });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/projects/project%20%2Fone/chat/unread");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/projects/project%20%2Fone/resources/resource%2F1/chat/read");
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "POST", cache: "no-store", credentials: "same-origin" });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ last_read_message_id: 9 });
+  });
   it("loads only the dedicated, encoded document chat path with private, uncached credentials", async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse(history));

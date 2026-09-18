@@ -47,6 +47,9 @@ import { PIXEL_ART_PALETTE } from "../../pixel-art/lib/palette";
 import ProjectEditorDialog from "./ProjectEditorDialog.vue";
 import ProjectPresenceAvatars from "./ProjectPresenceAvatars.vue";
 import UserProfileDialog from "./UserProfileDialog.vue";
+import DocumentChatUnreadBadge from "./DocumentChatUnreadBadge.vue";
+import { useProjectChatUnread } from "../composables/useProjectChatUnread";
+import { aggregateProjectChatUnread } from "../lib/projectChatUnread";
 
 type ResourceCreateType = "pixel_art" | "pixel_animation" | "sound_effect" | "text";
 type ExplorerCreateType = "folder" | ResourceCreateType;
@@ -278,6 +281,17 @@ const allProjectResources = computed(() => [
   ...(tree.value?.resources ?? []),
   ...localResources.value,
 ]);
+const projectChatUnread = useProjectChatUnread({
+  projectId: () => props.projectId,
+  accountKey: () => profileEmail.value,
+  enabled: () => Boolean(project.value) && !isProjectAccessRevoked.value,
+  onAccessDenied: () => revokeProjectAccess(),
+});
+const folderChatUnread = computed(() => aggregateProjectChatUnread(
+  projectChatUnread.counts.value, allProjectFolders.value, allProjectResources.value,
+));
+const chatUnreadForItem = (item: ExplorerItem) => item.kind === "folder"
+  ? folderChatUnread.value[item.id] || 0 : projectChatUnread.counts.value[item.id] || 0;
 const projectResourceTypesById = computed<Record<string, string>>(() =>
   Object.fromEntries(
     allProjectResources.value.map((resource) => [resource.id, resource.type]),
@@ -494,12 +508,20 @@ const resourceRouteKind = (resourceType: string) => {
   return "image";
 };
 
-const openResourceEditor = (item: Pick<ExplorerItem, "id" | "type">) => {
+const openResourceEditor = (item: Pick<ExplorerItem, "id" | "type">, openChat = false) => {
   window.location.assign(
     `/studio/${encodeURIComponent(props.projectId)}/${resourceRouteKind(item.type)}/${encodeURIComponent(
       item.id,
-    )}`,
+    )}${openChat ? '?chat=1' : ''}`,
   );
+};
+
+const openUnreadChat = (item: ExplorerItem) => {
+  if (isMovingExplorerItem.value || isProjectAccessRevoked.value) return;
+  closeEditingExplorerItem();
+  closeExplorerFloatingMenus();
+  if (item.kind === "folder") openFolder(item.id);
+  else openResourceEditor(item, true);
 };
 
 const openExplorerItem = (item: ExplorerItem) => {
@@ -2004,6 +2026,7 @@ const handleRealtimeProjectAccessUpdated = (payload: RealtimeEventPayload) => {
   if (isCurrentProjectRealtimeEvent(payload)) {
     void projectPresenceConnection.value?.refresh();
     scheduleProjectRefresh({ showError: true });
+    projectChatUnread.receiveRealtime(payload);
   }
 };
 
@@ -2027,6 +2050,8 @@ const connectRealtimeEvents = () => {
     "project.updated": handleRealtimeProjectUpdated,
     "project.deleted": handleRealtimeProjectUnavailable,
     "project.access.updated": handleRealtimeProjectAccessUpdated,
+    "document.chat.created": projectChatUnread.receiveRealtime,
+    "document.chat.read": projectChatUnread.receiveRealtime,
   });
 
   projectPresenceConnection.value?.close();
@@ -2380,7 +2405,7 @@ onUnmounted(() => {
                   </span>
                 </span>
                 <span v-else class="project-explorer-row__name-group">
-                  <span class="project-explorer-row__name">
+                  <span class="project-explorer-row__name" :title="item.name">
                     {{ item.name }}
                   </span>
                   <button
@@ -2394,6 +2419,10 @@ onUnmounted(() => {
                   >
                     <Pencil :size="15" :stroke-width="2.2" aria-hidden="true" />
                   </button>
+                  <DocumentChatUnreadBadge
+                    :count="chatUnreadForItem(item)" :name="item.name" :folder="item.kind === 'folder'"
+                    @open="openUnreadChat(item)"
+                  />
                   <ProjectPresenceAvatars
                     v-if="projectPresenceForExplorerItem(item).length > 0"
                     :members="projectPresenceForExplorerItem(item)"
@@ -2916,6 +2945,7 @@ onUnmounted(() => {
 
   .project-explorer-row__name-group {
     display: inline-flex;
+    flex: 1 1 auto;
     align-items: center;
     gap: 7px;
     min-width: 0;
@@ -2923,7 +2953,7 @@ onUnmounted(() => {
   }
 
   .project-explorer-row__name {
-    display: inline-flex;
+    display: block;
     align-items: center;
     min-width: 0;
     max-width: 100%;
@@ -3696,6 +3726,27 @@ onUnmounted(() => {
   }
 
   @media (max-width: 520px) {
+    .project-explorer-header,
+    .project-explorer-row {
+      grid-template-columns: minmax(0, 1fr) 54px;
+    }
+
+    .project-explorer-column:nth-child(3),
+    .project-explorer-cell:nth-child(3) {
+      display: none;
+    }
+
+    .project-explorer-row__name-group {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      row-gap: 3px;
+      padding-block: 3px;
+    }
+
+    .project-explorer-row__name-group :deep(.project-presence-avatars) {
+      grid-column: 1 / -1;
+    }
+
     .resource-modal-backdrop {
       padding: 12px;
     }

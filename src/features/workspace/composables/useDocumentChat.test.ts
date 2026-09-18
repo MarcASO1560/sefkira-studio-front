@@ -3,6 +3,7 @@ import { effectScope, nextTick, ref } from "vue";
 import {
   DocumentChatHttpError,
   getDocumentChatMessages,
+  markDocumentChatRead,
   postDocumentChatMessage,
   type DocumentChatAuthor,
   type DocumentChatMessagePublic,
@@ -13,7 +14,7 @@ import { DOCUMENT_CHAT_STICKERS } from "../lib/documentChatStickers";
 
 vi.mock("../../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../lib/api")>();
-  return { ...actual, getDocumentChatMessages: vi.fn(), postDocumentChatMessage: vi.fn() };
+  return { ...actual, getDocumentChatMessages: vi.fn(), postDocumentChatMessage: vi.fn(), markDocumentChatRead: vi.fn() };
 });
 
 class MemoryStorage implements Storage {
@@ -40,10 +41,14 @@ const message = (id: number, extra: Partial<DocumentChatMessagePublic> = {}): Do
   created_at: `2026-09-18T12:00:${String(id % 60).padStart(2, "0")}Z`,
   ...extra,
 });
-const page = (messages: DocumentChatMessagePublic[] = [], hasMore = false): DocumentChatPage => ({
+const page = (messages: DocumentChatMessagePublic[] = [], hasMore = false, unreadCount = 0, lastRead = 0): DocumentChatPage => ({
   messages,
   has_more: hasMore,
   next_before_id: messages[0]?.id ?? null,
+  unread_count: unreadCount,
+  last_read_message_id: lastRead,
+  last_message_id: messages.at(-1)?.id ?? null,
+  history_visible_from: "2026-09-18T10:00:00Z",
 });
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -93,6 +98,9 @@ describe("document chat synchronization", () => {
     vi.stubGlobal("navigator", { onLine: true });
     vi.stubGlobal("crypto", { randomUUID: vi.fn(() => uuid(sequence++)) });
     vi.mocked(getDocumentChatMessages).mockResolvedValue(page());
+    vi.mocked(markDocumentChatRead).mockImplementation(async (_project, resource, cursor) => ({
+      resource_id: resource, unread_count: 0, last_message_id: cursor, last_read_message_id: cursor,
+    }));
     vi.mocked(postDocumentChatMessage).mockImplementation(async (_projectId, resourceId, payload) => message(sequence++, {
       resource_id: resourceId,
       client_message_id: payload.client_message_id,
@@ -117,6 +125,174 @@ describe("document chat synchronization", () => {
     expect(chat.hasOlder.value).toBe(true);
     expect(chat.unreadCount.value).toBe(0);
     expect(chat.loading.value).toBe(false);
+  });
+
+  it("keeps server unread counts across reloads and chat opening until a read receipt succeeds", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(9)], false, 6, 3));
+    const first = makeClient();
+    await startChat(first.chat);
+    expect(first.chat.unreadCount.value).toBe(6);
+    expect(first.chat.lastReadMessageId.value).toBe(3);
+    first.chat.dispose();
+    const second = makeClient();
+    await startChat(second.chat);
+    second.chat.setOpen(true);
+    await settle();
+    expect(second.chat.unreadCount.value).toBe(6);
+    expect(markDocumentChatRead).not.toHaveBeenCalled();
+    await second.chat.markRead(9);
+    expect(second.chat.unreadCount.value).toBe(0);
+    expect(second.chat.lastReadMessageId.value).toBe(9);
+  });
+
+  it("never acknowledges hidden, unfocused, closed or unconfirmed messages", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(2)], false, 1));
+    const { chat } = makeClient();
+    await startChat(chat);
+    await chat.markRead(2);
+    chat.setOpen(true);
+    fakeDocument.visibilityState = "hidden";
+    await chat.markRead(2);
+    fakeDocument.visibilityState = "visible";
+    Object.assign(fakeDocument, { hasFocus: () => false });
+    await chat.markRead(2);
+    Object.assign(fakeDocument, { hasFocus: () => true });
+    await chat.markRead(999);
+    expect(markDocumentChatRead).not.toHaveBeenCalled();
+    expect(chat.unreadCount.value).toBe(1);
+    await chat.markRead(2);
+    expect(markDocumentChatRead).toHaveBeenCalledOnce();
+  });
+
+  it("retains failed read receipts and retries them when the visible document catches up", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(5)], false, 2));
+    vi.mocked(markDocumentChatRead).mockRejectedValueOnce(new TypeError("Offline"));
+    const { chat } = makeClient();
+    await startChat(chat);
+    chat.setOpen(true);
+    await settle();
+    await chat.markRead(5);
+    expect(chat.unreadCount.value).toBe(2);
+    expect(chat.lastReadMessageId.value).toBe(0);
+    await chat.catchUp();
+    expect(markDocumentChatRead).toHaveBeenCalledTimes(2);
+    expect(chat.unreadCount.value).toBe(0);
+    expect(chat.lastReadMessageId.value).toBe(5);
+  });
+
+  it("serializes advancing read cursors and ignores older HTTP snapshots", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(2), message(5)], false, 2));
+    const gate = deferred<Awaited<ReturnType<typeof markDocumentChatRead>>>();
+    vi.mocked(markDocumentChatRead).mockReturnValueOnce(gate.promise);
+    const { chat } = makeClient();
+    await startChat(chat);
+    chat.setOpen(true);
+    await settle();
+    const first = chat.markRead(2);
+    await chat.markRead(1);
+    const second = chat.markRead(5);
+    expect(markDocumentChatRead).toHaveBeenCalledOnce();
+    gate.resolve({ resource_id: "resource", unread_count: 1, last_message_id: 5, last_read_message_id: 2 });
+    await Promise.all([first, second]);
+    await settle();
+    expect(vi.mocked(markDocumentChatRead).mock.calls.map((call) => call[2])).toEqual([2, 5]);
+    await chat.catchUp();
+    expect(chat.lastReadMessageId.value).toBe(5);
+    expect(chat.unreadCount.value).toBe(0);
+  });
+
+  it("ignores delayed read acknowledgements after the signed-in user changes", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(4)], false, 1));
+    const gate = deferred<Awaited<ReturnType<typeof markDocumentChatRead>>>();
+    vi.mocked(markDocumentChatRead).mockReturnValueOnce(gate.promise);
+    const { chat, user } = makeClient();
+    await startChat(chat);
+    chat.setOpen(true);
+    await settle();
+    const reading = chat.markRead(4);
+    const signal = vi.mocked(markDocumentChatRead).mock.calls[0]![3]!.signal!;
+    user.value = otherUser;
+    await settle();
+    expect(signal.aborted).toBe(true);
+    gate.resolve({ resource_id: "resource", unread_count: 0, last_message_id: 4, last_read_message_id: 4 });
+    await reading;
+    expect(chat.lastReadMessageId.value).toBe(0);
+    expect(chat.unreadCount.value).toBe(1);
+    expect(chat.isOpen.value).toBe(false);
+  });
+
+  it("filters previous membership history and confirms realtime hints over HTTP", async () => {
+    const boundary = "2026-09-18T12:00:02Z";
+    vi.mocked(getDocumentChatMessages).mockResolvedValue({ ...page([message(1), message(2)], false, 1), history_visible_from: boundary });
+    const { chat } = makeClient();
+    await startChat(chat);
+    expect(chat.messages.value.map((row) => row.id)).toEqual([2]);
+    const gate = deferred<DocumentChatPage>();
+    vi.mocked(getDocumentChatMessages).mockReturnValueOnce(gate.promise);
+    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(1) });
+    expect(chat.messages.value.map((row) => row.id)).toEqual([2]);
+    gate.resolve({ ...page([], false, 1), history_visible_from: boundary });
+    await settle();
+    expect(chat.messages.value.map((row) => row.id)).toEqual([2]);
+  });
+
+  it("replaces the history and read cursor after removal and rejoining under a new membership", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(5)], false, 1, 3));
+    const { chat } = makeClient();
+    await startChat(chat);
+    vi.mocked(getDocumentChatMessages).mockResolvedValue({ ...page([message(12)], false, 1), history_visible_from: "2026-09-18T12:00:10Z" });
+    await chat.catchUp();
+    await settle();
+    expect(chat.messages.value.map((row) => row.id)).toEqual([12]);
+    expect(chat.lastReadMessageId.value).toBe(0);
+    expect(vi.mocked(getDocumentChatMessages).mock.calls.at(-1)?.[2]?.afterId).toBeUndefined();
+    vi.mocked(getDocumentChatMessages).mockRejectedValueOnce(new DocumentChatHttpError(403));
+    await chat.catchUp();
+    expect(chat.messages.value).toEqual([]);
+    expect(chat.unreadCount.value).toBe(0);
+  });
+
+  it.each(["history", "denied"])("ignores a delayed previous-membership older-page %s response after rejoining", async (result) => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([message(5)], true, 1, 3));
+    const { chat } = makeClient();
+    await startChat(chat);
+    const previousMembership = deferred<DocumentChatPage>();
+    vi.mocked(getDocumentChatMessages).mockReturnValueOnce(previousMembership.promise);
+    const older = chat.loadOlder();
+    vi.mocked(getDocumentChatMessages).mockResolvedValue({ ...page([message(12)], false, 1), history_visible_from: "2026-09-18T12:00:10Z" });
+    await chat.catchUp();
+    await settle();
+    if (result === "history") previousMembership.resolve(page([message(1)]));
+    else previousMembership.reject(new DocumentChatHttpError(403));
+    await older;
+    expect(chat.messages.value.map((row) => row.id)).toEqual([12]);
+    expect(chat.lastReadMessageId.value).toBe(0);
+    expect(chat.accessDenied.value).toBe(false);
+  });
+
+  it("does not discard a newer unread count when an earlier read response arrives late", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(2)], false, 1));
+    const { chat } = makeClient();
+    await startChat(chat);
+    chat.setOpen(true);
+    await settle();
+    const gate = deferred<Awaited<ReturnType<typeof markDocumentChatRead>>>();
+    vi.mocked(markDocumentChatRead).mockReturnValueOnce(gate.promise);
+    const reading = chat.markRead(2);
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(3)], false, 2));
+    const refresh = chat.catchUp();
+    await settle();
+    expect(chat.unreadCount.value).toBe(2);
+    gate.resolve({ resource_id: "resource", unread_count: 0, last_message_id: 2, last_read_message_id: 2 });
+    await Promise.all([reading, refresh]);
+    expect(chat.unreadCount.value).toBe(2);
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([], false, 1, 2));
+    // The unread response still refers to the document's latest message even
+    // when its catch-up page has no additional rows.
+    vi.mocked(getDocumentChatMessages).mockResolvedValue({ ...page([], false, 1, 2), last_message_id: 3 });
+    await chat.catchUp();
+    expect(chat.unreadCount.value).toBe(1);
+    expect(chat.lastReadMessageId.value).toBe(2);
   });
 
   it("keeps optimistic display names current without adding identity metadata to sends", async () => {
@@ -250,9 +426,12 @@ describe("document chat synchronization", () => {
     await startChat(chat);
     const sending = chat.sendSticker(stickerId);
     const originalId = chat.messages.value[0]!.client_message_id;
-    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(12, {
+    const confirmed = message(12, {
       author: ownUser, body: "", sticker_id: stickerId, client_message_id: originalId,
-    }) });
+    });
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([confirmed]));
+    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: confirmed });
+    await settle();
     gate.reject(new TypeError("Response lost"));
     expect(await sending).toBe(true);
     expect(chat.messages.value).toHaveLength(1);
@@ -268,6 +447,7 @@ describe("document chat synchronization", () => {
     await startChat(chat);
     expect(chat.messages.value[0]).toMatchObject({ body: "", sticker_id: stickerId, status: "sent" });
     const unknownId = "tiny-rpg-future-sticker";
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([message(2, { body: "", sticker_id: unknownId })], false, 1));
     chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(2, {
       body: "", sticker_id: unknownId,
     }) });
@@ -336,13 +516,18 @@ describe("document chat synchronization", () => {
   it("does not conflate different authors who reuse the same client message UUID", async () => {
     const { chat } = makeClient();
     await startChat(chat);
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([
+      message(1, { author: ownUser, client_message_id: uuid(9) }),
+      message(2, { author: otherUser, client_message_id: uuid(9) }),
+    ]));
     chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(1, { author: ownUser, client_message_id: uuid(9) }) });
     chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(2, { author: otherUser, client_message_id: uuid(9) }) });
     await settle();
     expect(chat.messages.value.map((entry) => entry.author.id)).toEqual(["owner", "editor"]);
   });
 
-  it("counts only unseen other-user messages and marks them read when opened", async () => {
+  it("restores persisted unread counts and acknowledges them only after a visible timeline receipt", async () => {
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(1), message(2, { author: ownUser })], false, 1));
     const { chat } = makeClient();
     await startChat(chat);
     const remote = message(1);
@@ -352,9 +537,14 @@ describe("document chat synchronization", () => {
     expect(chat.unreadCount.value).toBe(1);
     chat.setOpen(true);
     expect(chat.isOpen.value).toBe(true);
+    expect(chat.unreadCount.value).toBe(1);
+    expect(markDocumentChatRead).not.toHaveBeenCalled();
+    await chat.markRead(2);
     expect(chat.unreadCount.value).toBe(0);
+    vi.mocked(getDocumentChatMessages).mockResolvedValue(page([message(3)], false, 1, 2));
     chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(3) });
-    expect(chat.unreadCount.value).toBe(0);
+    await settle();
+    expect(chat.unreadCount.value).toBe(1);
     chat.setOpen(false);
     chat.receiveRealtime({ project_id: "other-project", resource_id: "resource", message: message(4, { project_id: "other-project" }) });
     chat.receiveRealtime({ project_id: "project", resource_id: "other-resource", message: message(5, { resource_id: "other-resource" }) });
@@ -459,9 +649,9 @@ describe("document chat synchronization", () => {
     await startChat(chat);
     vi.mocked(getDocumentChatMessages).mockClear();
     vi.mocked(getDocumentChatMessages).mockImplementation(async (_projectId, _resourceId, options) => {
-      if (options?.afterId === 1) return page([message(2), message(3)], true);
-      if (options?.afterId === 3) return page([message(4), message(5)]);
-      return page();
+      if (options?.afterId === 1) return page([message(2), message(3)], true, 4);
+      if (options?.afterId === 3) return page([message(4), message(5)], false, 4);
+      return page([], false, 4);
     });
     chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(4) });
     await chat.catchUp();
@@ -508,6 +698,7 @@ describe("document chat synchronization", () => {
     await startChat(chat);
     chat.setOpen(true);
     await settle();
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([message(1)]));
     chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(1) });
     await settle();
     vi.mocked(getDocumentChatMessages).mockClear();
@@ -540,11 +731,14 @@ describe("document chat synchronization", () => {
     const sending = chat.sendMessage("Accepted despite a lost response");
     await settle();
     const originalId = chat.messages.value[0]!.client_message_id;
-    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: message(12, {
+    const confirmed = message(12, {
       author: ownUser,
       body: "Accepted despite a lost response",
       client_message_id: originalId,
-    }) });
+    });
+    vi.mocked(getDocumentChatMessages).mockResolvedValueOnce(page([confirmed]));
+    chat.receiveRealtime({ project_id: "project", resource_id: "resource", message: confirmed });
+    await settle();
     gate.reject(new TypeError("HTTP response disappeared"));
     expect(await sending).toBe(true);
     await settle();

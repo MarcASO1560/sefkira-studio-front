@@ -658,7 +658,6 @@ const currentImagePresenceMember = computed<ProjectPresenceMember | null>(() => 
 });
 const hasImageDocumentPresence = computed(
   () =>
-    isImageEditor.value &&
     getDocumentPresenceMembers(
       projectPresenceMembers.value,
       currentPresenceUserId.value,
@@ -685,8 +684,8 @@ const documentChatUser = computed(() => currentPresenceUserId.value ? {
   avatar_pixel_art: profilePixelAvatar.value,
 } : null);
 const documentChat = useDocumentChat({
-  projectId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value ? props.projectId : "",
-  resourceId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value ? props.resourceId : "",
+  projectId: () => resource.value && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value ? props.projectId : "",
+  resourceId: () => resource.value && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value ? props.resourceId : "",
   user: documentChatUser,
 });
 const {
@@ -742,6 +741,10 @@ const canEditImage = computed(
     !imageAutosave.isHistoryBusy.value &&
     (project.value?.access_role === "owner" || project.value?.access_role === "editor"),
 );
+const canRenameResource = computed(() => Boolean(resource.value) && !isLoading.value
+  && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value
+  && (project.value?.access_role === "owner" || project.value?.access_role === "editor")
+  && (!isImageEditor.value || canEditImage.value));
 const canManagePersonalImagePalette = computed(
   () => Boolean(imagePaletteUserId.value) && !isPersonalImagePaletteSaving.value,
 );
@@ -1906,7 +1909,7 @@ const canonicalResourcePath = computed(
 );
 
 const navigateAfterImageSave = async (path: string, options: { requireSaved?: boolean } = {}) => {
-  if (isImageEditor.value && isRenamingResource.value && canEditImage.value) {
+  if (isRenamingResource.value && canRenameResource.value) {
     await commitResourceName();
   }
 
@@ -1937,6 +1940,14 @@ const navigateAfterImageSave = async (path: string, options: { requireSaved?: bo
         );
         return;
       }
+    }
+  }
+
+  if (!isImageEditor.value) {
+    await resourceMutationQueue;
+    if (isResourceNameSaving.value || hasPendingImageNameChange.value) {
+      if (options.requireSaved) return;
+      if (!window.confirm("The document name could not be saved. Leave the editor anyway?")) return;
     }
   }
 
@@ -2051,8 +2062,8 @@ const persistResourceName = async (name: string) => {
   try {
     await enqueueResourceMutation(async () => {
       const currentResource = resource.value;
-      if (!currentResource || !canEditImage.value) {
-        throw new Error("You no longer have permission to rename this image.");
+      if (!currentResource || !canRenameResource.value) {
+        throw new Error("You no longer have permission to rename this document.");
       }
 
       let result = await patchProjectResource(props.projectId, props.resourceId, {
@@ -2065,7 +2076,8 @@ const persistResourceName = async (name: string) => {
         // Refresh and retry only the name, never any image data.
         const latestResource = await fetchLatestImageResource();
         if (latestResource) {
-          await imageAutosave.acceptResource(latestResource);
+          if (isImageEditor.value) await imageAutosave.acceptResource(latestResource);
+          else resource.value = latestResource;
           result = await patchProjectResource(props.projectId, props.resourceId, {
             name,
             base_revision: latestResource.revision,
@@ -2075,7 +2087,7 @@ const persistResourceName = async (name: string) => {
 
       if (!result.ok) {
         if (result.conflict) {
-          openImageConflict(
+          if (isImageEditor.value) openImageConflict(
             { kind: "rename", name },
             result.conflict.current_revision,
           );
@@ -2086,8 +2098,8 @@ const persistResourceName = async (name: string) => {
         }
         throw new Error(
           result.status === 403
-            ? "You no longer have permission to rename this image."
-            : `The image name could not be saved${result.status ? ` (${result.status})` : ""}.`,
+            ? "You no longer have permission to rename this document."
+            : `The document name could not be saved${result.status ? ` (${result.status})` : ""}.`,
         );
       }
 
@@ -2096,7 +2108,7 @@ const persistResourceName = async (name: string) => {
         ...result.resource,
         data: currentResource.data,
       };
-      await imageAutosave.refresh();
+      if (isImageEditor.value) await imageAutosave.refresh();
     });
   } finally {
     isResourceNameSaving.value = false;
@@ -2104,7 +2116,7 @@ const persistResourceName = async (name: string) => {
 };
 
 const startRenamingResource = () => {
-  if (!canEditImage.value || !resource.value) return;
+  if (!canRenameResource.value || !resource.value) return;
   resourceNameSaveError.value = "";
   resourceNameDraft.value = resource.value.name;
   isRenamingResource.value = true;
@@ -2120,13 +2132,13 @@ const cancelRenamingResource = () => {
 const performResourceNameCommit = async () => {
   const currentResource = resource.value;
   const name = resourceNameDraft.value.trim();
-  if (!currentResource || !canEditImage.value || !name || name === currentResource.name) {
+  if (!currentResource || !canRenameResource.value || !name || name === currentResource.name) {
     cancelRenamingResource();
     return;
   }
 
-  await imageAutosave.flush();
-  if (imageAutosave.hasPendingChanges.value) {
+  if (isImageEditor.value) await imageAutosave.flush();
+  if (isImageEditor.value && imageAutosave.hasPendingChanges.value) {
     resourceNameSaveError.value = imageSaveError.value || "Save the pending image changes before renaming it.";
     showImageNotice(
       resourceNameSaveError.value,
@@ -2139,7 +2151,7 @@ const performResourceNameCommit = async () => {
     await persistResourceName(name);
     resourceNameSaveError.value = "";
     isRenamingResource.value = false;
-    showImageNotice("Image name updated.", "success");
+    if (isImageEditor.value) showImageNotice("Document name updated.", "success");
   } catch (error) {
     resourceNameSaveError.value =
       error instanceof Error ? error.message : "The image name could not be saved.";
@@ -2214,7 +2226,8 @@ const closeDocumentInfo = () => {
 };
 
 const openDocumentChat = () => {
-  if (isLoading.value || errorMessage.value || !resource.value || isResourceProjectAccessRevoked.value) return;
+  if (isLoading.value || errorMessage.value || !resource.value || isResourceProjectAccessRevoked.value
+    || isDocumentIdle.value || isDocumentChatAccessDenied.value) return;
   if (isDocumentChatOpen.value) {
     documentChat.setOpen(false);
     return;
@@ -2226,6 +2239,17 @@ const openDocumentChat = () => {
   activeImageInspectorPanel.value = null;
   documentChat.setOpen(true);
 };
+
+let requestedChatResource = "";
+watch([() => isLoading.value, () => resource.value?.id, () => currentPresenceUserId.value], () => {
+  if (typeof window === "undefined" || isLoading.value || !resource.value || !currentPresenceUserId.value
+    || errorMessage.value || isResourceProjectAccessRevoked.value || isDocumentIdle.value) return;
+  const key = `${props.projectId}:${props.resourceId}:${currentPresenceUserId.value}`;
+  if (requestedChatResource === key || new URLSearchParams(window.location.search).get("chat") !== "1") return;
+  requestedChatResource = key;
+  // Opening the panel is separate from acknowledging its visible timeline.
+  void nextTick(() => { if (!resourceEditorDisposed && !isDocumentChatOpen.value) openDocumentChat(); });
+}, { flush: "post" });
 
 const buildImageDocument = (includeRotationPreview = true, includePalette = true): PixelArtDocumentV2 => {
   // Pixel buffers are treated as immutable throughout the editor. Reusing them
@@ -2734,10 +2758,10 @@ const displayedImageSaveStatus = computed(() =>
       ? "error"
       : hasPendingImageNameChange.value
         ? "dirty"
-        : imageSaveStatus.value,
+        : isImageEditor.value ? imageSaveStatus.value : "saved",
 );
 const displayedImageSaveError = computed(
-  () => resourceNameSaveError.value || imageSaveError.value,
+  () => resourceNameSaveError.value || (isImageEditor.value ? imageSaveError.value : ""),
 );
 const normalizeResourceUpdatedAt = (value: string | null | undefined) => {
   const timestamp = value?.trim();
@@ -2748,7 +2772,7 @@ const normalizeResourceUpdatedAt = (value: string | null | undefined) => {
     : timestamp;
 };
 const effectiveImageLastSavedAt = computed(
-  () => imageLastSavedAt.value ?? normalizeResourceUpdatedAt(resource.value?.updated_at),
+  () => (isImageEditor.value ? imageLastSavedAt.value : null) ?? normalizeResourceUpdatedAt(resource.value?.updated_at),
 );
 const isImageSaveClean = computed(
   () =>
@@ -2757,7 +2781,7 @@ const isImageSaveClean = computed(
     !hasPendingImageNameChange.value,
 );
 const retryImageSave = () => {
-  if (!canEditImage.value) return;
+  if (!canRenameResource.value) return;
   if (
     resourceNameSaveError.value &&
     isRenamingResource.value &&
@@ -2766,7 +2790,7 @@ const retryImageSave = () => {
     void commitResourceName();
     return;
   }
-  void imageAutosave.retry();
+  if (isImageEditor.value) void imageAutosave.retry();
 };
 
 const saveImageNow = async () => {
@@ -6495,12 +6519,9 @@ const hasImageUnloadRisk = () => {
     Boolean(resourceNameDraft.value.trim()) &&
     resourceNameDraft.value.trim() !== resource.value?.name;
   return (
-    isImageEditor.value &&
-    (imageAutosave.hasPendingChanges.value ||
-      isResourceNameSaving.value ||
-      isPersonalImagePaletteSaving.value ||
-      hasUnsavedName ||
-      imageConflictOperation.value !== null)
+    isResourceNameSaving.value || hasUnsavedName ||
+    isImageEditor.value && (imageAutosave.hasPendingChanges.value ||
+      isPersonalImagePaletteSaving.value || imageConflictOperation.value !== null)
   );
 };
 
@@ -6624,6 +6645,7 @@ const connectResourceRealtime = () => {
     "project.access.updated": handleResourceProjectAccessUpdated,
     "project.deleted": handleResourceProjectAccessUpdated,
     "document.chat.created": documentChat.receiveRealtime,
+    "document.chat.read": documentChat.receiveReadRealtime,
   });
 };
 
@@ -6729,6 +6751,13 @@ const loadEditor = async () => {
       return;
     }
 
+    if (workspace?.user) {
+      profileUsername.value = workspace.user.username || "";
+      profileUserName.value = getUserDisplayName(workspace.user);
+      profileAvatarUrl.value = workspace.user.avatar_url || "";
+      profileEmail.value = workspace.user.email;
+      profilePixelAvatar.value = workspace.user.avatar_pixel_art || null;
+    }
     imagePaletteUserId.value = workspace?.user.id || "";
     currentPresenceUserId.value = workspace?.user.id || "";
     personalImagePalette.value = normalizePinnedPaletteColors(
@@ -6780,7 +6809,9 @@ const loadEditor = async () => {
 
     const routeKind = editorMetaByType[resourceDetail.type]?.routeKind;
     if (routeKind && props.resourceKind !== routeKind) {
-      window.history.replaceState(null, "", canonicalResourcePath.value);
+      const canonicalUrl = new URL(window.location.href);
+      canonicalUrl.pathname = canonicalResourcePath.value;
+      window.history.replaceState(null, "", `${canonicalUrl.pathname}${canonicalUrl.search}${canonicalUrl.hash}`);
     }
 
   } catch {
@@ -6977,7 +7008,7 @@ onUnmounted(() => {
             <span class="resource-editor-title__name">{{ resourceName }}</span>
             <span class="resource-editor-title__kind">{{ editorMeta.label }}</span>
           </span>
-          <span v-if="isImageEditor && !isLoading" class="resource-editor-title__status">
+          <span v-if="resource && !isLoading" class="resource-editor-title__status">
             <ImageSaveStatus
               :status="displayedImageSaveStatus"
               :error="displayedImageSaveError"
@@ -6997,7 +7028,7 @@ onUnmounted(() => {
       </template>
       <template #actions>
         <button
-          v-if="isImageEditor && !isLoading && !errorMessage && resource"
+          v-if="!isLoading && !errorMessage && resource"
           type="button"
           class="image-editor-chat-trigger"
           :aria-label="documentChatButtonLabel"
@@ -7030,7 +7061,7 @@ onUnmounted(() => {
       :members="projectPresenceMembers"
       :current-user-id="currentPresenceUserId"
       :current-user="currentImagePresenceMember"
-      :show-people="isImageEditor"
+      :show-people="true"
       @close="closeDocumentInfo"
     >
       <template #name>
@@ -7061,7 +7092,7 @@ onUnmounted(() => {
         </form>
         <strong v-else class="resource-document-info__name">{{ resourceName }}</strong>
         <button
-          v-if="canEditImage && !isRenamingResource"
+          v-if="canRenameResource && !isRenamingResource"
           ref="resourceRenameButton"
           type="button"
           class="resource-document-info__rename"
@@ -7071,7 +7102,7 @@ onUnmounted(() => {
         >Rename</button>
         <p v-if="resourceNameSaveError" id="resource-document-name-error" class="resource-document-info__name-error" role="alert">{{ resourceNameSaveError }}</p>
       </template>
-      <template v-if="isImageEditor" #save>
+      <template #save>
         <ImageSaveStatus
           :status="displayedImageSaveStatus"
           :error="displayedImageSaveError"
@@ -8163,8 +8194,8 @@ onUnmounted(() => {
         </footer>
       </div>
       <ResourceDocumentChatDialog
-        v-if="isImageEditor && resource && !errorMessage"
-        :key="`${projectId}:${resourceId}`"
+        v-if="resource && !errorMessage"
+        :key="`${projectId}:${resourceId}:${currentPresenceUserId}`"
         :open="isDocumentChatOpen"
         :document-name="resourceName"
         :participants-count="documentChatParticipantsCount"
@@ -8181,6 +8212,7 @@ onUnmounted(() => {
         @retry="documentChat.retryMessage"
         @load-older="documentChat.loadOlder"
         @reload="documentChat.catchUp"
+        @read="documentChat.markRead"
       />
     </main>
 

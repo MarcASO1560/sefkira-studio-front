@@ -14,6 +14,7 @@ export const REALTIME_EVENT_NAMES = [
   "project.access.updated",
   "project.share.updated",
   "document.chat.created",
+  "document.chat.read",
 ] as const;
 
 export type RealtimeEventName = (typeof REALTIME_EVENT_NAMES)[number];
