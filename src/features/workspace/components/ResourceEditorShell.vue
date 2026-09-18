@@ -49,6 +49,7 @@ import ImageDocumentPresence from "./ImageDocumentPresence.vue";
 import ResourceDocumentInfoDialog from "./ResourceDocumentInfoDialog.vue";
 import ResourceDocumentChatDialog from "./ResourceDocumentChatDialog.vue";
 import { useDocumentChat } from "../composables/useDocumentChat";
+import { useDocumentInactivity } from "../composables/useDocumentInactivity";
 import { buildDocumentInfoDetails } from "../lib/documentInfo";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import {
@@ -420,6 +421,9 @@ const isLoading = ref(true);
 const errorMessage = ref("");
 const project = ref<ProjectPublic | null>(null);
 const isResourceProjectAccessRevoked = ref(false);
+const editorRoot = ref<HTMLElement | null>(null);
+const isDocumentIdle = ref(false);
+const isIdleExitSaving = ref(false);
 const resource = ref<ProjectResourceDetail | null>(null);
 const imageGridWidth = ref(DEFAULT_IMAGE_WIDTH);
 const imageGridHeight = ref(DEFAULT_IMAGE_HEIGHT);
@@ -679,8 +683,8 @@ const documentChatUser = computed(() => currentPresenceUserId.value ? {
   avatar_pixel_art: profilePixelAvatar.value,
 } : null);
 const documentChat = useDocumentChat({
-  projectId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value ? props.projectId : "",
-  resourceId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value ? props.resourceId : "",
+  projectId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value ? props.projectId : "",
+  resourceId: () => isImageEditor.value && resource.value && !isResourceProjectAccessRevoked.value && !isDocumentIdle.value ? props.resourceId : "",
   user: documentChatUser,
 });
 const {
@@ -732,6 +736,7 @@ const canEditImage = computed(
     isImageEditor.value &&
     isImageOperationReady.value &&
     !isResourceProjectAccessRevoked.value &&
+    !isDocumentIdle.value &&
     !imageAutosave.isHistoryBusy.value &&
     (project.value?.access_role === "owner" || project.value?.access_role === "editor"),
 );
@@ -1898,8 +1903,8 @@ const canonicalResourcePath = computed(
     )}`,
 );
 
-const navigateAfterImageSave = async (path: string) => {
-  if (isImageEditor.value && isRenamingResource.value) {
+const navigateAfterImageSave = async (path: string, options: { requireSaved?: boolean } = {}) => {
+  if (isImageEditor.value && isRenamingResource.value && canEditImage.value) {
     await commitResourceName();
   }
 
@@ -1919,6 +1924,7 @@ const navigateAfterImageSave = async (path: string) => {
       hasUnsavedName ||
       imageConflictOperation.value !== null
     ) {
+      if (options.requireSaved) return;
       const shouldLeave = window.confirm(
         "Your latest changes could not be saved. Leave the editor anyway? Unsaved changes may be lost.",
       );
@@ -2271,7 +2277,7 @@ const broadcastImageDocument = (
 };
 
 const requestImageCanonicalRefresh = (requireFresh = false) => {
-  if (!isImageOperationReady.value) return;
+  if (!isImageOperationReady.value || isDocumentIdle.value) return;
   imageCanonicalRefreshRequiresFresh ||= requireFresh;
   if (imageCanonicalRefreshTimeout !== null) return;
   imageCanonicalRefreshTimeout = setTimeout(() => {
@@ -2435,7 +2441,7 @@ const updateRemoteImageCollaborator = (
 };
 
 const handleProjectPresenceSync = (snapshot: ProjectPresenceSnapshot) => {
-  if (isResourceProjectAccessRevoked.value) return;
+  if (isResourceProjectAccessRevoked.value || isDocumentIdle.value) return;
   projectPresenceMembers.value = snapshot[props.resourceId] || [];
   requestImageCanonicalRefresh();
   if (projectPresenceMembers.value.length === 0) {
@@ -2507,7 +2513,7 @@ const applyRemoteImageDocument = (
 };
 
 const handleProjectEditorActivity = (activity: ProjectEditorActivity) => {
-  if (isResourceProjectAccessRevoked.value) return;
+  if (isResourceProjectAccessRevoked.value || isDocumentIdle.value) return;
   if (activity.resource_id !== props.resourceId) return;
   if (!resource.value || !isImageEditor.value) {
     pendingProjectEditorActivities.push(activity);
@@ -6527,6 +6533,7 @@ const flushImageBeforePageHide = () => {
 };
 
 const handleResourceVisibilityChange = () => {
+  if (isDocumentIdle.value) return;
   if (document.visibilityState !== "visible") {
     broadcastImageCursor(null);
     flushImageCollaborationCursor();
@@ -6563,7 +6570,7 @@ const revokeResourceProjectAccess = () => {
 };
 
 const refreshResourceProjectAccess = () => {
-  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return Promise.resolve();
+  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value || isDocumentIdle.value) return Promise.resolve();
   if (resourceAccessRefresh) return resourceAccessRefresh;
   resourceAccessRefresh = (async () => {
     const controller = new AbortController();
@@ -6574,7 +6581,7 @@ const refreshResourceProjectAccess = () => {
         headers: { Accept: "application/json" },
         signal: controller.signal,
       });
-      if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
+      if (resourceEditorDisposed || isResourceProjectAccessRevoked.value || isDocumentIdle.value) return;
       if ([401, 403, 404].includes(response.status)) {
         revokeResourceProjectAccess();
       } else if (response.ok) {
@@ -6596,14 +6603,14 @@ const refreshResourceProjectAccess = () => {
 };
 
 const handleResourceProjectAccessUpdated = (payload: RealtimeEventPayload) => {
-  if (payload.project_id !== props.projectId || resourceEditorDisposed) return;
+  if (payload.project_id !== props.projectId || resourceEditorDisposed || isDocumentIdle.value) return;
   void projectPresenceConnection?.refresh();
   void refreshResourceProjectAccess();
   if (isImageOperationReady.value) requestImageCanonicalRefresh();
 };
 
 const connectResourcePresence = () => {
-  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
+  if (resourceEditorDisposed || isResourceProjectAccessRevoked.value || isDocumentIdle.value) return;
   projectPresenceConnection?.close();
   projectPresenceConnection = connectProjectPresence(
     props.projectId,
@@ -6612,6 +6619,72 @@ const connectResourcePresence = () => {
     handleProjectEditorActivity,
     revokeResourceProjectAccess,
   );
+};
+
+const connectResourceRealtime = () => {
+  if (resourceEditorDisposed || isDocumentIdle.value) return;
+  resourceAccessConnection?.close();
+  resourceAccessConnection = connectUserRealtime({
+    "project.access.updated": handleResourceProjectAccessUpdated,
+    "project.deleted": handleResourceProjectAccessUpdated,
+    "document.chat.created": documentChat.receiveRealtime,
+  });
+};
+
+const leaveInactiveDocument = async () => {
+  if (resourceEditorDisposed || isDocumentIdle.value) return;
+  isDocumentIdle.value = true;
+  isIdleExitSaving.value = true;
+  clearImageTemporaryKeys();
+  documentChat.setOpen(false);
+  isDocumentInfoOpen.value = false;
+  broadcastImageCursor(null);
+  flushImageCollaborationCursor();
+  projectPresenceConnection?.close();
+  projectPresenceConnection = null;
+  resourceAccessConnection?.close();
+  resourceAccessConnection = null;
+  projectPresenceMembers.value = [];
+  remoteImageCollaborators.value = {};
+  pendingProjectEditorActivities.length = 0;
+  pendingImageCollaborationCursor = null;
+  pendingImageCollaborationSelection = null;
+  imageLivePreviews.clear();
+  imageLivePreviewSender.clear();
+  if (imageCanonicalRefreshTimeout !== null) {
+    window.clearTimeout(imageCanonicalRefreshTimeout);
+    imageCanonicalRefreshTimeout = null;
+    imageCanonicalRefreshRequiresFresh = false;
+  }
+  if (imageCollaborationCleanupInterval !== null) {
+    window.clearInterval(imageCollaborationCleanupInterval);
+    imageCollaborationCleanupInterval = null;
+  }
+  try {
+    await persistImageEditorSession(true);
+    await navigateAfterImageSave(projectPath.value, { requireSaved: true });
+  } catch {
+    // Keep the local document available if saving or navigation cannot finish.
+  } finally {
+    isIdleExitSaving.value = false;
+  }
+};
+const documentInactivity = useDocumentInactivity({
+  element: editorRoot,
+  isActivityWithinDocument: (event) => event.target instanceof Element && Boolean(event.target.closest(
+    "#resource-document-chat-dialog, #resource-document-info-dialog",
+  )),
+  onIdle: () => { void leaveInactiveDocument(); },
+});
+const continueEditingInactiveDocument = () => {
+  if (!isDocumentIdle.value || isIdleExitSaving.value || resourceEditorDisposed || isResourceProjectAccessRevoked.value) return;
+  isDocumentIdle.value = false;
+  documentInactivity.start();
+  connectResourcePresence();
+  connectResourceRealtime();
+  imageCollaborationCleanupInterval = window.setInterval(removeStaleImageCollaborators, 4000);
+  void refreshResourceProjectAccess();
+  requestImageCanonicalRefresh();
 };
 
 const removeStaleImageCollaborators = () => {
@@ -6774,6 +6847,7 @@ const loadEditor = async () => {
 };
 
 onMounted(() => {
+  documentInactivity.start();
   window.addEventListener("pointerup", finishImagePointerInteraction);
   window.addEventListener("pointercancel", cancelImagePointerInteraction);
   window.addEventListener("keydown", handleResourceEditorKeydown);
@@ -6791,11 +6865,7 @@ onMounted(() => {
   // The route already identifies the resource, so announce presence while the
   // document, layers, and per-user editor state load in parallel.
   connectResourcePresence();
-  resourceAccessConnection = connectUserRealtime({
-    "project.access.updated": handleResourceProjectAccessUpdated,
-    "project.deleted": handleResourceProjectAccessUpdated,
-    "document.chat.created": documentChat.receiveRealtime,
-  });
+  connectResourceRealtime();
   void loadEditor().then(() => {
     if (!resource.value) projectPresenceConnection?.setResourceId(null);
   });
@@ -6803,6 +6873,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   resourceEditorDisposed = true;
+  documentInactivity.stop();
   imageUsedPalette.clear();
   imageCanvasBitmapWriter.clear();
   imageCanvasBitmap = null;
@@ -6865,7 +6936,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="resource-editor" :style="editorStyle">
+  <section ref="editorRoot" class="resource-editor" :class="{ 'resource-editor--with-chat-action': isImageEditor }" :style="editorStyle">
     <StudioTopbar
       mode="project"
       center-max-width="min(520px, 38vw)"
@@ -6928,7 +6999,30 @@ onUnmounted(() => {
           </span>
         </button>
       </template>
+      <template #actions>
+        <button
+          v-if="isImageEditor && !isLoading && !errorMessage && resource"
+          type="button"
+          class="image-editor-chat-trigger"
+          :aria-label="documentChatButtonLabel"
+          title="Document chat"
+          aria-controls="resource-document-chat-dialog"
+          :aria-expanded="isDocumentChatOpen"
+          :disabled="isResourceProjectAccessRevoked || isDocumentChatAccessDenied || isDocumentIdle"
+          data-image-shortcuts="off"
+          @click="openDocumentChat"
+        >
+          <MessageSquareText :size="21" :stroke-width="2" aria-hidden="true" />
+          <span v-if="documentChatUnreadCount > 0" class="image-editor-chat-trigger__unread" aria-hidden="true">{{ documentChatUnreadCount > 99 ? '99+' : documentChatUnreadCount }}</span>
+        </button>
+      </template>
     </StudioTopbar>
+
+    <div v-if="isDocumentIdle" class="resource-editor-idle" role="status">
+      <p>{{ isIdleExitSaving ? 'Disconnected after 30 minutes of inactivity. Saving before returning to your documents…' : 'Disconnected after 30 minutes of inactivity. Your local document is preserved.' }}</p>
+      <button type="button" :disabled="isIdleExitSaving || isResourceProjectAccessRevoked" @click="continueEditingInactiveDocument">Continue editing</button>
+      <button type="button" :disabled="isIdleExitSaving" @click="returnToProject">Back to documents</button>
+    </div>
 
     <ResourceDocumentInfoDialog
       v-if="!isLoading && !errorMessage && resource"
@@ -7017,20 +7111,6 @@ onUnmounted(() => {
               @select-tool="activeImageTool = $event"
             />
           </div>
-          <button
-            type="button"
-            class="image-editor-chat-trigger"
-            :aria-label="documentChatButtonLabel"
-            title="Document chat"
-            aria-controls="resource-document-chat-dialog"
-            :aria-expanded="isDocumentChatOpen"
-            :disabled="isResourceProjectAccessRevoked || isDocumentChatAccessDenied"
-            data-image-shortcuts="off"
-            @click="openDocumentChat"
-          >
-            <MessageSquareText :size="21" :stroke-width="2" aria-hidden="true" />
-            <span v-if="documentChatUnreadCount > 0" class="image-editor-chat-trigger__unread" aria-hidden="true">{{ documentChatUnreadCount > 99 ? '99+' : documentChatUnreadCount }}</span>
-          </button>
         </aside>
 
         <ImageCanvasModesMenu
@@ -8132,6 +8212,11 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+  .resource-editor-idle { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; background: var(--editor-surface); color: var(--editor-text); border-bottom: 1px solid var(--editor-border); }
+  .resource-editor-idle p { flex: 1 1 240px; margin: 0; font-size: 13px; line-height: 1.5; }
+  .resource-editor-idle button { min-height: 44px; padding: 8px 12px; font: inherit; font-size: 13px; background: var(--editor-panel); color: var(--editor-text); border: 1px solid var(--editor-border); border-radius: var(--editor-radius-sm); cursor: pointer; touch-action: manipulation; }
+  .resource-editor-idle button:disabled { opacity: .4; cursor: default; }
+  .resource-editor-idle button:focus-visible { outline: 2px solid var(--editor-focus); outline-offset: 2px; }
   .resource-editor {
     --editor-bg: #080808;
     --editor-panel: #111111;
@@ -8374,6 +8459,11 @@ onUnmounted(() => {
     font-weight: 550;
   }
 
+  .resource-editor :deep(.studio-topbar__actions) {
+    align-items: center;
+    gap: 6px;
+  }
+
   .resource-editor-stage {
     position: relative;
     display: flex;
@@ -8442,10 +8532,9 @@ onUnmounted(() => {
     display: grid;
     flex: 0 0 auto;
     place-items: center;
-    width: 34px;
-    height: 36px;
-    min-height: 36px;
-    margin-top: 8px;
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
     padding: 0;
     color: var(--editor-text);
     cursor: pointer;
@@ -8460,6 +8549,7 @@ onUnmounted(() => {
   @media (hover: hover) and (pointer: fine) {
     .image-editor-chat-trigger:hover:not(:disabled) { background: var(--editor-hover); }
   }
+  .image-editor-chat-trigger[aria-expanded="true"] { background: var(--editor-hover); }
   .image-editor-chat-trigger:active:not(:disabled) { opacity: .75; transform: scale(.94); }
   .image-editor-chat-trigger:focus-visible { outline: 2px solid var(--editor-focus); outline-offset: -2px; }
   .image-editor-chat-trigger:disabled { opacity: .4; cursor: not-allowed; }
@@ -9815,6 +9905,11 @@ onUnmounted(() => {
     pointer-events: none;
   }
 
+  .image-editor-canvas-bitmap,
+  .image-editor-grid-overlay {
+    border-radius: inherit;
+  }
+
   .image-editor-subdivision-line {
     position: absolute;
     z-index: 3;
@@ -10468,8 +10563,6 @@ onUnmounted(() => {
       min-width: 40px;
     }
 
-    .image-editor-chat-trigger { width: 40px; height: 44px; min-height: 44px; }
-
     .image-editor-statusbar {
       gap: 4px;
       justify-content: center;
@@ -10484,6 +10577,14 @@ onUnmounted(() => {
 
     .image-editor-mobile-color-trigger {
       display: inline-grid;
+    }
+  }
+
+  @media (max-width: 520px) {
+    .resource-editor--with-chat-action :deep(.studio-topbar) {
+      grid-template-areas: "brand user" "center center";
+      grid-template-columns: minmax(0, 1fr) max-content;
+      row-gap: 6px;
     }
   }
 

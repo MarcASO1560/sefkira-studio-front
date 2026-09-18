@@ -325,7 +325,10 @@ const removeSupabaseConnection = (
   client: RealtimeClient,
   channel: RealtimeChannel,
 ) => {
-  void client.removeChannel(channel).finally(() => client.disconnect());
+  void client.removeChannel(channel).catch(() => undefined);
+  // Closing an idle document must not keep heartbeats alive while a leave
+  // acknowledgement is delayed or the socket is unavailable.
+  void client.disconnect();
 };
 
 export const connectUserRealtime = (
@@ -433,13 +436,14 @@ export const connectUserRealtime = (
       };
 
       const getAccessToken = async () => {
+        if (closed) return null;
         const expiresAt = Date.parse(activeConfig.expires_at);
         if (Number.isFinite(expiresAt) && expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) {
           return activeConfig.access_token;
         }
 
         const refreshedConfig = await fetchRealtimeConfig();
-        if (!isSupabaseConfig(refreshedConfig)) {
+        if (closed || !isSupabaseConfig(refreshedConfig)) {
           return null;
         }
         activeConfig = refreshedConfig;

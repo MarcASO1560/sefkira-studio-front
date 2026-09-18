@@ -190,6 +190,7 @@ const handleUserClick = () => {
     </div>
 
     <div class="studio-topbar__actions">
+      <slot name="actions" />
       <component
         :is="userInteractive ? 'button' : 'div'"
         class="studio-topbar__user"

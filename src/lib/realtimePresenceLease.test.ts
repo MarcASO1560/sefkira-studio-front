@@ -114,6 +114,82 @@ const openPresence = async () => {
   return { connection, onSync, onActivity, onDenied };
 };
 
+const openUserRealtime = async (expiresAt = "2099-01-01T00:00:00Z") => {
+  fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+    if (String(input).endsWith("/events/config")) {
+      return response({ ...config(), expires_at: expiresAt, channel: "user:user-1", latest_event_id: 0 });
+    }
+    return response([]);
+  });
+  const onProjectUpdated = vi.fn();
+  const connection = connectUserRealtime({ "project.updated": onProjectUpdated });
+  connections.push(connection);
+  await vi.waitFor(() => expect(clients[0]?.room.subscribe).toHaveBeenCalledOnce());
+  await vi.advanceTimersByTimeAsync(0);
+  return { connection, client: clients[0]!, onProjectUpdated };
+};
+
+describe("user realtime closure", () => {
+  it.each(["acknowledged", "rejected"])(
+    "disconnects before a pending unsubscribe is %s and ignores late room callbacks", async (outcome) => {
+      const { connection, client, onProjectUpdated } = await openUserRealtime();
+      let finish!: (value: string) => void;
+      let reject!: (reason: Error) => void;
+      client.removeChannel.mockReturnValueOnce(new Promise<string>((resolve, fail) => {
+        finish = resolve;
+        reject = fail;
+      }));
+      const requestCount = fetchMock.mock.calls.length;
+
+      connection.close();
+      connection.close();
+      expect(client.removeChannel).toHaveBeenCalledExactlyOnceWith(client.room);
+      expect(client.disconnect).toHaveBeenCalledOnce();
+      client.room.handlers.get("broadcast:project.updated")?.({ payload: { project_id: "late" } });
+      client.room.subscription?.("SUBSCRIBED");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onProjectUpdated).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(requestCount);
+
+      if (outcome === "acknowledged") finish("ok");
+      else reject(new Error("unsubscribe failed after the socket was closed"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.disconnect).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["2099-01-01T00:00:00Z", "2026-09-17T10:00:30Z"])(
+    "returns null from late auth callbacks without requesting config, expiration %s", async (expiresAt) => {
+      const { connection, client } = await openUserRealtime(expiresAt);
+      const requestCount = fetchMock.mock.calls.length;
+      connection.close();
+      expect(await client.options.accessToken()).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(requestCount);
+    },
+  );
+
+  it("discards an auth refresh completed after close and cannot restart a channel", async () => {
+    const { connection, client, onProjectUpdated } = await openUserRealtime("2026-09-17T10:00:30Z");
+    const pending = deferred<Response>();
+    fetchMock.mockReturnValueOnce(pending.promise);
+    const token = client.options.accessToken();
+    const requestCount = fetchMock.mock.calls.length;
+    expect(String(fetchMock.mock.calls.at(-1)![0])).toMatch(/\/events\/config$/);
+    connection.close();
+    pending.resolve(response({ ...config(), channel: "user:user-1", latest_event_id: 0 }));
+    expect(await token).toBeNull();
+    client.room.subscription?.("SUBSCRIBED");
+    client.room.handlers.get("broadcast:project.updated")?.({ payload: { project_id: "late" } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.channel).toHaveBeenCalledOnce();
+    expect(client.room.subscribe).toHaveBeenCalledOnce();
+    expect(client.disconnect).toHaveBeenCalledOnce();
+    expect(onProjectUpdated).not.toHaveBeenCalled();
+    expect(await client.options.accessToken()).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(requestCount);
+  });
+});
+
 describe("project presence authorization lease", () => {
   it("rotates the room, retires the old socket first, and ignores every late old callback", async () => {
     const { connection, onSync, onActivity } = await openPresence();

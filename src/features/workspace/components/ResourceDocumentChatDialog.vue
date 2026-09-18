@@ -5,6 +5,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type { DocumentChatAuthor } from "../../../lib/api";
 import type { DocumentChatMessage } from "../composables/useDocumentChat";
 import { useDocumentChatViewport } from "../composables/useDocumentChatViewport";
+import { useDocumentChatResize } from "../composables/useDocumentChatResize";
 import { groupDocumentChatMessages, validatedDocumentChatAvatar } from "../lib/documentChatPresentation";
 import { DOCUMENT_CHAT_STICKERS, getDocumentChatSticker } from "../lib/documentChatStickers";
 import DocumentChatSticker from "./DocumentChatSticker.vue";
@@ -30,6 +31,7 @@ const emit = defineEmits<{
   reload: [];
 }>();
 const dialog = ref<HTMLElement | null>(null);
+const panel = ref<HTMLElement | null>(null);
 const timeline = ref<HTMLElement | null>(null);
 const composer = ref<HTMLTextAreaElement | null>(null);
 const closeButton = ref<HTMLButtonElement | null>(null);
@@ -59,6 +61,13 @@ let renderedMessageKeys = props.messages.map(messageKey);
 const { isMobileLayout, viewportStyle, start: startViewport, stop: stopViewport } = useDocumentChatViewport({
   onResize: () => {
     if (!props.open) return;
+    scheduleComposerResize();
+    if (nearBottom) void nextTick(() => { if (props.open) scrollToBottom(); });
+  },
+});
+const chatResize = useDocumentChatResize({
+  panel, isMobileLayout,
+  onResize: () => {
     scheduleComposerResize();
     if (nearBottom) void nextTick(() => { if (props.open) scrollToBottom(); });
   },
@@ -231,6 +240,7 @@ const stopDialogEffects = () => {
   document.removeEventListener("pointerdown", handleOutsidePointer, true);
   syncModalEffects();
   stopViewport();
+  chatResize.stop();
   if (composerResizeFrame !== null) window.cancelAnimationFrame(composerResizeFrame);
   composerResizeFrame = null;
   if (messageAnimationTimer !== null) clearTimeout(messageAnimationTimer);
@@ -257,6 +267,7 @@ watch(() => props.open, async (open) => {
   if (typeof window === "undefined") return;
   const generation = ++dialogGeneration;
   if (!open) {
+    chatResize.stop();
     restoreFocusOnClose = isMobileLayout.value || Boolean(dialog.value?.contains(document.activeElement));
     closeStickerPicker();
     composer.value?.blur();
@@ -278,6 +289,7 @@ watch(() => props.open, async (open) => {
   syncModalEffects();
   await nextTick();
   if (!props.open || generation !== dialogGeneration) return;
+  chatResize.start();
   scrollToBottom();
   resizeComposer();
   // Avoid opening the virtual keyboard before the user chooses to write.
@@ -288,9 +300,11 @@ watch(isMobileLayout, async (mobile) => {
   if (!dialogEffectsActive) return;
   syncModalEffects();
   scheduleComposerResize();
-  if (!mobile) return;
+  chatResize.stop();
   const generation = dialogGeneration;
   await nextTick();
+  if (!props.open || generation !== dialogGeneration) return;
+  if (!mobile) { chatResize.start(); return; }
   if (props.open && isMobileLayout.value && generation === dialogGeneration
     && !dialog.value?.contains(document.activeElement)) closeButton.value?.focus({ preventScroll: true });
 });
@@ -335,11 +349,20 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 <template>
   <Teleport to="body" :disabled="!isMobileLayout">
     <Transition name="document-chat" @after-leave="finishClose">
-    <div v-if="open" class="document-chat-backdrop" :style="viewportStyle"
+    <div v-if="open" ref="panel" class="document-chat-backdrop" :class="{ 'document-chat-backdrop--resizing': chatResize.isResizing.value }"
+      :style="[viewportStyle, chatResize.panelStyle.value]"
       @wheel.stop @pointerdown.stop @pointermove.stop @pointerup.stop @keydown.stop>
       <section id="resource-document-chat-dialog" ref="dialog" class="document-chat" :class="{ 'document-chat--choosing-sticker': isStickerPickerOpen }"
         :role="isMobileLayout ? 'dialog' : 'complementary'"
         :aria-modal="isMobileLayout ? true : undefined" aria-labelledby="resource-document-chat-title" data-image-shortcuts="off" tabindex="-1">
+        <div v-if="!isMobileLayout" class="document-chat__resize-handle" role="separator" aria-label="Resize document chat"
+          aria-orientation="vertical" aria-controls="resource-document-chat-dialog" tabindex="0"
+          :aria-valuenow="Math.round(chatResize.width.value)" :aria-valuemin="Math.round(chatResize.bounds.value.minimum)"
+          :aria-valuemax="Math.round(chatResize.bounds.value.maximum)" :aria-valuetext="`${Math.round(chatResize.width.value)} pixels wide`"
+          title="Drag to resize chat. Double-click to reset."
+          @pointerdown.stop="chatResize.startDrag" @pointermove.stop="chatResize.moveDrag"
+          @pointerup.stop="chatResize.endDrag" @pointercancel.stop="chatResize.endDrag"
+          @lostpointercapture.stop="chatResize.endDrag" @keydown="chatResize.handleKeydown" @dblclick="chatResize.reset" />
         <header class="document-chat__header">
           <MessageSquareText :size="22" aria-hidden="true" class="document-chat__header-icon" />
           <div class="document-chat__identity">
@@ -451,7 +474,10 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 </template>
 
 <style scoped>
-.document-chat-backdrop { position: relative; z-index: 6; display: flex; flex: 0 0 min(380px, 42vw); width: min(380px, 42vw); min-width: 0; min-height: 0; height: 100%; box-sizing: border-box; overscroll-behavior: contain; }
+.document-chat-backdrop { position: relative; z-index: 6; display: flex; flex: 0 0 var(--document-chat-width, min(380px, 42vw)); width: var(--document-chat-width, min(380px, 42vw)); min-width: 0; min-height: 0; height: 100%; box-sizing: border-box; overscroll-behavior: contain; }
+.document-chat__resize-handle { position: absolute; z-index: 2; inset: 0 auto 0 -4px; width: 9px; cursor: col-resize; touch-action: none; outline: none; }
+.document-chat__resize-handle::after { position: absolute; inset: 0 auto 0 4px; width: 2px; content: ''; background: transparent; transition: background-color 140ms ease; }
+.document-chat__resize-handle:focus-visible::after, .document-chat-backdrop--resizing .document-chat__resize-handle::after { background: var(--editor-focus, #ffffff); }
 .document-chat { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; overflow: hidden; box-sizing: border-box; border: 0; border-left: 1px solid var(--editor-border, #2b2b2b); background: var(--editor-panel, #111111); color: var(--editor-text, #f2f2f2); font-family: inherit; }
 .document-chat-enter-active { transition: opacity 180ms ease-out; }
 .document-chat-leave-active { transition: opacity 140ms ease-in; }
@@ -517,6 +543,7 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 .sticker-picker-enter-from, .sticker-picker-leave-to { opacity: 0; transform: translateY(6px); }
 .document-chat__sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (hover: hover) and (pointer: fine) {
+  .document-chat__resize-handle:hover::after { background: var(--editor-border-strong, #666666); }
   .document-chat__icon-button:hover:not(:disabled), .document-chat__older:hover:not(:disabled),
   .document-chat__failed button:hover:not(:disabled), .document-chat__error button:hover:not(:disabled),
   .document-chat__sticker-option:hover:not(:disabled) { background: var(--editor-hover, #242424); }
@@ -534,6 +561,7 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
   .document-chat__error { padding-inline: max(16px, env(safe-area-inset-left, 0px)) max(16px, env(safe-area-inset-right, 0px)); }
 }
 @media (prefers-reduced-motion: reduce) {
+  .document-chat__resize-handle::after { transition: none; }
   .document-chat-enter-active, .document-chat-leave-active,
   .document-chat-enter-active .document-chat, .document-chat-leave-active .document-chat,
   .document-chat__icon-button, .document-chat__older, .document-chat__failed button,

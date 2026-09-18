@@ -1223,6 +1223,15 @@ const updateAccessUserRole = async (user: ProjectAccessUserPublic, role: Project
   }
 };
 
+const changeAccessUserRole = (user: ProjectAccessUserPublic, event: Event) => {
+  const select = event.target;
+  if (!(select instanceof HTMLSelectElement)) return;
+  const role = select.value;
+  select.value = user.role;
+  if (!projectRoleOptions.some((option) => option.value === role)) return;
+  void updateAccessUserRole(user, role as ProjectAccessRole);
+};
+
 const requestRemoveAccessUser = (user: ProjectAccessUserPublic) => {
   if (!canManageProjectAccess.value || accessMutationBusy.value || accessUserPendingBlock.value || user.is_owner || isCurrentAccessUser(user)) {
     return;
@@ -1938,28 +1947,23 @@ onUnmounted(() => {
                 <span v-if="!canManageProjectAccess" class="access-role">
                   {{ accessRoleLabel(user) }}
                 </span>
-                <div
+                <select
                   v-else
-                  class="access-role-options"
-                  role="group"
+                  class="access-role-select"
+                  :value="user.role"
                   :aria-label="`Project role for ${accessUserName(user)}`"
+                  :aria-busy="accessUpdatingUserId === user.id"
+                  :disabled="accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)"
+                  @change="changeAccessUserRole(user, $event)"
                 >
-                  <button
+                  <option
                     v-for="option in projectRoleOptions"
                     :key="`member-role-${user.id}-${option.value}`"
-                    type="button"
-                    class="access-role-option"
-                    :class="{ 'is-active': user.role === option.value }"
-                    :aria-pressed="user.role === option.value"
-                    :disabled="
-                      user.role === option.value ||
-                      accessMutationBusy || Boolean(accessUserPendingBlock || accessUserPendingRemove)
-                    "
-                    @click="updateAccessUserRole(user, option.value)"
+                    :value="option.value"
                   >
                     {{ accessRoleLabel(option.value) }}
-                  </button>
-                </div>
+                  </option>
+                </select>
                 <div
                   v-if="canManageProjectAccess && !user.is_owner && !isCurrentAccessUser(user)"
                   class="access-user-actions"
@@ -1990,7 +1994,7 @@ onUnmounted(() => {
 
           <section v-if="canManageProjectAccess" class="blocked-people-section" aria-labelledby="blocked-people-title">
             <h3 id="blocked-people-title">Blocked people <span>{{ projectBlockedUsers.length }}</span></h3>
-            <p>Blocked people cannot join this project, even with a valid share link. Unblocking does not restore project access.</p>
+            <p v-if="projectBlockedUsers.length || isLoadingBlockedUsers">Blocked people cannot join this project, even with a valid share link. Unblocking does not restore project access.</p>
             <p v-if="blockedMessage" class="access-dialog__message" role="status">{{ blockedMessage }}</p>
             <div v-if="isLoadingBlockedUsers" class="access-dialog__loading">
               <span class="button-spinner" aria-hidden="true"></span>
@@ -3222,6 +3226,12 @@ onUnmounted(() => {
     border-color: rgba(255, 252, 244, 0.18);
   }
 
+  .access-dialog .project-modal__close {
+    flex: 0 0 auto;
+    width: 44px;
+    height: 44px;
+  }
+
   .access-dialog header,
   .share-dialog header,
   .leave-confirm-dialog header,
@@ -3238,6 +3248,11 @@ onUnmounted(() => {
   .share-dialog > header {
     align-items: center;
     padding: 16px 24px;
+  }
+
+  .access-dialog > header {
+    align-items: center;
+    padding: 12px 18px;
   }
 
   .access-dialog header p,
@@ -3275,17 +3290,15 @@ onUnmounted(() => {
 
   .access-dialog__body {
     display: grid;
-    gap: 16px;
-    padding: 18px 20px 14px;
+    flex: 1 1 auto;
+    align-content: start;
+    gap: 12px;
+    padding: 14px 18px;
   }
 
   .access-dialog__summary {
     display: grid;
-    gap: 6px;
-    padding: 14px 16px;
-    background: rgba(255, 252, 244, 0.035);
-    border: 1px solid rgba(255, 252, 244, 0.08);
-    border-radius: 8px;
+    gap: 4px;
   }
 
   .access-dialog__body h3 {
@@ -3298,12 +3311,19 @@ onUnmounted(() => {
     white-space: nowrap;
   }
 
+  .access-dialog__summary h3,
+  .blocked-people-section h3 {
+    margin-bottom: 0;
+  }
+
   .access-dialog__body p {
     margin: 0;
     color: rgba(247, 241, 231, 0.64);
+    font-size: 0.8125rem;
     line-height: 1.45;
   }
 
+  .access-dialog__body .access-dialog__message,
   .access-dialog__message {
     color: #ffb09f;
   }
@@ -3319,7 +3339,7 @@ onUnmounted(() => {
 
   .access-list {
     display: grid;
-    gap: 12px;
+    gap: 0;
     padding: 0;
     margin: 0;
     list-style: none;
@@ -3327,21 +3347,22 @@ onUnmounted(() => {
 
   .access-list li {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
     align-items: center;
     min-height: 0;
-    padding: 10px;
+    padding: 8px 0;
     color: #fff;
-    background: #161717;
-    border: 1px solid #303232;
-    border-radius: 8px;
+  }
+
+  .access-list li + li {
+    border-top: 1px solid rgba(255, 252, 244, 0.08);
   }
 
   .access-user-identity {
     display: grid;
-    grid-template-columns: 38px minmax(0, 1fr);
-    gap: 12px;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 10px;
     align-items: center;
     min-width: 0;
   }
@@ -3349,8 +3370,8 @@ onUnmounted(() => {
   .access-user-avatar {
     display: grid;
     place-items: center;
-    width: 38px;
-    height: 38px;
+    width: 34px;
+    height: 34px;
     overflow: hidden;
     color: #fff;
     font-size: 0.72rem;
@@ -3376,23 +3397,27 @@ onUnmounted(() => {
 
   .access-user-copy {
     display: grid;
-    gap: 4px;
+    gap: 2px;
     min-width: 0;
   }
 
   .access-user-copy strong,
   .access-user-copy span {
-    overflow-wrap: anywhere;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .access-user-copy strong {
+    white-space: normal;
+    overflow-wrap: anywhere;
     color: #fff;
     font-size: 0.9rem;
     line-height: 1.4;
   }
 
   .access-user-copy span {
-    color: #fff;
+    color: rgba(247, 241, 231, 0.64);
     font-size: 0.78rem;
     font-weight: 400;
     line-height: 1.45;
@@ -3402,20 +3427,16 @@ onUnmounted(() => {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-height: 26px;
-    padding: 0 9px;
-    color: #fff;
-    font-size: 0.72rem;
-    font-weight: 800;
-    background: #242626;
-    border: 1px solid #404242;
-    border-radius: 6px;
+    min-height: 44px;
+    padding: 0 8px;
+    color: rgba(247, 241, 231, 0.76);
+    font-size: 0.8125rem;
+    font-weight: 550;
   }
 
   .access-user-controls {
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px 12px;
+    gap: 4px;
     align-items: center;
     justify-content: flex-start;
     min-width: 0;
@@ -3423,8 +3444,7 @@ onUnmounted(() => {
 
   .access-user-actions {
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    gap: 2px;
     min-width: 0;
   }
 
@@ -3432,61 +3452,36 @@ onUnmounted(() => {
     justify-self: start;
   }
 
-  .access-role-options {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    flex: 0 1 224px;
-    gap: 4px;
-    min-width: 0;
-    padding: 2px;
-    background: #101111;
-    border: 1px solid #3c3e3e;
-    border-radius: 8px;
-  }
-
-  .access-role-option {
-    min-width: 0;
-    min-height: 32px;
-    padding: 6px 8px;
+  .access-role-select {
+    flex: 0 0 auto;
+    max-width: 100%;
+    min-width: 92px;
+    min-height: 44px;
+    padding: 0 6px;
     color: #fff;
     font: inherit;
-    font-size: 0.76rem;
-    font-weight: 750;
+    font-size: 0.8125rem;
+    font-weight: 550;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 6px;
     cursor: pointer;
-    transition:
-      background 160ms ease,
-      border-color 160ms ease;
+    color-scheme: dark;
   }
 
-  .access-role-option:hover:not(:disabled) {
-    background: #282a2a;
-  }
-
-  .access-role-option:focus-visible {
+  .access-role-select:focus-visible {
     outline: 2px solid #fff;
-    outline-offset: 2px;
+    outline-offset: -2px;
   }
 
-  .access-role-option.is-active {
+  .access-role-select option {
     color: #fff;
-    background: #303232;
-    border-color: #747676;
+    background: #161717;
   }
 
-  .access-role-option:disabled {
-    cursor: default;
-    opacity: 0.52;
-  }
-
-  .access-role-option.is-active:disabled {
-    opacity: 1;
-  }
-
-  .access-role-option:disabled:not(.is-active) {
+  .access-role-select:disabled {
     cursor: wait;
+    opacity: 0.52;
   }
 
   .access-remove-button {
@@ -3500,10 +3495,6 @@ onUnmounted(() => {
     border: 0;
     border-radius: 7px;
     cursor: pointer;
-  }
-
-  .access-remove-button:hover:not(:disabled) {
-    background: rgba(255, 126, 103, 0.1);
   }
 
   .access-remove-button:focus-visible {
@@ -3523,26 +3514,31 @@ onUnmounted(() => {
 
   .access-list .access-remove-button,
   .access-list .access-unblock-button {
-    min-width: 0;
-    min-height: 32px;
-    padding: 6px 12px;
-    color: #fff;
-    background: #1b1d1d;
-    border: 1px solid #505252;
-    border-radius: 7px;
+    transform: none;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 8px;
+    color: rgba(247, 241, 231, 0.76);
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
     box-shadow: none;
     font-size: 0.8rem;
     font-weight: 550;
     line-height: 1.3;
+    transition: background-color 130ms ease, opacity 100ms ease;
+    touch-action: manipulation;
   }
 
-  .access-list .access-remove-button:hover:not(:disabled),
-  .access-list .access-unblock-button:hover:not(:disabled) {
-    color: #fff;
-    background: #2b2d2d;
-    border-color: #7c7e7e;
-    box-shadow: none;
-    transform: none;
+  @media (hover: hover) and (pointer: fine) {
+    .access-role-select:hover:not(:disabled),
+    .access-list .access-remove-button:hover:not(:disabled),
+    .access-list .access-unblock-button:hover:not(:disabled) {
+      color: #fff;
+      background: rgba(255, 252, 244, 0.06);
+      box-shadow: none;
+      transform: none;
+    }
   }
 
   .access-list .access-remove-button:focus-visible,
@@ -3551,11 +3547,16 @@ onUnmounted(() => {
     outline-offset: 2px;
   }
 
+  .access-list .access-remove-button:active:not(:disabled),
+  .access-list .access-unblock-button:active:not(:disabled) {
+    opacity: 0.7;
+  }
+
   .blocked-people-section {
     display: grid;
-    gap: 14px;
+    gap: 8px;
     border-top: 1px solid var(--line);
-    padding-top: 18px;
+    padding-top: 14px;
   }
 
   .blocked-people-section h3 {
@@ -3570,36 +3571,29 @@ onUnmounted(() => {
   }
 
   @media (max-width: 560px) {
+    .access-dialog {
+      max-height: calc(100dvh - 32px);
+    }
+
+    .access-dialog > header {
+      padding: 10px 14px;
+    }
+
     .access-dialog__body {
-      padding: 16px 18px 12px;
+      padding: 12px 14px;
     }
 
     .access-list li {
-      grid-template-columns: minmax(0, 1fr);
-      padding: 12px;
+      gap: 0 8px;
     }
 
     .access-user-controls {
-      gap: 10px;
+      display: contents;
     }
 
-    .access-role-options,
     .access-user-actions {
-      flex: 1 1 100%;
-    }
-
-    .access-user-actions > button {
-      flex: 1 1 0;
-    }
-
-    .access-role-option,
-    .access-list .access-remove-button,
-    .access-list .access-unblock-button {
-      min-height: 44px;
-    }
-
-    .access-unblock-button {
-      width: 100%;
+      grid-column: 1 / -1;
+      justify-content: flex-end;
     }
   }
 
@@ -3965,7 +3959,24 @@ onUnmounted(() => {
     display: flex;
     gap: 10px;
     justify-content: flex-end;
-    padding: 0 20px 20px;
+    padding: 8px 18px;
+    border-top: 1px solid var(--line);
+    background: #101111;
+  }
+
+  .access-dialog footer .primary-action {
+    min-height: 44px;
+    padding: 0 16px;
+    border-radius: 6px;
+    box-shadow: none;
+    transform: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .access-list .access-remove-button,
+    .access-list .access-unblock-button {
+      transition: none;
+    }
   }
 
   .share-dialog footer {

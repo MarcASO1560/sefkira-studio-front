@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DocumentChatMessage } from "../composables/useDocumentChat";
 import * as presentation from "../lib/documentChatPresentation";
 import * as stickers from "../lib/documentChatStickers";
+import * as resize from "../composables/useDocumentChatResize";
 
 const stickerId = stickers.DOCUMENT_CHAT_STICKERS[0]!.id;
 
@@ -90,6 +91,7 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
     if (name === "@lucide/vue") return {};
     if (name === "../lib/documentChatPresentation") return presentation;
     if (name === "../lib/documentChatStickers") return stickers;
+    if (name === "../composables/useDocumentChatResize") return resize;
     if (name === "./DocumentChatSticker.vue") return { default: {} };
     if (name === "../composables/useDocumentChatViewport") return {
       useDocumentChatViewport: () => ({
