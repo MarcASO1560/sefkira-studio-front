@@ -1,7 +1,26 @@
 import { describe, expect, it } from "vitest";
 
 import type { PixelAvatarData } from "../../../lib/api";
-import { documentChatDayKey, groupDocumentChatMessages, validatedDocumentChatAvatar } from "./documentChatPresentation";
+import { documentChatAuthorDisplayName, documentChatDayKey, groupDocumentChatMessages, validatedDocumentChatAvatar } from "./documentChatPresentation";
+
+describe("document chat author names", () => {
+  it("preserves a visible username over the server fallback", () => {
+    expect(documentChatAuthorDisplayName({ id: "artist", username: "  Dr.Maraka  ", display_name: "artist@example.com" }))
+      .toBe("  Dr.Maraka  ");
+  });
+
+  it.each([null, "", " \t\n"])("uses the complete server display name when username is %s", (username) => {
+    expect(documentChatAuthorDisplayName({ id: "artist", username, display_name: "artist.name@example.com" }))
+      .toBe("artist.name@example.com");
+  });
+
+  it("supports legacy authors without inspecting undocumented email fields", () => {
+    expect(documentChatAuthorDisplayName({ id: "legacy" })).toBe("Project member");
+    expect(documentChatAuthorDisplayName({ id: "legacy", username: " ", display_name: null })).toBe("Project member");
+    const legacyAuthor = { id: "legacy", username: null, email: "private@example.com" };
+    expect(documentChatAuthorDisplayName(legacyAuthor)).toBe("Project member");
+  });
+});
 
 const message = (id: string, author: string, date: Date) => ({
   client_message_id: id,

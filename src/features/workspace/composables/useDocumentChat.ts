@@ -348,6 +348,17 @@ export const useDocumentChat = (options: Options) => {
   };
   const stopWatch = watch([() => toValue(options.projectId), () => toValue(options.resourceId), () => toValue(options.user)?.id || ""],
     () => { if (started && !disposed) resetContext(); });
+  const stopUserWatch = watch(() => toValue(options.user), (user) => {
+    if (!context || !user || user.id !== context.user.id || disposed) return;
+    context.user = user;
+    let changed = false;
+    messages.value = messages.value.map((message) => {
+      if (message.status === "sent" || message.author.id !== user.id) return message;
+      changed = true;
+      return { ...message, author: user };
+    });
+    if (changed) persistPending();
+  });
   const start = () => {
     if (started || disposed) return;
     started = true;
@@ -369,6 +380,7 @@ export const useDocumentChat = (options: Options) => {
     for (const controller of controllers) controller.abort();
     controllers.clear();
     stopWatch();
+    stopUserWatch();
     if (typeof window !== "undefined") {
       window.removeEventListener("focus", refreshOnReturn);
       window.removeEventListener("online", refreshOnReturn);

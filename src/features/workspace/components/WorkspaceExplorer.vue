@@ -18,6 +18,7 @@ import {
   type RealtimeEventPayload,
 } from "../../../lib/realtime";
 import { WORKSPACE_TRANSITION_STORAGE_KEY } from "../../../lib/routeTransition";
+import { getAccessUserDisplayName, getUserDisplayName, getUserInitials } from "../../../lib/userDisplayName";
 import {
   canBlockProjectMember,
   isShareLinkExpired,
@@ -81,7 +82,7 @@ const workspaceRefreshTimeoutId = ref<number | null>(null);
 const accessRefreshTimeoutId = ref<number | null>(null);
 const activeMenuProjectId = ref<string | null>(null);
 const isProfileDialogOpen = ref(false);
-const profileUserName = ref(props.userName || "");
+const profileUserName = ref(getUserDisplayName({ username: props.userUsername, email: props.userEmail }, props.userName || ""));
 const profileUsername = ref(props.userUsername || "");
 const profileAvatarUrl = ref(props.userAvatarUrl || "");
 const profileEmail = ref(props.userEmail || "");
@@ -223,8 +224,7 @@ const projectAccessCountLabel = computed(() => {
 });
 
 type AccessProfile = Pick<ProjectAccessUserPublic, "email" | "username">;
-const accessUserName = (user: AccessProfile) =>
-  user.username ? `@${user.username}` : user.email.split("@")[0] || "User";
+const accessUserName = (user: AccessProfile) => getAccessUserDisplayName(user);
 
 const accessRoleLabel = (roleOrUser: ProjectAccessRole | ProjectAccessUserPublic) => {
   const role = typeof roleOrUser === "string" ? roleOrUser : roleOrUser.role;
@@ -257,16 +257,9 @@ const isCurrentAccessUser = (user: ProjectAccessUserPublic) =>
   user.email === currentUserEmail.value;
 
 const accessUserInitials = (user: AccessProfile) => {
-  const label = user.username || user.email;
+  const label = getUserDisplayName(user, "U").trim();
   const [firstPart = ""] = label.split("@");
-  const initials = firstPart
-    .split(/[\s._-]+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("");
-
-  return initials || "U";
+  return getUserInitials(firstPart, "U", 1);
 };
 
 const handleProjectManagementError = (error: unknown) => {
@@ -1458,7 +1451,7 @@ const confirmDeleteProject = async () => {
 
 const updateProfile = (user: UserPublic) => {
   profileUsername.value = user.username || "";
-  profileUserName.value = user.username || user.email;
+  profileUserName.value = getUserDisplayName(user);
   profileAvatarUrl.value = user.avatar_url || "";
   profileEmail.value = user.email;
   profilePixelAvatar.value = user.avatar_pixel_art || null;
@@ -3409,7 +3402,7 @@ onUnmounted(() => {
   }
 
   .access-user-copy strong {
-    white-space: normal;
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
     color: #fff;
     font-size: 0.9rem;

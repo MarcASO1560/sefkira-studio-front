@@ -44,6 +44,7 @@ import {
   type RealtimeConnection,
   type RealtimeEventPayload,
 } from "../../../lib/realtime";
+import { getUserDisplayName, getUserInitials, hasVisibleUserName } from "../../../lib/userDisplayName";
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
 import ImageDocumentPresence from "./ImageDocumentPresence.vue";
 import ResourceDocumentInfoDialog from "./ResourceDocumentInfoDialog.vue";
@@ -634,7 +635,7 @@ let pendingPersonalImagePaletteMutations = 0;
 let resourceNameCommitPromise: Promise<void> | null = null;
 let allowImageUnload = false;
 const isProfileDialogOpen = ref(false);
-const profileUserName = ref(props.userName || "");
+const profileUserName = ref(getUserDisplayName({ username: props.userUsername, email: props.userEmail }, props.userName || ""));
 const profileUsername = ref(props.userUsername || "");
 const profileAvatarUrl = ref(props.userAvatarUrl || "");
 const profileEmail = ref(props.userEmail || "");
@@ -649,7 +650,7 @@ const currentImagePresenceMember = computed<ProjectPresenceMember | null>(() => 
   return {
     id: currentPresenceUserId.value,
     email: profileEmail.value,
-    username: profileUsername.value || profileUserName.value,
+    username: hasVisibleUserName(profileUsername.value) ? profileUsername.value : null,
     avatar_url: profileAvatarUrl.value || null,
     avatar_pixel_art: profilePixelAvatar.value,
     resource_id: props.resourceId,
@@ -678,7 +679,8 @@ const projectPixelArt = computed<PixelAvatarData | null>(() => {
 
 const documentChatUser = computed(() => currentPresenceUserId.value ? {
   id: currentPresenceUserId.value,
-  username: profileUsername.value || profileUserName.value || null,
+  username: hasVisibleUserName(profileUsername.value) ? profileUsername.value : null,
+  display_name: getUserDisplayName({ username: profileUsername.value, email: profileEmail.value }),
   avatar_url: profileAvatarUrl.value || null,
   avatar_pixel_art: profilePixelAvatar.value,
 } : null);
@@ -1948,7 +1950,7 @@ const returnToProject = () => navigateAfterImageSave(projectPath.value);
 
 const updateProfile = (user: UserPublic) => {
   profileUsername.value = user.username || "";
-  profileUserName.value = user.username || user.email;
+  profileUserName.value = getUserDisplayName(user);
   profileAvatarUrl.value = user.avatar_url || "";
   profileEmail.value = user.email;
   profilePixelAvatar.value = user.avatar_pixel_art || null;
@@ -2373,19 +2375,13 @@ const broadcastImageSelection = () => {
 };
 
 const collaboratorName = (activity: ProjectEditorActivity) =>
-  activity.user.username?.trim() || activity.user.email.split("@")[0] || "Collaborator";
+  getUserDisplayName(activity.user, "Collaborator");
 
 const collaboratorPresenceMember = (activity: ProjectEditorActivity) =>
   projectPresenceMembers.value.find((member) => member.client_id === activity.client_id) ||
   projectPresenceMembers.value.find((member) => member.id === activity.user.id);
 
-const remoteImageCollaboratorInitials = (collaborator: RemoteImageCollaborator) => {
-  const parts = collaborator.name.split(/[\s._-]+/).filter(Boolean);
-  return (parts.length > 1
-    ? `${parts[0]?.[0] || ""}${parts[1]?.[0] || ""}`
-    : collaborator.name.slice(0, 2)
-  ).toUpperCase();
-};
+const remoteImageCollaboratorInitials = (collaborator: RemoteImageCollaborator) => getUserInitials(collaborator.name);
 
 const hasRemoteImagePixelAvatar = (collaborator: RemoteImageCollaborator) =>
   Boolean(collaborator.pixelAvatar?.pixels?.length && collaborator.pixelAvatar.size > 0);

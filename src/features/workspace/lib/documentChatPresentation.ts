@@ -1,4 +1,8 @@
-import type { PixelAvatarData } from "../../../lib/api";
+import type { DocumentChatAuthor, PixelAvatarData } from "../../../lib/api";
+import { getUserDisplayName, hasVisibleUserName } from "../../../lib/userDisplayName";
+
+export const documentChatAuthorDisplayName = (author: DocumentChatAuthor) =>
+  getUserDisplayName({ username: author.username }, hasVisibleUserName(author.display_name) ? author.display_name : "Project member");
 
 type ChatPresentationMessage = {
   client_message_id: string;

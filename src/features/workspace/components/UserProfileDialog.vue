@@ -12,6 +12,7 @@ import {
 } from "../../pixel-art/lib/palette";
 
 const AVATAR_SIZE = 16;
+const MAX_USERNAME_LENGTH = 255;
 const palette = PIXEL_ART_PALETTE;
 
 const props = defineProps<{
@@ -42,7 +43,7 @@ const initialAvatarMode = ref<"google" | "pixel">("google");
 const initialPixelsKey = ref("");
 
 const currentProfileName = computed(
-  () => username.value.trim() || props.userUsername || props.userName || props.userEmail || "User",
+  () => username.value.trim() ? username.value : props.userEmail || "User",
 );
 
 const pixelAvatarJson = computed<PixelAvatarData>(() => ({
@@ -54,15 +55,8 @@ const pixelAvatarJson = computed<PixelAvatarData>(() => ({
 
 const hasGoogleAvatar = computed(() => Boolean(props.userAvatarUrl?.trim()));
 const usernameError = computed(() => {
-  const value = username.value.trim();
-  if (Array.from(value).length < 3 || Array.from(value).length > 40) {
-    return "Username must be between 3 and 40 characters.";
-  }
-  if (!/^[\p{L}\p{N}_.-]+$/u.test(value)) {
-    return "Use only letters, numbers, dots (.), hyphens (-) and underscores (_). Spaces and other symbols are not allowed.";
-  }
-  if (!/[\p{L}\p{N}]/u.test(value)) {
-    return "Username must include at least one letter or number.";
+  if (username.value.trim() && Array.from(username.value).length > MAX_USERNAME_LENGTH) {
+    return `Username must be ${MAX_USERNAME_LENGTH} characters or fewer.`;
   }
   return "";
 });
@@ -70,7 +64,7 @@ const canSave = computed(() => !usernameError.value && !isSaving.value);
 const pixelsKey = (items: Array<string | null>) => items.map((pixel) => pixel || "").join("|");
 const hasUnsavedChanges = computed(
   () =>
-    username.value.trim() !== initialUsername.value ||
+    username.value !== initialUsername.value ||
     avatarMode.value !== initialAvatarMode.value ||
     pixelsKey(pixels.value) !== initialPixelsKey.value,
 );
@@ -112,7 +106,7 @@ const resetForm = () => {
   username.value = props.userUsername || "";
   pixels.value = normalizePixels(props.userPixelAvatar);
   avatarMode.value = props.userPixelAvatar ? "pixel" : "google";
-  initialUsername.value = username.value.trim();
+  initialUsername.value = username.value;
   initialAvatarMode.value = avatarMode.value;
   initialPixelsKey.value = pixelsKey(pixels.value);
   activeMobilePanel.value = "profile";
@@ -201,7 +195,7 @@ const saveProfile = async () => {
 
   try {
     const user = await patchCurrentUser({
-      username: username.value.trim(),
+      username: username.value.trim() ? username.value : null,
       avatar_pixel_art: avatarMode.value === "pixel" ? pixelAvatarJson.value : null,
     });
     emit("saved", user);
@@ -268,19 +262,17 @@ const saveUnsavedChanges = async () => {
           @submit.prevent="saveProfile"
         >
           <label>
-            <span id="profile-username-label">Username</span>
+            <span id="profile-username-label">Username (optional)</span>
             <input
               v-model="username"
               autocomplete="username"
-              autocapitalize="none"
               :spellcheck="false"
-              maxlength="40"
               aria-labelledby="profile-username-label"
               aria-describedby="profile-username-hint profile-username-error"
               :aria-invalid="Boolean(usernameError)"
             />
             <small id="profile-username-hint" class="profile-field-hint">
-              3–40 characters. Letters, numbers, dots (.), hyphens (-) and underscores (_).
+              Any characters, up to 255. Leave blank to use your email.
             </small>
             <small
               id="profile-username-error"
@@ -569,6 +561,7 @@ const saveUnsavedChanges = async () => {
 
   .profile-fields {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     align-content: start;
     gap: 14px;
   }
@@ -664,6 +657,10 @@ const saveUnsavedChanges = async () => {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .profile-preview strong {
+    white-space: pre;
   }
 
   .profile-preview p {

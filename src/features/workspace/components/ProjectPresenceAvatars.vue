@@ -7,6 +7,7 @@ import { Icon, type IconifyIcon } from "@iconify/vue";
 import { computed, ref } from "vue";
 
 import type { ProjectPresenceMember } from "../../../lib/realtime";
+import { getUserDisplayName, getUserInitials } from "../../../lib/userDisplayName";
 
 const props = defineProps<{
   members: ProjectPresenceMember[];
@@ -30,15 +31,9 @@ const presenceIconsByResourceType: Record<string, IconifyIcon> = {
 
 const failedAvatarIds = ref(new Set<string>());
 
-const displayName = (member: ProjectPresenceMember) =>
-  member.username?.trim() || member.email || "Project member";
+const displayName = (member: ProjectPresenceMember) => getUserDisplayName(member);
 
-const initials = (member: ProjectPresenceMember) => {
-  const source = member.username?.trim() || member.email.split("@")[0] || "?";
-  const parts = source.split(/[\s._-]+/).filter(Boolean);
-  return (parts.length > 1 ? `${parts[0]?.[0] || ""}${parts[1]?.[0] || ""}` : source.slice(0, 2))
-    .toUpperCase();
-};
+const initials = (member: ProjectPresenceMember) => getUserInitials(getUserDisplayName(member, "?"));
 
 const hasPixelAvatar = (member: ProjectPresenceMember) =>
   Boolean(member.avatar_pixel_art?.pixels?.length && member.avatar_pixel_art.size > 0);

@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 
 import type { PixelAvatarData } from "../../../lib/api";
+import { getUserDisplayName, getUserInitials } from "../../../lib/userDisplayName";
 import PulsarLogo from "../../auth/components/PulsarLogo.vue";
 
 type TopbarMode = "projects" | "project";
@@ -70,27 +71,16 @@ const canInteractWithBrandTrail = computed(
 );
 const userAvatarUrl = computed(() => props.userAvatarUrl.trim());
 const userLabelText = computed(
-  () => props.userLabel || props.userEmail || props.userName || props.userUsername || "",
+  () => getUserDisplayName({ username: props.userUsername, email: props.userEmail }, props.userLabel || props.userName || ""),
 );
 const canShowPixelAvatar = computed(() => Boolean(props.userPixelAvatar?.pixels?.length));
 const canShowUserAvatar = computed(
   () => !canShowPixelAvatar.value && userAvatarUrl.value.length > 0 && !hasAvatarLoadError.value,
 );
 const userInitials = computed(() => {
-  const trimmedName = (props.userUsername || props.userName || props.userEmail).trim();
-  if (!trimmedName) {
-    return "ME";
-  }
-
+  const trimmedName = userLabelText.value.trim();
   const [firstPart = ""] = trimmedName.split("@");
-  const initials = firstPart
-    .split(/[\s._-]+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("");
-
-  return initials || "ME";
+  return getUserInitials(firstPart, "ME", 1);
 });
 
 watch(
@@ -226,7 +216,7 @@ const handleUserClick = () => {
           <img
             v-else-if="canShowUserAvatar"
             :src="userAvatarUrl"
-            :alt="`${userName || 'Current user'} profile photo`"
+            :alt="`${userLabelText || 'Current user'} profile photo`"
             referrerpolicy="no-referrer"
             @error="hasAvatarLoadError = true"
           />
@@ -500,7 +490,7 @@ const handleUserClick = () => {
     font-size: 0.82rem;
     font-weight: 650;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: pre;
   }
 
   @media (max-width: 820px) {

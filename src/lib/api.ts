@@ -50,6 +50,7 @@ export type PixelAvatarData = {
 export type DocumentChatAuthor = {
   id: string;
   username?: string | null;
+  display_name?: string | null;
   avatar_url?: string | null;
   avatar_pixel_art?: PixelAvatarData | null;
 };

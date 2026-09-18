@@ -107,6 +107,7 @@ let redirectTimer = 0;
 let googlePromptTimer = 0;
 const CARD_FLIP_MS = 720;
 const WORKSPACE_TRANSITION_MS = 80;
+const MAX_USERNAME_LENGTH = 255;
 
 const googleClientId = import.meta.env.PUBLIC_GOOGLE_CLIENT_ID || "";
 const isGoogleConfigured = computed(() => googleClientId.trim().length > 0);
@@ -115,7 +116,6 @@ const canUseEmail = computed(
 );
 const canCreateAccount = computed(
   () =>
-    signUpUsername.value.trim().length > 0 &&
     signUpEmail.value.trim().length > 0 &&
     signUpPassword.value.length > 0 &&
     signUpRepeatPassword.value.length > 0,
@@ -379,12 +379,12 @@ const showPasswordReset = () => {
 
 const createAccount = async () => {
   if (!canCreateAccount.value) {
-    showToast("Complete all fields.", "error");
+    showToast("Enter your email and password, then repeat your password.", "error");
     return;
   }
 
-  if (signUpUsername.value.trim().length < 3) {
-    showToast("Username must be at least 3 characters.", "error");
+  if (signUpUsername.value.trim() && Array.from(signUpUsername.value).length > MAX_USERNAME_LENGTH) {
+    showToast(`Username must be ${MAX_USERNAME_LENGTH} characters or fewer.`, "error");
     return;
   }
 
@@ -405,7 +405,7 @@ const createAccount = async () => {
     await postJson<AuthSessionResponse>(
       "/api/v1/auth/register",
       {
-        username: signUpUsername.value.trim(),
+        username: signUpUsername.value.trim() ? signUpUsername.value : null,
         email: signUpEmail.value.trim(),
         password: signUpPassword.value,
         password_confirmation: signUpRepeatPassword.value,
@@ -751,13 +751,13 @@ const hideToast = () => {
 
             <form class="email-form" @submit.prevent="createAccount">
               <label class="field-group">
-                <span class="sr-only">Username</span>
+                <span class="sr-only">Username (optional)</span>
                 <span class="text-input-control">
                   <input
                     v-model="signUpUsername"
                     autocomplete="username"
                     name="signup-username"
-                    placeholder="Username"
+                    placeholder="Username (optional)"
                     type="text"
                   />
                   <span class="field-icon" aria-hidden="true">

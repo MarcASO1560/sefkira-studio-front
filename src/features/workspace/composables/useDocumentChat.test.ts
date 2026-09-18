@@ -119,6 +119,28 @@ describe("document chat synchronization", () => {
     expect(chat.loading.value).toBe(false);
   });
 
+  it("keeps optimistic display names current without adding identity metadata to sends", async () => {
+    const gate = deferred<DocumentChatMessagePublic>();
+    vi.mocked(postDocumentChatMessage).mockReturnValueOnce(gate.promise);
+    const fallbackAuthor: DocumentChatAuthor = { ...ownUser, username: null, display_name: "owner.name@example.com" };
+    const { chat, user } = makeClient(ref("resource"), ref<DocumentChatAuthor | null>(fallbackAuthor));
+    await startChat(chat);
+    const sending = chat.sendMessage("Hello");
+    const receipt = chat.messages.value[0]!.client_message_id;
+    expect(chat.messages.value[0]!.author).toEqual(fallbackAuthor);
+    expect(chat.messages.value[0]!.author).not.toHaveProperty("email");
+    expect(vi.mocked(postDocumentChatMessage).mock.calls[0]?.[2]).toEqual({ client_message_id: receipt, body: "Hello" });
+    const updatedAuthor = { ...fallbackAuthor, username: "  New  Artist  ", display_name: "  New  Artist  " };
+    user.value = updatedAuthor;
+    await settle();
+    expect(chat.messages.value[0]!.author).toEqual(updatedAuthor);
+    expect(JSON.parse(storage.getItem(storage.key(0)!)!).author).toEqual(updatedAuthor);
+    gate.resolve(message(5, { author: updatedAuthor, client_message_id: receipt, body: "Hello" }));
+    expect(await sending).toBe(true);
+    expect(chat.messages.value[0]!.author).toEqual(updatedAuthor);
+    expect(chat.messages.value[0]!.status).toBe("sent");
+  });
+
   it("shows an optimistic send and deduplicates an echo arriving before the HTTP confirmation", async () => {
     const gate = deferred<DocumentChatMessagePublic>();
     vi.mocked(postDocumentChatMessage).mockReturnValueOnce(gate.promise);

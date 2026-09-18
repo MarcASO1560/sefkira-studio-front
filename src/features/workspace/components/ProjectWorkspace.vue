@@ -39,6 +39,7 @@ import {
   type RealtimeConnection,
   type RealtimeEventPayload,
 } from "../../../lib/realtime";
+import { getUserDisplayName } from "../../../lib/userDisplayName";
 import StudioTopbarCommandBar from "../../navigation/components/StudioTopbarCommandBar.vue";
 import StudioTopbar from "../../navigation/components/StudioTopbar.vue";
 import { createPixelArtDocument } from "../../pixel-art/lib/document";
@@ -173,7 +174,7 @@ const projectEditName = ref("");
 const projectEditPixels = ref<Array<string | null>>([]);
 const projectEditErrorMessage = ref("");
 const isProfileDialogOpen = ref(false);
-const profileUserName = ref(props.userName || "");
+const profileUserName = ref(getUserDisplayName({ username: props.userUsername, email: props.userEmail }, props.userName || ""));
 const profileUsername = ref(props.userUsername || "");
 const profileAvatarUrl = ref(props.userAvatarUrl || "");
 const profileEmail = ref(props.userEmail || "");
@@ -1908,7 +1909,7 @@ const createProjectItem = async () => {
 
 const updateProfile = (user: UserPublic) => {
   profileUsername.value = user.username || "";
-  profileUserName.value = user.username || user.email;
+  profileUserName.value = getUserDisplayName(user);
   profileAvatarUrl.value = user.avatar_url || "";
   profileEmail.value = user.email;
   profilePixelAvatar.value = user.avatar_pixel_art || null;

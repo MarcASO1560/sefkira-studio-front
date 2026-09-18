@@ -3,6 +3,7 @@ import { ArrowLeft, X } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import type { ProjectPresenceMember } from "../../../lib/realtime";
+import { getUserDisplayName, getUserInitials } from "../../../lib/userDisplayName";
 import { getDocumentPresenceMembers } from "../lib/documentPresence";
 import { groupDocumentInfoDetails, type DocumentInfoDetail } from "../lib/documentInfo";
 import { getDocumentInfoViewportStyle } from "../lib/documentInfoViewport";
@@ -42,15 +43,9 @@ const presence = computed(() =>
 const listedMembers = computed(() => presence.value.members);
 const detailSections = computed(() => groupDocumentInfoDetails(props.details));
 
-const displayName = (member: ProjectPresenceMember) =>
-  member.username?.trim() || member.email || "Project member";
+const displayName = (member: ProjectPresenceMember) => getUserDisplayName(member);
 
-const initials = (member: ProjectPresenceMember) => {
-  const source = member.username?.trim() || member.email.split("@")[0] || "?";
-  const parts = source.split(/[\s._-]+/).filter(Boolean);
-  return (parts.length > 1 ? `${parts[0]?.[0] || ""}${parts[1]?.[0] || ""}` : source.slice(0, 2))
-    .toUpperCase();
-};
+const initials = (member: ProjectPresenceMember) => getUserInitials(getUserDisplayName(member, "?"));
 
 const hasPixelAvatar = (member: ProjectPresenceMember) =>
   Boolean(member.avatar_pixel_art?.pixels?.length && member.avatar_pixel_art.size > 0);
@@ -487,7 +482,7 @@ onBeforeUnmount(() => {
     font-size: 14px;
     font-weight: 600;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: pre;
   }
 
   .image-document-presence-member__status {
@@ -561,7 +556,7 @@ onBeforeUnmount(() => {
     .resource-document-info__people { margin-top: 20px; padding-top: 20px; }
 
     .image-document-presence-member__name {
-      white-space: normal;
+      white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
   }

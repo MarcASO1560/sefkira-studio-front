@@ -7,6 +7,8 @@ import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { DocumentChatMessage } from "../composables/useDocumentChat";
+import type { DocumentChatAuthor } from "../../../lib/api";
+import * as userDisplayNames from "../../../lib/userDisplayName";
 import * as presentation from "../lib/documentChatPresentation";
 import * as stickers from "../lib/documentChatStickers";
 import * as resize from "../composables/useDocumentChatResize";
@@ -89,6 +91,7 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
   new Function("require", "exports", script)((name: string) => {
     if (name === "vue") return { ...vue, onBeforeUnmount: (hook: () => void) => unmountHooks.push(hook) };
     if (name === "@lucide/vue") return {};
+    if (name === "../../../lib/userDisplayName") return userDisplayNames;
     if (name === "../lib/documentChatPresentation") return presentation;
     if (name === "../lib/documentChatStickers") return stickers;
     if (name === "../composables/useDocumentChatResize") return resize;
@@ -105,6 +108,8 @@ const setupChat = (mobile = false, initialMessages: DocumentChatMessage[] = []) 
     messages: initialMessages, loading: false, error: null, hasOlder: true, sending: false, accessDenied: false,
   });
   const state = scope.run(() => exports.default!.setup(props, { expose: () => {}, emit })) as {
+    displayName: (author: DocumentChatAuthor) => string;
+    initials: (author: DocumentChatAuthor) => string;
     dialog: vue.Ref<HTMLElement | null>;
     timeline: vue.Ref<HTMLElement | null>;
     composer: vue.Ref<HTMLTextAreaElement | null>;
@@ -186,6 +191,22 @@ afterEach(() => {
 });
 
 describe("ResourceDocumentChatDialog interaction", () => {
+  it("uses exact usernames, complete display-name fallbacks and generic legacy author names", () => {
+    const { state } = setupChat();
+    expect(state.displayName({ id: "artist", username: "  Artist  Name  ", display_name: "artist@example.com" }))
+      .toBe("  Artist  Name  ");
+    expect(state.displayName({ id: "artist", username: " ", display_name: "artist.name@example.com" }))
+      .toBe("artist.name@example.com");
+    const legacyAuthor = { id: "legacy", username: null, email: "private@example.com" };
+    expect(state.displayName(legacyAuthor)).toBe("Project member");
+    expect(state.displayName({ id: "legacy" })).toBe("Project member");
+  });
+
+  it.each([["🎨 Artist", "🎨A"], ["👨‍💻 Artist", "👨‍💻A"], ["🇪🇸 Artist", "🇪🇸A"]])("keeps emoji graphemes intact in initials for %s", (username, expected) => {
+    const { state } = setupChat();
+    expect(state.initials({ id: "artist", username })).toBe(expected);
+  });
+
   it.each([
     { layout: "mobile", mobile: true },
     { layout: "desktop", mobile: false },

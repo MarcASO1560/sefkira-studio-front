@@ -3,10 +3,11 @@ import { MessageSquareText, SendHorizontal, Sticker, UsersRound, X } from "@luci
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import type { DocumentChatAuthor } from "../../../lib/api";
+import { getUserInitials } from "../../../lib/userDisplayName";
 import type { DocumentChatMessage } from "../composables/useDocumentChat";
 import { useDocumentChatViewport } from "../composables/useDocumentChatViewport";
 import { useDocumentChatResize } from "../composables/useDocumentChatResize";
-import { groupDocumentChatMessages, validatedDocumentChatAvatar } from "../lib/documentChatPresentation";
+import { documentChatAuthorDisplayName, groupDocumentChatMessages, validatedDocumentChatAvatar } from "../lib/documentChatPresentation";
 import { DOCUMENT_CHAT_STICKERS, getDocumentChatSticker } from "../lib/documentChatStickers";
 import DocumentChatSticker from "./DocumentChatSticker.vue";
 
@@ -72,12 +73,8 @@ const chatResize = useDocumentChatResize({
     if (nearBottom) void nextTick(() => { if (props.open) scrollToBottom(); });
   },
 });
-const displayName = (author: DocumentChatAuthor) => author.username?.trim() || "Project member";
-const initials = (author: DocumentChatAuthor) => {
-  const source = displayName(author);
-  const parts = source.split(/[\s._-]+/).filter(Boolean);
-  return (parts.length > 1 ? `${parts[0]?.[0] || ""}${parts[1]?.[0] || ""}` : source.slice(0, 2)).toUpperCase();
-};
+const displayName = documentChatAuthorDisplayName;
+const initials = (author: DocumentChatAuthor) => getUserInitials(displayName(author));
 const canShowImageAvatar = (author: DocumentChatAuthor) => Boolean(
   author.avatar_url && failedAvatarUrls.value.get(author.id) !== author.avatar_url,
 );
@@ -503,7 +500,7 @@ onBeforeUnmount(() => { dialogGeneration++; previousFocus = null; stopDialogEffe
 .document-chat__avatar svg, .document-chat__avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .document-chat__content { flex: 1 1 auto; min-width: 0; }
 .document-chat__author-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; min-width: 0; margin-bottom: 3px; font-size: 11px; line-height: 1.5; }
-.document-chat__author { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 650; }
+.document-chat__author { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 13px; font-weight: 650; }
 .document-chat__you, .document-chat time { color: var(--editor-quiet, #8a8a8a); font-size: 10px; }
 .document-chat__message p { margin: 0; color: var(--editor-text, #f2f2f2); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.55; }
 .document-chat__message + .document-chat__message { margin-top: 5px; }
