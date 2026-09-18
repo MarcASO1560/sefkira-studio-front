@@ -1913,16 +1913,12 @@ onUnmounted(() => {
             <li v-for="user in projectAccessUsers" :key="user.id">
               <div class="access-user-identity">
                 <div class="access-user-avatar" aria-hidden="true">
-                  <div
+                  <ProjectPixelArtThumbnail
                     v-if="user.avatar_pixel_art?.pixels?.length"
                     class="access-user-avatar__pixels"
-                  >
-                    <span
-                      v-for="(pixel, index) in user.avatar_pixel_art.pixels"
-                      :key="`access-user-pixel-${user.id}-${index}`"
-                      :style="{ backgroundColor: pixel || 'transparent' }"
-                    ></span>
-                  </div>
+                    :pixels="user.avatar_pixel_art.pixels"
+                    :size="user.avatar_pixel_art.size"
+                  />
                   <img
                     v-else-if="user.avatar_url"
                     :src="user.avatar_url"
@@ -2004,9 +2000,12 @@ onUnmounted(() => {
               <li v-for="user in projectBlockedUsers" :key="`blocked-${user.id}`">
                 <div class="access-user-identity">
                   <div class="access-user-avatar" aria-hidden="true">
-                    <div v-if="user.avatar_pixel_art?.pixels?.length" class="access-user-avatar__pixels">
-                      <span v-for="(pixel, index) in user.avatar_pixel_art.pixels" :key="`blocked-pixel-${user.id}-${index}`" :style="{ backgroundColor: pixel || 'transparent' }"></span>
-                    </div>
+                    <ProjectPixelArtThumbnail
+                      v-if="user.avatar_pixel_art?.pixels?.length"
+                      class="access-user-avatar__pixels"
+                      :pixels="user.avatar_pixel_art.pixels"
+                      :size="user.avatar_pixel_art.size"
+                    />
                     <img v-else-if="user.avatar_url" :src="user.avatar_url" alt="" loading="lazy" />
                     <span v-else>{{ accessUserInitials(user) }}</span>
                   </div>
@@ -3369,17 +3368,10 @@ onUnmounted(() => {
   }
 
   .access-user-avatar__pixels {
-    display: grid;
-    grid-template-columns: repeat(16, 1fr);
-    grid-template-rows: repeat(16, 1fr);
+    display: block;
     width: 100%;
     height: 100%;
     image-rendering: pixelated;
-  }
-
-  .access-user-avatar__pixels span {
-    min-width: 0;
-    min-height: 0;
   }
 
   .access-user-copy {

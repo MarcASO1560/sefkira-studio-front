@@ -5,6 +5,7 @@ import {
   patchCurrentUser,
   patchProjectResource,
   putResourceEditorState,
+  type PixelAvatarData,
   type ProjectResourcePublic,
 } from "./api";
 
@@ -256,6 +257,114 @@ describe("patchProjectResource", () => {
 });
 
 describe("patchCurrentUser", () => {
+  it("sends a dotted username and pixel avatar together and returns the saved profile", async () => {
+    const avatar: PixelAvatarData = {
+      version: 1,
+      size: 16,
+      palette: ["#FFFFFF", "#000000"],
+      pixels: Array.from({ length: 256 }, (_, index) => index % 2 ? "#000000" : "#FFFFFF"),
+    };
+    const user = {
+      id: "user-1",
+      username: "Dr.Maraka.exe",
+      email: "artist@example.com",
+      avatar_url: null,
+      avatar_pixel_art: avatar,
+      is_admin: false,
+      created_at: "2026-09-12T08:00:00Z",
+      updated_at: "2026-09-12T08:02:00Z",
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify(user), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      patchCurrentUser({ username: "Dr.Maraka.exe", avatar_pixel_art: avatar }),
+    ).resolves.toEqual(user);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/users/me");
+    expect(init).toMatchObject({
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+    });
+    expect(JSON.parse(String(init?.body))).toEqual({
+      username: "Dr.Maraka.exe",
+      avatar_pixel_art: avatar,
+    });
+  });
+
+  it("turns FastAPI validation details into a readable profile error", async () => {
+    const message = "Username can only contain letters, numbers, dots, underscores and hyphens";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({
+          detail: [{
+            type: "value_error",
+            loc: ["body", "username"],
+            msg: `Value error, ${message}`,
+            input: "artist/name",
+            ctx: { error: {} },
+          }],
+        }), {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    await expect(patchCurrentUser({ username: "artist/name" })).rejects.toEqual(
+      new Error(message),
+    );
+  });
+
+  it.each([
+    { label: "object detail", detail: { error: "Unknown validation error" } },
+    { label: "malformed validation entries", detail: [{ msg: {} }, null, "Unknown error"] },
+    { label: "empty validation message", detail: [{ msg: "   " }] },
+    { label: "missing detail", detail: undefined },
+  ])("uses the profile fallback for $label", async ({ detail }) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ detail }), {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    await expect(patchCurrentUser({ username: "artist" })).rejects.toEqual(
+      new Error("Could not update your profile."),
+    );
+  });
+
+  it("surfaces the server's duplicate username error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ detail: "Username already taken" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    await expect(patchCurrentUser({ username: "existing_artist" })).rejects.toEqual(
+      new Error("Username already taken"),
+    );
+  });
+
   it("accepts a semantically matching normalized personal pixel-art palette", async () => {
     const user = {
       id: "user-1",

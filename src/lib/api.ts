@@ -358,6 +358,14 @@ const readApiErrorMessage = (responseBody: unknown, fallback: string) => {
     return responseBody.detail;
   }
 
+  if (Array.isArray(responseBody.detail)) {
+    const messages = responseBody.detail
+      .filter(isRecord)
+      .map((issue) => typeof issue.msg === "string" ? issue.msg.replace(/^Value error, /, "").trim() : "")
+      .filter(Boolean);
+    if (messages.length) return [...new Set(messages)].slice(0, 3).join(" ");
+  }
+
   return fallback;
 };
 
@@ -447,6 +455,7 @@ const isMatchingPixelArtPaletteAcknowledgement = (
 };
 
 export const patchCurrentUser = async (update: UserUpdate): Promise<UserPublic> => {
+  const isPaletteUpdate = update.pixel_art_palette !== undefined;
   const response = await fetch(apiUrl("/users/me"), {
     method: "PATCH",
     credentials: "same-origin",
@@ -460,12 +469,16 @@ export const patchCurrentUser = async (update: UserUpdate): Promise<UserPublic> 
 
   if (!response.ok) {
     throw new Error(
-      readApiErrorMessage(responseBody, "Your personal palette could not be saved."),
+      readApiErrorMessage(responseBody, isPaletteUpdate
+        ? "Your personal palette could not be saved."
+        : "Could not update your profile."),
     );
   }
 
   if (!isUserPublicAcknowledgement(responseBody)) {
-    throw new Error("The server did not confirm the personal palette update.");
+    throw new Error(isPaletteUpdate
+      ? "The server did not confirm the personal palette update."
+      : "The server did not confirm the profile update.");
   }
 
   if (

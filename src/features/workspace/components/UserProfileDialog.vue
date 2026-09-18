@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 
-import { API_V1_URL, type PixelAvatarData, type UserPublic } from "../../../lib/api";
+import { patchCurrentUser, type PixelAvatarData, type UserPublic } from "../../../lib/api";
 import { clearClientSession } from "../../../lib/session";
 import PixelArtEditor from "../../pixel-art/components/PixelArtEditor.vue";
 import {
@@ -42,7 +42,7 @@ const initialAvatarMode = ref<"google" | "pixel">("google");
 const initialPixelsKey = ref("");
 
 const currentProfileName = computed(
-  () => props.userUsername || props.userName || props.userEmail || "User",
+  () => username.value.trim() || props.userUsername || props.userName || props.userEmail || "User",
 );
 
 const pixelAvatarJson = computed<PixelAvatarData>(() => ({
@@ -53,7 +53,20 @@ const pixelAvatarJson = computed<PixelAvatarData>(() => ({
 }));
 
 const hasGoogleAvatar = computed(() => Boolean(props.userAvatarUrl?.trim()));
-const canSave = computed(() => username.value.trim().length >= 3 && !isSaving.value);
+const usernameError = computed(() => {
+  const value = username.value.trim();
+  if (Array.from(value).length < 3 || Array.from(value).length > 40) {
+    return "Username must be between 3 and 40 characters.";
+  }
+  if (!/^[\p{L}\p{N}_.-]+$/u.test(value)) {
+    return "Use only letters, numbers, dots (.), hyphens (-) and underscores (_). Spaces and other symbols are not allowed.";
+  }
+  if (!/[\p{L}\p{N}]/u.test(value)) {
+    return "Username must include at least one letter or number.";
+  }
+  return "";
+});
+const canSave = computed(() => !usernameError.value && !isSaving.value);
 const pixelsKey = (items: Array<string | null>) => items.map((pixel) => pixel || "").join("|");
 const hasUnsavedChanges = computed(
   () =>
@@ -119,6 +132,10 @@ watch(
   { immediate: true },
 );
 
+watch(username, () => {
+  statusMessage.value = "";
+}, { flush: "sync" });
+
 const requestLogout = () => {
   showLogoutConfirm.value = true;
 };
@@ -169,8 +186,12 @@ const discardUnsavedChanges = () => {
 };
 
 const saveProfile = async () => {
-  if (!canSave.value) {
-    statusMessage.value = "Username must be at least 3 characters.";
+  if (isSaving.value) {
+    return false;
+  }
+  if (usernameError.value) {
+    statusMessage.value = usernameError.value;
+    activeMobilePanel.value = "profile";
     showUnsavedConfirm.value = false;
     return false;
   }
@@ -179,29 +200,16 @@ const saveProfile = async () => {
   statusMessage.value = "";
 
   try {
-    const response = await fetch(`${API_V1_URL}/users/me`, {
-      method: "PATCH",
-      credentials: "same-origin",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        username: username.value.trim(),
-        avatar_pixel_art: avatarMode.value === "pixel" ? pixelAvatarJson.value : null,
-      }),
+    const user = await patchCurrentUser({
+      username: username.value.trim(),
+      avatar_pixel_art: avatarMode.value === "pixel" ? pixelAvatarJson.value : null,
     });
-
-    if (!response.ok) {
-      const payload = await response.json().catch(() => null);
-      throw new Error(payload?.detail || "Could not update your profile.");
-    }
-
-    emit("saved", (await response.json()) as UserPublic);
+    emit("saved", user);
     return true;
   } catch (error) {
     statusMessage.value =
       error instanceof Error ? error.message : "Could not update your profile.";
+    activeMobilePanel.value = "profile";
     showUnsavedConfirm.value = false;
     return false;
   } finally {
@@ -260,8 +268,25 @@ const saveUnsavedChanges = async () => {
           @submit.prevent="saveProfile"
         >
           <label>
-            <span>Username</span>
-            <input v-model="username" autocomplete="username" maxlength="40" />
+            <span id="profile-username-label">Username</span>
+            <input
+              v-model="username"
+              autocomplete="username"
+              autocapitalize="none"
+              :spellcheck="false"
+              maxlength="40"
+              aria-labelledby="profile-username-label"
+              aria-describedby="profile-username-hint profile-username-error"
+              :aria-invalid="Boolean(usernameError)"
+            />
+            <small id="profile-username-hint" class="profile-field-hint">
+              3–40 characters. Letters, numbers, dots (.), hyphens (-) and underscores (_).
+            </small>
+            <small
+              id="profile-username-error"
+              class="profile-field-error"
+              aria-live="polite"
+            >{{ usernameError }}</small>
           </label>
 
           <label>
@@ -277,13 +302,17 @@ const saveUnsavedChanges = async () => {
                 :alt="`${currentProfileName} Google profile photo`"
                 referrerpolicy="no-referrer"
               />
-              <div v-else class="pixel-preview" aria-hidden="true">
-                <span
+              <svg v-else class="pixel-preview" :viewBox="`0 0 ${AVATAR_SIZE} ${AVATAR_SIZE}`" shape-rendering="crispEdges" aria-hidden="true">
+                <rect
                   v-for="(pixel, index) in pixels"
                   :key="`preview-${index}`"
-                  :style="{ backgroundColor: pixel || 'transparent' }"
-                ></span>
-              </div>
+                  :x="index % AVATAR_SIZE"
+                  :y="Math.floor(index / AVATAR_SIZE)"
+                  width="1"
+                  height="1"
+                  :fill="pixel && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(pixel) ? pixel : 'transparent'"
+                />
+              </svg>
             </div>
             <div>
               <strong>{{ currentProfileName }}</strong>
@@ -308,7 +337,7 @@ const saveUnsavedChanges = async () => {
             Log out
           </button>
 
-          <p v-if="statusMessage" class="profile-status">{{ statusMessage }}</p>
+          <p v-if="statusMessage" class="profile-status" role="alert">{{ statusMessage }}</p>
         </form>
 
         <PixelArtEditor
@@ -418,6 +447,8 @@ const saveUnsavedChanges = async () => {
 
   .profile-dialog {
     position: relative;
+    display: flex;
+    flex-direction: column;
     width: min(920px, 100%);
     max-height: calc(100dvh - 44px);
     overflow: hidden;
@@ -430,6 +461,7 @@ const saveUnsavedChanges = async () => {
 
   .profile-dialog header {
     display: flex;
+    flex: 0 0 auto;
     align-items: flex-start;
     justify-content: space-between;
     padding: 20px 22px;
@@ -442,6 +474,7 @@ const saveUnsavedChanges = async () => {
 
   .profile-dialog__footer {
     display: flex;
+    flex: 0 0 auto;
     gap: 10px;
     justify-content: flex-end;
     padding: 16px 22px;
@@ -508,6 +541,9 @@ const saveUnsavedChanges = async () => {
 
   .profile-dialog__content {
     display: grid;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
     grid-template-columns: minmax(250px, 330px) minmax(390px, 1fr);
     gap: 36px;
     align-items: start;
@@ -568,6 +604,28 @@ const saveUnsavedChanges = async () => {
     cursor: not-allowed;
   }
 
+  .profile-field-hint,
+  .profile-field-error {
+    font-size: 0.75rem;
+    line-height: 1.45;
+  }
+
+  .profile-field-hint {
+    color: rgba(247, 241, 231, 0.62);
+  }
+
+  .profile-field-error {
+    color: #f0a18d;
+  }
+
+  .profile-field-error:empty {
+    display: none;
+  }
+
+  .profile-fields input[aria-invalid="true"] {
+    border-color: rgba(240, 161, 141, 0.65);
+  }
+
   .profile-preview {
     display: flex;
     gap: 12px;
@@ -579,6 +637,7 @@ const saveUnsavedChanges = async () => {
   }
 
   .profile-preview__avatar {
+    flex: 0 0 auto;
     width: 54px;
     height: 54px;
     overflow: hidden;
@@ -591,6 +650,11 @@ const saveUnsavedChanges = async () => {
     width: 100%;
     height: 100%;
     object-fit: cover;
+  }
+
+  .profile-preview > div:last-child {
+    flex: 1;
+    min-width: 0;
   }
 
   .profile-preview strong,
@@ -690,18 +754,11 @@ const saveUnsavedChanges = async () => {
   }
 
   .pixel-preview {
-    display: grid;
-    grid-template-columns: repeat(16, 1fr);
-    grid-template-rows: repeat(16, 1fr);
+    display: block;
     width: 100%;
     height: 100%;
     background: rgba(255, 252, 244, 0.045);
     image-rendering: pixelated;
-  }
-
-  .pixel-preview span {
-    min-width: 0;
-    min-height: 0;
   }
 
   .logout-confirm-layer,

@@ -8446,9 +8446,15 @@ onUnmounted(() => {
     background: var(--editor-surface);
     border: 0;
     border-radius: var(--editor-radius-md);
+    touch-action: manipulation;
+    transition: background-color 140ms ease, opacity 100ms ease, transform 100ms ease;
+    -webkit-tap-highlight-color: transparent;
   }
 
-  .image-editor-chat-trigger:hover:not(:disabled) { background: var(--editor-hover); }
+  @media (hover: hover) and (pointer: fine) {
+    .image-editor-chat-trigger:hover:not(:disabled) { background: var(--editor-hover); }
+  }
+  .image-editor-chat-trigger:active:not(:disabled) { opacity: .75; transform: scale(.94); }
   .image-editor-chat-trigger:focus-visible { outline: 2px solid var(--editor-focus); outline-offset: -2px; }
   .image-editor-chat-trigger:disabled { opacity: .4; cursor: not-allowed; }
   .image-editor-chat-trigger__unread {
@@ -8658,6 +8664,14 @@ onUnmounted(() => {
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .image-editor-chat-trigger {
+      transition: none;
+    }
+
+    .image-editor-chat-trigger:active:not(:disabled) {
+      transform: none;
+    }
+
     .image-editor-layers-dialog {
       transition: none;
     }
